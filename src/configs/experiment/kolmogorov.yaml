@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - example.yaml
+  - override /datamodule: kolmogorov.yaml
+  - override /model: unet_resnet.yaml
+  - override /module: forecasting_multi_horizon_at_once.yaml
+  - _self_
+
+name: "Kolmogorov"
+
+datamodule:
+  eval_batch_size: 10     # effectively eval_batch_size *= number of predictions
+  batch_size: 512         # Global batch size
+# model:
+#   dropout: 0.1
+
+module:
+  num_predictions: 16
+  use_ema: True
+  inference_val_every_n_epochs: 2
+  optimizer:
+    lr: 5e-4
+    weight_decay: 1e-4
+  scheduler:
+    max_steps: ${trainer.max_epochs}
+    warmup_steps: 10
+    
+trainer:
+  max_epochs: 5000
+  gradient_clip_val: 0.5
+
+callbacks:
+  early_stopping: null
+  model_checkpoint:
+    save_top_k: 10
+    every_n_epochs: 1
+  # model_checkpoint_inf_t8:
+  #   _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  #   monitor: "inference/${module.num_predictions}ens_mems/t12/crps"   # name of the logged metric which determines when model is improving
+  #   mode:  "min"       # "max" means higher metric value is better, can be also "min"
+  #   save_top_k: 2               # save k best models (determined by above metric)
+  #   save_last: False             # additionally always save model from last epoch
+  #   verbose: ${verbose}
+  #   dirpath: ${ckpt_dir}
+  #   filename: "inf-${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}"
+  #   auto_insert_metric_name: True
+
+logger:
+  wandb:
+    project: "Kolmogorov"
+    save_to_s3_bucket: False
+    save_best_ckpt: False
+    save_last_ckpt: False

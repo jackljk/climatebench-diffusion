@@ -1,0 +1,44 @@
+# @package _global_
+
+defaults:
+  - example.yaml
+  - override /datamodule: kolmogorov.yaml
+  - override /model: unet_simple_navier_stokes.yaml
+  - override /module: forecasting_multi_horizon_at_once.yaml
+  - _self_
+
+name: "Kolmogorov"
+
+datamodule:
+  eval_batch_size: 10     # effectively eval_batch_size *= number of predictions
+
+# model:
+#   dropout: 0.1
+
+module:
+  num_predictions: 16
+  use_ema: True
+  inference_val_every_n_epochs: 2
+  optimizer:
+    lr: 5e-4
+    weight_decay: 1e-4
+  scheduler:
+    max_steps: ${trainer.max_epochs}
+    warmup_steps: 10
+
+trainer:
+  max_epochs: 400
+  gradient_clip_val: 1.0
+
+callbacks:
+  early_stopping: null
+  model_checkpoint:
+    save_top_k: 5
+    every_n_epochs: 1
+
+logger:
+  wandb:
+    project: "Kolmogorov"
+    save_to_s3_bucket: False
+    save_best_ckpt: False
+    save_last_ckpt: False

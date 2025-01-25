@@ -1,0 +1,10 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_2d
+
+defaults:
+  - era5_base.yaml
+  - override /datamodule: era5_2d.yaml
+  - override /model: unet_resnet.yaml
+  - _self_

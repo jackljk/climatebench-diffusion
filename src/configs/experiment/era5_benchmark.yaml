@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - era5_2d.yaml
+  - override /datamodule: era5_benchmark.yaml
+  - _self_
+
+name: "ERA5-${datamodule.hourly_resolution}h-${datamodule.horizon}l"
+
+trainer:
+  max_epochs: 200
+  accumulate_grad_batches: 2
+
+datamodule:
+  batch_size: 6
+  eval_batch_size: 4
+  # How to weight the loss terms during training
+  loss_pressure_weighting: "makani"
+  loss_surface_vars_weighting: "graphcast"
+  # num_workers: 24  # works well for horizon=1,2
+  # prefetch_factor: 8
+  use_dask: True
+
+callbacks:
+  model_checkpoint_t2m:
+    monitor: "val/t6/crps/2m_temperature"
+  model_checkpoint_u10m:
+    monitor: "val/t12/crps/10m_u_component_of_wind"
+
+logger:
+  wandb:
+    project: "WB2"

@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - _base_dyffusion.yaml
+  - _self_
+
+
+diffusion:
+  _target_: src.diffusion.dyffusion_e2e.DYffusionEnd2End
+  lambda_reconstruction: 0.5
+  lambda_reconstruction2: 0.0
+  lambda_interpolation: 0.25
+  lambda_interpolation2: 0.25
+  reconstruction2_detach_x_last: False   # True or False
+  detach_interpolated_data: False   # True or False
+  detach_interpolated_data2: False   # True or False
+  interpolator_freeze_start_step: null
+  mask_type: "zeros"
+  condition_on_x_last: True
+  use_separate_heads: False
+  loss_function_interpolation: "mse"
+  loss_function_forecast: "mae"
+  time_encoding: "discrete"
+  refine_predictions: False
+  refinement_rounds: 0
+  #
+  forward_conditioning: "none"
+

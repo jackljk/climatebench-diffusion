@@ -1,0 +1,31 @@
+# @package _global_
+
+# example usage:
+# `python run.py mode=test_era5 logger.wandb.id=SOME_WANDB_ID
+
+eval_mode: "test"
+
+module:
+  num_predictions: 25
+
+datamodule:
+  prediction_horizon: 56
+  prediction_horizon_long: 56
+  num_workers: 8
+  eval_batch_size: 8
+
+logger:
+  wandb:
+    id: ???    # id of the run to be continued. Needs to be set manually
+    project: "ERA5"   
+    project_test: "ERA5-eval"   #If not null: overrides logger.wandb.project (allows to use different project for test metrics)
+    job_type: "test"
+    save_to_s3_bucket: False
+    save_best_ckpt: False
+    save_last_ckpt: False
+
+# Checkpoint path to be loaded from wandb cloud (see files tab of run page) or locally (use absolute path)
+ckpt_path: "latest_epoch" #last.ckpt"
+
+trainer:
+  strategy: "auto"

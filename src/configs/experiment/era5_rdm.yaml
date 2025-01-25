@@ -1,0 +1,32 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_rdm
+
+defaults:
+  - era5_genie_ar_global.yaml
+  - override /module: rdm.yaml
+  - override /model: adm.yaml
+  - override /diffusion: erdm.yaml
+  - _self_
+
+name: "${datamodule.hourly_resolution}h-${datamodule.horizon}AR-RDM"
+
+model:
+  with_time_emb: False  # set to true to use time embeddings
+
+diffusion:
+  loss_function: "wmse"
+  variance_loss: False  #  or True or "with_channel"
+  step: 0.5
+  sigma_min: 0.03
+  sigma_max: 800
+
+module:
+  learned_channel_variance_loss: True
+
+datamodule:
+  spatial_crop_outputs: null
+  output_mask_area: null
+  horizon: 8
+  subsample_valid: 38

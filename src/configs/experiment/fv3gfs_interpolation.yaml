@@ -1,0 +1,23 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=fv3gfs_interpolation
+
+defaults:
+  - fv3gfs.yaml
+  - override /module: interpolation.yaml
+  - _self_
+
+name: "FV3GFS-Ipol${datamodule.horizon}h"
+
+datamodule:
+  horizon: 6
+  prediction_horizon: null
+  prediction_horizon_long: null
+
+module:
+  enable_inference_dropout: True
+
+logger:
+  wandb:
+    tags: ["fv3gfs", "interpolation"]

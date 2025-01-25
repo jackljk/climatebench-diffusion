@@ -1,0 +1,13 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=climatebench_daily_adm
+
+defaults:
+  - climatebench_daily.yaml
+  - override /model: adm.yaml
+  - _self_
+
+model:
+  model_channels: 128
+  upsample_outputs_by: 2

@@ -1,0 +1,25 @@
+defaults:
+  - _base_data_config.yaml   # general, dataset-independent, parameters
+  - _self_
+
+_target_: src.datamodules.climatebench.climatebench_daily.ClimateBenchDailyDataModule
+data_dir: "~/data/climate-analytics-lab-shared/ClimateBench/daily/data"   # Make sure that it is an absolute path!
+window: 1 # no window since the granularity is daily (for now)
+simulations: ['ssp126', 'ssp370', 'ssp585', 'historical'] # sims avaliable, ssp126, ssp245, ssp370, ssp585, historical
+normalize_vars: ['CO2', 'CH4', 'SO2', 'BC']
+additional_vars: ['rsdt']
+output_vars: "tas"
+
+sim_validation: 'ssp370'
+validation_size: 45
+mean_over_ensemble: True # True (to mean), 'first' (to take the first ensemble member), stack (to stack all ensemble members)
+scale_inputs: null  # 'upscale' # 'upscale' or 'downscale'
+validation_ensemble: 'first' # Only 'first for now'
+num_ensemble_members: 2 # Number of ensemble members to use ('all' to use all available)
+
+# Simulations Anormalization Parameters - raw datasets should be set as "ssp126_outputs_daily_raw.nc" etc
+simulations_raw: null # Set to null if all simulations are already normalized ie "ssp126_outputs_daily.nc"
+simulations_anom_type: 'piControl' # 'standard' or 'minmax' or 'piControl'
+
+# Debugging parameters
+DEBUG_dataset_size: null # Set to None to use the full dataset, value is the number of years to use

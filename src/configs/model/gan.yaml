@@ -1,0 +1,7 @@
+_target_: src.models.gan.GAN
+
+defaults:
+  - _self_
+  - _base_model_config.yaml   # general, model independent, parameters
+
+dim: 64

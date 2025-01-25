@@ -1,0 +1,6 @@
+defaults:
+  - era5_genie.yaml   # general, dataset-independent, parameters
+  - _self_
+
+
+output_vars: ${datamodule.input_vars}

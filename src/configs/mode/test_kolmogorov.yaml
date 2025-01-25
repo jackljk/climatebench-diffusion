@@ -1,0 +1,32 @@
+# @package _global_
+
+# example usage:
+# `python run.py mode=test_kolmogorov logger.wandb.id=SOME_WANDB_ID`
+
+eval_mode: "test"
+
+module:
+  num_predictions: 25
+
+datamodule:
+  prediction_horizon_long: 209
+  num_workers: 8
+  eval_batch_size: 20
+
+logger:
+  wandb:
+    id: ???    # id of the run to be continued. Needs to be set manually
+    project: "Kolmogorov"   
+    project_test: "Kolmogorov-test"   #If not null: overrides logger.wandb.project (allows to use different project for test metrics)
+    job_type: "test"
+    save_to_s3_bucket: False
+    save_best_ckpt: False
+    save_last_ckpt: False
+
+# Checkpoint path to be loaded from wandb cloud (see files tab of run page) or locally (use absolute path)
+# ckpt_path: "best-val_16ens_mems_avg_crps.ckpt"
+# ckpt_path: "best.ckpt"
+ckpt_path: "last.ckpt"
+
+trainer:
+  strategy: "auto"

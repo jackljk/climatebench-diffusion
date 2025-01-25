@@ -1,0 +1,15 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=climatebench_daily
+# To run it with the modified datamodule, run:
+# python run.py experiment=climatebench_daily datamodule=climatebench_daily_modified
+defaults:
+  - climatebench.yaml
+  - override /datamodule: climatebench_daily.yaml
+  - _self_
+
+name: "CB-Daily"
+
+datamodule:
+  window: 1 # no window since the granularity is daily (for now)

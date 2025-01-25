@@ -1,0 +1,17 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=climatebench_daily_unet
+
+defaults:
+  - climatebench_daily.yaml
+  - override /model: unet_resnet.yaml
+  - _self_
+
+model:
+  dim: 64
+  upsample_outputs_by: 2
+
+logger:
+  wandb:
+    tags: ["climatebench", "UNet-resnet"]

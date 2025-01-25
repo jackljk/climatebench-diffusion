@@ -1,0 +1,54 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=fv3gfs_interpolation
+
+defaults:
+  - fv3gfs.yaml
+  - override /module: forecasting_multi_horizon_dyffusion.yaml
+  - override /diffusion: dyffusion.yaml
+  - _self_
+
+name: "FV3GFS-DY-${datamodule.horizon}h"
+
+datamodule:
+  horizon: 6
+  prediction_horizon: 504
+  prediction_horizon_long: 1464
+
+module:
+  enable_inference_dropout: False
+  num_predictions: 10
+  monitor: "val/avg/crps"
+  inference_val_every_n_epochs: 10  # go for prediction_horizon_long steps every 10 epochs
+
+diffusion:
+  forward_conditioning: "none"
+  interpolator_run_id: "33271555"  # FV3GFS-Ipol6h_SFNO_EMA_256x8d_L2rel_44lr_10mlpDr_10dpr_53wd_fixedLRS_11seed_11h37mNov25_33271555
+  interpolator_wandb_ckpt_filename: "last.ckpt"  # "best-val_avg_crps.ckpt"
+
+callbacks:
+  model_checkpoint_time_mean_rmse_air_temperature_7:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: "val/time_mean/rmse/air_temperature_7"   # name of the logged metric which determines when model is improving
+    mode: "min"         # "max" means higher metric value is better, can be also "min"
+    save_top_k: 1               # save k best models (determined by above metric)
+    save_last: False            # already saved in normal model checkpoint
+    verbose: ${verbose}
+    dirpath: ${ckpt_dir}
+    filename: "${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}"
+    auto_insert_metric_name: False
+  model_checkpoint_time_mean_rmse_pressure:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: "val/time_mean/rmse/PRESsfc"   # name of the logged metric which determines when model is improving
+    mode: "min"         # "max" means higher metric value is better, can be also "min"
+    save_top_k: 1               # save k best models (determined by above metric)
+    save_last: False            # already saved in normal model checkpoint
+    verbose: ${verbose}
+    dirpath: ${ckpt_dir}
+    filename: "${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}"
+    auto_insert_metric_name: False
+
+logger:
+  wandb:
+    tags: ["fv3gfs", "dyffusion"]

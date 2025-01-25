@@ -1,0 +1,16 @@
+defaults:
+  - unet_resnet.yaml   # general, model independent, parameters
+  - _self_
+
+_target_: src.models.unet_semi_temp_rdm.Unet
+with_time_emb: True
+time_dim_mult: 2
+# 
+temporal_op: "conv_3d"  # conv_1d, conv_3d, or attn
+temporal_conv_kernel_size: 3
+use_init_temporal: False
+use_rotary_emb: False
+attn_heads: 8
+attn_dim_head: 32
+temporal_dropout: 0.0
+double_conv_temporal_layer: True   # not used if temporal_op is attn

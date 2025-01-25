@@ -1,0 +1,29 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_forecasting
+
+defaults:
+  - era5_3d.yaml
+#  - override /module: forecasting_multi_horizon_time_conditioned.yaml
+  - _self_
+
+trainer:
+  max_epochs: 50
+  accumulate_grad_batches: 4
+
+datamodule:
+  prediction_horizon: 240
+  train_slice: ["2009-01-01", "2018-12-31"]
+
+module:
+  num_predictions: 16
+  num_predictions_in_memory: 8
+  enable_inference_dropout: True
+  use_ema: True
+
+model:
+  dim: 64
+  block_dropout2: 0.25
+  block_dropout1: 0.0
+  attn_spatial_dropout: 0.05

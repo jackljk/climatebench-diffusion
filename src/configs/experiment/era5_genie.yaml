@@ -1,0 +1,30 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_genie
+
+defaults:
+  - era5_2d.yaml
+  - override /datamodule: era5_genie.yaml
+  - override /module: forecasting_multi_horizon_time_conditioned.yaml
+  - _self_
+
+name: "GENIE-${datamodule.hourly_resolution}h-${datamodule.horizon}l"
+
+trainer:
+  max_epochs: 200
+  accumulate_grad_batches: 1
+#  precision: 32   # 16-bit precision if commented out
+
+datamodule:
+  hourly_resolution: 6
+  batch_size: 64    # for horizon 1
+  eval_batch_size: 4
+
+module:
+  enable_inference_dropout: False
+
+
+logger:
+  wandb:
+    project: "ERA5" #-GENIE"

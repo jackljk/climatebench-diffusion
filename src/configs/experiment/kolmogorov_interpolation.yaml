@@ -1,0 +1,21 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_interpolation
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: interpolation.yaml
+  - _self_
+
+name: "Kolmogorov-Ipol${datamodule.horizon}h"
+module:
+  enable_inference_dropout: True
+  monitor: "val/avg/crps"
+
+model:
+  with_time_emb: True
+
+logger:
+  wandb:
+    tags: ["interpolation"]

@@ -1,0 +1,23 @@
+# @package _global_
+
+# debug mode sets name of the logging folder to 'logs/debug/...'
+# enables trainer debug options
+# also sets level od command line logger to DEBUG
+# example usage:
+# `python run.py mode=debug_ns`
+
+defaults:
+#  - debug.yaml
+#  - override /datamodule: navier_stokes.yaml
+  - override /experiment: navier_stokes_time_conditioned.yaml
+  - override /callbacks: none
+  - override /logger: none
+  - _self_
+
+# experiment=navier_stokes callbacks=none logger=none datamodule.num_workers=0 datamodule.num_trajectories=1
+datamodule:
+  num_trajectories: 1
+  eval_batch_size: 4
+
+module:
+  num_predictions: 3

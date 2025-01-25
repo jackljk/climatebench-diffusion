@@ -1,0 +1,29 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=spring_mesh_dyffusion_markov
+
+defaults:
+  - spring_mesh.yaml
+  - override /module: forecasting_multi_horizon_dyffusion_markov.yaml
+  - override /diffusion: dyffusion_markov.yaml
+  - _self_
+
+name: "SM-MH${datamodule.horizon}-DYMarkov"
+diffusion:
+  interpolator_run_id: "czocieyv"   # Please fill in the wandb run id of the trained interpolator
+  forward_conditioning: "none"
+
+logger:
+  wandb:
+    tags: ['dyffusion-markov']
+
+#v0=2sqdeqlu - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_5Dr_14wd__11seed
+#v1=czocieyv - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_10Dr_14wd__11seed
+#v2=wcdgeb88 - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_15Dr_14wd__11seed
+#v3=qaudgrcb - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_20Dr_14wd__11seed
+#v4=v36fbo7n - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_25Dr_14wd__11seed
+#v5=ngnfc3nj - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_30Dr_14wd__11seed
+#v6=nhggkeuk - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_35Dr_14wd__11seed
+#v7=q5lt6sjg - SpringMesh-IpolNext6h_SimpleCNN_EMA0.995_64d_44lr_40Dr_14wd__11seed
+#v8=wm43eedx - SpringMesh-IpolNext6h_SimpleCNN_64d_44lr_10Dr_14wd__11seed

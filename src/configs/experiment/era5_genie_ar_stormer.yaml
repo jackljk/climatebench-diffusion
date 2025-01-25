@@ -1,0 +1,35 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_genie_ar_stormer
+
+defaults:
+  - era5_genie_ar.yaml
+  - override /model: stormer.yaml
+  - _self_
+
+name: "GENIE-${datamodule.hourly_resolution}h-${datamodule.horizon}AR"
+
+datamodule:
+  spatial_crop_inputs: null
+  batch_size: 100  # 96 # 160
+  spatial_crop_outputs: null
+  output_mask_area: null
+
+module:
+  _target_: "src.experiment_types.forecasting_multi_horizon.ForecastingStormer"
+#  torch_compile: "model"
+
+model:
+  outer_sample_mode: "bilinear"
+  upsample_dims: [240, 128]
+  # Patch size.
+  #   For 1.5 deg data:
+  #       - 2 -> seq. length = 7200; last-linear projects to 4 * c_out (e.g. 4*69 = 276)
+  #       - 4 -> seq. length = 1800 (or 1920 after upsampling); last-linear projects to 16 * c_out (e.g. 16*69 = 1104)
+  patch_size: 4
+
+trainer:
+  deterministic: False
+  benchmark: False
+

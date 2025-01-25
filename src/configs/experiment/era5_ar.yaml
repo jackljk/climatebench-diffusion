@@ -1,0 +1,18 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_ipol
+
+defaults:
+  - era5_benchmark.yaml
+  - override /datamodule: era5_benchmark.yaml
+  - override /module: forecasting_multi_horizon_at_once.yaml
+  - _self_
+
+name: "ERA5-AR-${datamodule.hourly_resolution}h-${datamodule.horizon}l"
+
+module:
+  enable_inference_dropout: True
+
+datamodule:
+  prediction_horizon: 20

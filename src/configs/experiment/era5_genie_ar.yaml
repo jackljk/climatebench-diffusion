@@ -1,0 +1,28 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_genie
+
+defaults:
+  - era5_genie.yaml
+  - override /datamodule: era5_genie_ar.yaml
+  - override /module: forecasting_multi_horizon_at_once.yaml
+  - _self_
+
+name: "GENIE-${datamodule.hourly_resolution}h-${datamodule.horizon}AR"
+
+datamodule:
+  hourly_resolution: 6
+  horizon: 1
+  prediction_horizon: 12
+  spatial_crop_during_training: False   #  Important due to autoregressive nature of the model
+  # How to weight the loss terms during training
+  loss_pressure_weighting: "graphcast"
+  loss_surface_vars_weighting: "graphcast"
+  # num_workers: 32
+  # prefetch_factor: 12
+  batch_size: 96
+
+trainer:
+  accumulate_grad_batches: 1
+  devices: 2

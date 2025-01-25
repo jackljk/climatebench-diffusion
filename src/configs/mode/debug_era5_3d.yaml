@@ -1,0 +1,28 @@
+# @package _global_
+
+# debug mode sets name of the logging folder to 'logs/debug/...'
+# enables trainer debug options
+# also sets level od command line logger to DEBUG
+# example usage:
+# `python run.py mode=debug_era5`
+
+defaults:
+#  - debug.yaml
+  - override /experiment: era5_3d.yaml
+  - override /callbacks: null
+  - override /logger: null
+  - _self_
+
+# experiment=navier_stokes callbacks=none logger=none datamodule.num_workers=0 datamodule.num_trajectories=1
+datamodule:
+  train_slice: ["2017-01-01", "2017-12-32"]  # None means use all data
+  subsample_valid: 20
+  prediction_horizon: 24   #${datamodule.horizon}   # may set to higher rollouts
+  variables_3d:
+    - "geopotential"
+    - "specific_humidity"
+  variables_2d:
+      - "mean_sea_level_pressure"
+  static_fields:
+      - "land_sea_mask"
+  pressure_levels: [50, 400, 1000]

@@ -1,0 +1,6 @@
+name: "cosine_hard_restarts"
+warmup_epochs: 10
+max_epochs: ${trainer.max_epochs}
+num_cycles: 1
+last_epoch: -1
+interval: "step"

@@ -1,0 +1,31 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_interpolation
+
+defaults:
+  - era5_genie_ar.yaml
+  - override /module: interpolation.yaml
+  - override /model: adm.yaml
+  - _self_
+
+name: "Ipol-${datamodule.hourly_resolution}h-${datamodule.horizon}T"
+
+datamodule:
+  spatial_crop_inputs: null
+  spatial_crop_outputs: null
+  output_mask_area: null
+  prediction_horizon: ${datamodule.horizon}   # rollouts don't make sense for interpolation
+
+module:
+  conv_padding_mode_global: "circular_width_only"   #  circular is appropriate for global data since it treats the borders as connected
+  enable_inference_dropout: True
+
+model:
+  outer_sample_mode: "bilinear"
+  upsample_dims: [240, 128]
+  with_time_emb: True
+
+trainer:
+  deterministic: False    # necessary when using upsample_dims
+  benchmark: False

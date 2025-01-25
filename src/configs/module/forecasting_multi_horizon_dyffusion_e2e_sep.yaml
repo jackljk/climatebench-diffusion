@@ -1,0 +1,10 @@
+# to execute this module run:
+# python run.py module=forecasting_multi_horizon_dyffusion_e2e
+
+defaults:
+  - _base_multi_horizon_config.yaml
+  - _self_
+
+_target_: src.experiment_types.forecasting_multi_horizon.DYffusionE2ESeparateModels
+use_ema_interpolator: False
+interpolator_ema_decay: 0.9999

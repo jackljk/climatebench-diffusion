@@ -1,0 +1,25 @@
+defaults:
+  - _base_data_config.yaml   # general, dataset-independent, parameters
+  - _self_
+
+
+# DO NOT USE THIS CONFIGURATION DIRECTLY. It is intended to be used as a base for specifying specific sets of fields.
+_target_: src.datamodules.fv3gfs_ensemble.FV3GFSEnsembleDataModule
+data_dir: null #"/net/nfs/climate/data/2023-08-11-vertically-resolved-1deg-fme-ensemble-dataset"
+data_dir_stats: null #'/net/nfs/climate/salvar/data/fv3gfs-ensemble-ic0001-stats-residual-scaling-all-years-v2'
+training_sub_paths: null    # set to ic_0002 to train on the second ensemble member only (or any list of ensemble members)
+max_train_samples: null    # if null, use all training samples
+max_val_samples: 80       # if null, use all validation samples
+# Set the below list of fields in the inheriting config files (in configs/datamodule/ subdirectory)
+forcing_names: null   # if null, no forcing is used
+in_names: null
+out_names: null
+auxiliary_names: null
+# horizon for inference
+prediction_horizon: 500   #${datamodule.horizon}   # may set to higher rollouts
+prescriber:
+  _target_: src.ace_inference.core.prescriber.Prescriber
+  prescribed_name: surface_temperature
+  mask_name: ocean_fraction
+  mask_value: 1
+num_workers: 2

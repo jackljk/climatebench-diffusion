@@ -1,0 +1,13 @@
+defaults:
+  - adm.yaml   # inherit defaults from adm.yaml
+  - _self_
+
+_target_: src.models.networks_edm.DhariwalUNetTemporal
+temporal_op: "attn"
+ # use temporal block after first encoder conv or not
+init_temporal_op: False
+# use temporal block before downsampling or not. If False, use after downsampling.
+#  If null, don't use temporal block before or after downsampling
+temporal_op_before_down: null
+# use temporal block after the last decoder block or not
+final_temporal_op: False

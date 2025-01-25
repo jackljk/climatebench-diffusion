@@ -1,0 +1,12 @@
+defaults:
+  - era5_2d.yaml   # general, dataset-independent, parameters
+  - _self_
+
+train_slice: ["1979-01-01", "2018-12-31"]    # Match text available in the dataset
+val_slice: ["2019-01-01", "2019-12-31"]
+test_slice: ["2020-01-01", "2020-12-31"]
+prediction_horizon: null   #${datamodule.horizon}   # may set to higher rollouts
+spatial_crop_inputs: null
+spatial_crop_outputs: null
+output_vars: ${datamodule.input_vars}
+hourly_resolution: 6

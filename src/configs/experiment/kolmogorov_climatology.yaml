@@ -1,0 +1,20 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_climatology
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: climatology.yaml
+  - _self_
+
+name: "Kolmogorov-Climatology"
+module:
+  num_predictions: 25
+
+eval_mode: "test"
+
+logger:
+  wandb:
+    project: "Kolmogorov-test"
+    tags: ["climatology"]

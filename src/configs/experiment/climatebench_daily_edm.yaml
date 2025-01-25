@@ -1,0 +1,23 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=cb_ddpm
+
+defaults:
+  - climatebench_daily.yaml
+  - override /model: unet_resnet.yaml  # or use adm.yaml
+  - override /diffusion: edm.yaml
+  - _self_
+
+name: "CB-Daily-EDM"
+
+model:
+  with_time_emb: True
+  upsample_condition_by: 2   # Is this the right choice to fix issue of differing spatial resolutions of inputs vs targets?
+
+diffusion:
+  loss_function: "mse"   # todo: use latitude-weighted MSE when saving latitude area weights
+
+logger:
+  wandb:
+    tags: ["climatebench", "edm"]

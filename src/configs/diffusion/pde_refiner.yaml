@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - _base.yaml
+  - _self_
+
+diffusion:
+  _target_: src.diffusion.pderefiner.PDERefiner
+
+  predict_difference: False
+  difference_weight: 1.0
+  num_refinement_steps: 3
+  min_noise_std: 2e-7
+  timesteps: ${diffusion.num_refinement_steps}
+  loss_function: "mse"

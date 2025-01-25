@@ -1,0 +1,10 @@
+defaults:
+  - _self_
+  - _base_data_config.yaml   # general, dataset-independent, parameters
+
+_target_: src.datamodules.debug_datamodule.DebugDataModule
+horizon: 1
+window: 1
+channels: 2
+height: 8
+width: 8

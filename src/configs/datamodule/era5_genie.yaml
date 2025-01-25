@@ -1,0 +1,16 @@
+defaults:
+  - era5_2d.yaml   # general, dataset-independent, parameters
+  - _self_
+
+train_slice: ["2014-04-07", "2020-12-31"]    # Match text available in the dataset
+prediction_horizon: null   #${datamodule.horizon}   # may set to higher rollouts
+spatial_crop_inputs:
+  latitude: [10, 70]
+  longitude: [190, 310]
+spatial_crop_outputs:
+  latitude: [24, 50]
+  longitude: [235, 295]
+output_mask_area: "land"
+spatial_crop_during_training: True
+
+batch_size: 64                 # batch size for training

@@ -1,0 +1,19 @@
+# @package _global_
+
+# to execute this module run:
+# python run.py module=climatology datamodule=<SOME_DATAMODULE> 
+
+defaults:
+  - _base_multi_horizon_config.yaml
+  - _self_
+
+name: "Climatology"
+module:
+  _target_: src.experiment_types.forecasting_multi_horizon.ClimatologyBaseline
+  optimizer: null
+  scheduler: null
+  use_ema: False
+  
+model: null
+
+eval_mode: "test"

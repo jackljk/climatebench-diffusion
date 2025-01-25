@@ -1,0 +1,25 @@
+defaults:
+  - _base.yaml
+  - _self_
+
+_target_: src.diffusion.erdm.ERDM
+schedule: 'edm'            # edm | poly1 | poly2 -- support for different schedules within the window
+sigma_min: 0.002           # Minimum supported noise level.
+sigma_max: 80.0            # Maximum supported noise level.
+variance_loss: True        # Use a Kendall&Gal style loss weighting with learned per-frame variance -- found to be beneficial
+use_map_noise: True        # Use classical global mapping network based conditioning to inform network of fractional frame shift. 
+                           # If False, the network will not be trained with randomly shifted noises, and will only handle the case offset=0! (XXX that mode is currently untested)
+# time_cond_mode: null       # None | 'direct' | 'fourier'
+time_to_channels: True
+conditional: False
+a: null
+b: null
+# Sampling parameters.
+# how many frames to step per iteration - can be fractional, e.g. 0.3 will do three or four sub-steps per frame.
+# A frame is yielded every time the steps add up to a full integer   # RDM does 4 (?) sub-steps per frame = 0.25
+step: 1
+rho: 7                     # Exponent of the time step discretization.
+S_churn: 0.05               # Maximum noise increase per step.
+S_noise: 1                 # Noise level for increased noise.
+S_ar_noise: 1
+heun: True                 # Use Heun's method for ODE integration.

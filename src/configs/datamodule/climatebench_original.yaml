@@ -1,0 +1,14 @@
+defaults:
+  - _base_data_config.yaml   # general, dataset-independent, parameters
+  - _self_
+
+_target_: src.datamodules.climatebench.climatebench_original.ClimateBenchDataModule
+data_dir: "~/data/climatebench"   # Make sure that it is an absolute path!
+window: 10
+simulations: ['ssp126', 'ssp370', 'ssp585', 'hist-GHG', 'hist-aer']
+normalize_vars: ['CO2', 'CH4', 'SO2', 'BC']
+output_vars: "tas"
+
+sim_validation: 'ssp370'
+validation_size: 45
+mean_over_ensemble: True

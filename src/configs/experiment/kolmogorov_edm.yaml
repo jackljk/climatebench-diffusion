@@ -1,0 +1,23 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_edm
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: forecasting_multi_horizon_at_once.yaml
+  - override /model: adm.yaml
+  - override /diffusion: edm.yaml
+  - _self_
+
+name: "Kolmogorov-H${datamodule.horizon}-EDM-${diffusion.num_steps}T"
+
+model:
+  with_time_emb: True
+
+# diffusion:
+#   sampling_timesteps: 100
+
+logger:
+  wandb:
+    tags: ["diffusion", "EDM"]

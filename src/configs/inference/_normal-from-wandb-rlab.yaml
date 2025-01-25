@@ -1,0 +1,88 @@
+# this is used when doing standalone inference with beaker-inference.yaml
+experiment_dir: /data/climate-model/results/fme-inference-ema
+#n_forward_steps: 43800
+#n_forward_steps: 14600
+#forward_steps_in_memory: 200
+n_forward_steps: 1000
+forward_steps_in_memory: 20
+log_video: false
+log_zonal_mean_images: false
+logging:
+  log_to_screen: true
+  log_to_wandb: true
+  log_to_file: true
+  project: "salva-test-fme-inference"
+  entity: ai2cm
+validation_loader:
+  start_indices:
+    first: 0
+    n_initial_conditions: 1
+  dataset:
+#    data_path: /data/climate-model/fv3gfs/2023-08-11-subset-for-debugging-of-vertically-resolved-1deg-ensemble-dataset/validation/ic_0011
+    data_path: /data/climate-model/fv3gfs/2023-09-07-vertically-resolved-1deg-fme-ensemble-dataset-netcdfs/validation/ic_0011
+#    n_repeats: 10   # 10 --> 100 year rollout (10 x 10 years)
+    n_repeats: 1
+  num_data_workers: 8
+#  n_samples: 1  # 1460, 2920
+data_writer:
+  save_prediction_files: false  #true  # Set to true to save predictions to xarray files (e.g. for further analysis)
+#compute_metrics: false
+overrides:
+#  use_ema_at_inference: False
+#  enable_inference_dropout: False
+  diffusion_config:
+    interpolator_local_checkpoint_path: "/data/results/checkpoints/33271555-best-val_avg_crps.ckpt"  # new checkpoint
+    interpolator_run_id: "33271555"
+#    interpolator_local_checkpoint_path: "/data/results/checkpoints/01HER6GMAMHXPA62240XSV4TD4-best-val_avg_16ens_mems_weighted_crps.ckpt"
+    interpolator_wandb_kwargs:
+      entity: "ai2cm"
+      project: "FME-v2-salva"
+##    refine_predictions: "intermediate"
+##    refinement_rounds: 1
+##    interpolator_wandb_ckpt_filename: "best-val_avg_16ens_mems_weighted_crps.ckpt"
+#    use_cold_sampling_for_last_step: False
+#    use_cold_sampling_for_intermediate_steps: False
+#    interpolator_use_ema: True
+#    use_cold_sampling_for_init_of_ar_step: True
+#    refine_intermediate_predictions: True
+#    enable_interpolator_dropout: False
+#    sampling_type: "heun2"
+#    additional_interpolation_steps_factor: 6
+#    interpolate_before_t1: False
+#    schedule: "before_t1_only"
+#    additional_interpolation_steps: 25
+checkpoint_path: /data/results/checkpoints/01HJC457FVAKFPT6A4FJZJ1T8Q-best-inference_avg_16ens_mems_weighted_crps-ep31_cleaned.ckpt
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME1BZNDVR4C5NR53HN8A2V9-FV3GFS-MH6-DY2S_NOdp_epoch032_seed11_inference-ep32.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME1BZNDVR4C5NR53HN8A2V9-best-inference_avg_16ens_mems_weighted_crps-final.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME1BZNDVR4C5NR53HN8A2V9-best-val_avg_16ens_mems_weighted_crps-final.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME090NQZH2Q5R251RAWNXG8-FV3GFS-MH6-DY2S_None_epoch085_seed11-ep85.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME090NQZH2Q5R251RAWNXG8-FV3GFS-MH6-DY2S_None_epoch032_seed11-ep32.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME090NQZH2Q5R251RAWNXG8-FV3GFS-MH6-DY2S_None_epoch031_seed11-ep31.ckpt"
+#checkpoint_path: "/net/nfs/climate/salvar/data/checkpoints-from-wandb/01HME090NQZH2Q5R251RAWNXG8-FV3GFS-MH6-DY2S_None_epoch030_seed11-ep30.ckpt"
+# ------------------ For wandb reloading:
+#checkpoint_path: "last.ckpt"
+#checkpoint_path: "best-val_avg_16ens_mems_weighted_crps.ckpt"
+#wandb_run_path: "ai2cm/FME-v2-salva/01HME1BZNDVR4C5NR53HN8A2V9"
+#checkpoint_path: "best-inference_avg_16ens_mems_weighted_crps.ckpt"
+#wandb_run_path: "ai2cm/FME-v2-salva/01HJC457FVAKFPT6A4FJZJ1T8Q"
+
+#checkpoint_path: "best-val_avg_1ens_mems_weighted_rmse.ckpt"
+#checkpoint_path: "best-inference_avg_1ens_mems_weighted_rmse.ckpt"
+#wandb_run_path: "ai2cm/FME-v2-salva/01HPV76TC9WFM90ZK9KJG14SVQ"
+
+
+
+# 01HGEAX0PCZW2T730EBQH052E5: FV3GFS-MH6-DY2S_UNetR_EMA_01HENDE6CTGQ7EKMKE6VMENB81-ipolID_none-fcond_DynT_128x3h_L1_34lr_10bDr_iDr_13wd_cos__11seed_20h08mNov29_01HGEAX0PCZW2T730EBQH052E5
+# 01HGGQBVQ0QQQP35WDPVG92Y04: FV3GFS-MH6-DY2S_SFNO_EMA_01HEND4Z50D9WHSAEGA5TF2FP0-ipolID_none-fcond_DynT_256x8h_L2R_34lr_4ft2mlpDr_iDr_53wd_cos__11seed_18h21mNov30_01HGGQBVQ0QQQP35WDPVG92Y04
+# 01HGBKF2DJ0RY39VDCJ8BEA5AT: FV3GFS-MH6-DY2S_SFNO_EMA_01HEND4Z50D9WHSAEGA5TF2FP0-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_53wd_cos__11seed_18h42mNov28_01HGBKF2DJ0RY39VDCJ8BEA5AT
+# 01HGA6640GAJB90E0YTBCACSXA: FV3GFS-MH6-DY2S_SFNO_EMA_01HEND4Z50D9WHSAEGA5TF2FP0-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_15wd_cos__11seed_05h25mNov28_01HGA6640GAJB90E0YTBCACSXA
+# 01HJC457FVAKFPT6A4FJZJ1T8Q: FV3GFS-MH6-DY2S_SFNO_EMA_01HER6GMAMHXPA62240XSV4TD4-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_53wd_cos__11seed_19h59mDec23_01HJC457FVAKFPT6A4FJZJ1T8Q
+
+# 01HMD315T7WV0C5DHJ8HJCQ5HZ: FV3GFS-MH6-DY2S_SFNO_EMA_01HFQMN1P7SSEX155QTAQXT0D7-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_0.1wd_cos_SA_11seed_01h31mJan18_01HMD315T7WV0C5DHJ8HJCQ5HZ (train-fme-run_mh6_dy2s3_sfno_none_34lr_ema_cos_1wd_save_all)
+# 01HME090NQZH2Q5R251RAWNXG8: FV3GFS-MH6-DY2S_SFNO_EMA_01HFQMN1P7SSEX155QTAQXT0D7-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_53wd_cos_SA_11seed_10h06mJan18_01HME090NQZH2Q5R251RAWNXG8 (train-fme-run_mh6_dy2s3_sfno_none_34lr_ema_cos_005wd_save_all)
+
+# 01HME1BZNDVR4C5NR53HN8A2V9: FV3GFS-MH6-DY2S_NOdp_SFNO_EMA_01HKH0CMWYEQ2EJ5XZKKPFFXPF-ipolID_none-fcond_DynT_256x8h_L1_34lr_4ft2mlpDr_iDr_53wd_cos__11seed_10h21mJan18_01HME1BZNDVR4C5NR53HN8A2V9
+# 01HMFES2M785769Y2GBJ1CCQBK: FV3GFS-SimMH1_SFNO_EMA_256x8h_L2R_44lr_13ft8mlpDr_8dpr_15wd_cos__11seed_23h34mJan18_01HMFES2M785769Y2GBJ1CCQBK
+
+# 01HPV76TC9WFM90ZK9KJG14SVQ: FV3GFS-MH6-DYe2e_SFNO_EMA_none-fcond_256x8h_MSE-MAE_34lr_13ft8mlpDr_iDr_53wd_cos__11seed_09h44mFeb17_01HPV76TC9WFM90ZK9KJG14SVQ
+# 01HPV745KS4NCX2XT9X1DD0JGS: FV3GFS-MH6-DYe2e_SFNO_EMA_none-fcond_256x8h_MSE-MAE_34lr_0.5lRec_0.25lIpols_13ft8mlpDr_iDr_53wd_cos__11seed_09h42mFeb17_01HPV745KS4NCX2XT9X1DD0JGS

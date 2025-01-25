@@ -1,0 +1,17 @@
+# @package _global_
+
+# to execute this module run:
+# python run.py module=emulation
+
+defaults:
+  - _base_experiment_config.yaml
+  - _self_
+
+module:
+  _target_: src.experiment_types.emulation.EmulationExperiment
+  stack_window_to_channel_dim: True
+  enable_inference_dropout: False
+  monitor: "val/rmse"
+
+model:
+  with_time_emb: False

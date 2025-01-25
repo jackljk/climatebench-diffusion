@@ -1,0 +1,11 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5
+
+defaults:
+  - era5_base.yaml
+  - override /datamodule: era5_3d.yaml
+  - override /model: unet3d.yaml
+#  - override scheduler@module.scheduler: cosine_annealing.yaml
+  - _self_

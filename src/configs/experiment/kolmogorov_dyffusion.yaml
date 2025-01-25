@@ -1,0 +1,21 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_dyffusion
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: forecasting_multi_horizon_dyffusion.yaml
+  - override /diffusion: dyffusion.yaml
+  - _self_
+
+name: "Kolmogorov-H${datamodule.horizon}-DY2S"
+diffusion:
+  interpolator_run_id: ???   # Please fill in the wandb run id of the trained interpolator
+  interpolator_wandb_ckpt_filename: "last.ckpt"
+  refine_intermediate_predictions: False
+  forward_conditioning: "none"
+
+logger:
+  wandb:
+    tags: ['dyffusion']

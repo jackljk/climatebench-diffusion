@@ -1,0 +1,19 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_genie
+
+defaults:
+  - era5_genie_ar_global.yaml
+  - override /model: adm.yaml
+  - _self_
+
+name: "${datamodule.hourly_resolution}h-${datamodule.horizon}AR"
+
+model:
+  outer_sample_mode: "bilinear"
+  upsample_dims: [240, 128]
+
+datamodule:
+  spatial_crop_outputs: null
+  output_mask_area: null

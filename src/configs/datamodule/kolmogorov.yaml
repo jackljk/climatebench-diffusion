@@ -1,0 +1,21 @@
+defaults:
+  - _base_data_config_temporal.yaml   # general, dataset-independent, parameters
+  - _self_
+
+_target_: src.datamodules.kolmogorov.KolmogorovDataModule
+# data_dir: "C:/Users/XYZ/data/physical-nn-benchmark"
+filename: "kolmogorov-32-250-256-256.nc"
+prediction_horizon: null
+prediction_horizon_long: 209   #  ds
+channels: ["streamfunction"]
+downsampling_method: "interp"
+spatial_downsampling_factor: 1
+num_val_trajectories: 2
+num_test_trajectories: 5
+discard_first_n: 40
+add_noise_level: 0.0
+subsample_valid: 2
+max_num_train_samples: null
+data_split_seed: 77 # Seed for the random number generator, do not change for reproducibility
+batch_size: 128     # Global batch size
+standardize: False   # Standardize the data

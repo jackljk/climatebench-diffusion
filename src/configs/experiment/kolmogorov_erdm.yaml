@@ -1,0 +1,36 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_erdm
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: rdm.yaml
+  - override /model: unet_resnet.yaml
+  - override /diffusion: erdm.yaml
+  - _self_
+
+name: "Kolmogorov-H${datamodule.horizon}-ERDM-${diffusion.schedule}-${diffusion.sigma_min}-${diffusion.sigma_max}sigma"
+
+model:
+  with_time_emb: False
+
+module:
+  inference_val_every_n_epochs: 4
+
+callbacks:
+  model_checkpoint_t8:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: "val/t8/crps"   # name of the logged metric which determines when model is improving
+    mode:  "min"       # "max" means higher metric value is better, can be also "min"
+    save_top_k: 5               # save k best models (determined by above metric)
+    save_last: False             # additionally always save model from last epoch
+    verbose: ${verbose}
+    dirpath: ${ckpt_dir}
+    filename: "${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}"
+    auto_insert_metric_name: True
+
+logger:
+  wandb:
+    tags: ["diffusion", "ERDM"]
+  

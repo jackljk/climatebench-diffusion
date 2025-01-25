@@ -1,0 +1,267 @@
+import torch
+import torch.nn.functional as F
+from einops import rearrange, repeat
+from torch import einsum, nn
+from xformers.ops import memory_efficient_attention, unbind
+
+from src.models.modules.misc import checkpoint
+from src.utilities.utils import default, exists
+
+
+class LinearAttention(nn.Module):
+    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32, dropout: float = 0.0, rescale: str = "qk"):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Sequential(nn.Dropout(dropout), nn.Conv2d(dim, hidden_dim * 3, 1, bias=False))
+        assert rescale in ["qk", "qkv"]
+        self.rescale = getattr(self, f"rescale_{rescale}")
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+        # nn.Sequential(
+        #     nn.Conv2d(hidden_dim, dim, 1),
+        #     nn.Dropout(dropout)
+        # )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv)
+
+        q, k, v = self.rescale(q, k, v, h=h, w=w)
+        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
+
+        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
+        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
+        return self.to_out(out)
+
+    def rescale_qk(self, q, k, v, h, w):
+        q = q * self.scale
+        k = k.softmax(dim=-1)
+        return q, k, v
+
+    def rescale_qkv(self, q, k, v, h, w):
+        q = q.softmax(dim=-2)
+        q = q * self.scale
+        k = k.softmax(dim=-1)
+        v = v / (h * w)
+        return q, k, v
+
+
+def l2norm(t):
+    return F.normalize(t, dim=-1)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32, dropout: float = 0.0):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, pos_bias=None):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv)
+
+        q = q * self.scale
+
+        sim = torch.einsum("b h d i, b h d j -> b h i j", q, k)
+        # relative positional bias
+        if exists(pos_bias):
+            sim = sim + pos_bias
+
+        attn = sim.softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = torch.einsum("b h i j, b h d j -> b h i d", attn, v)
+        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
+        return self.to_out(out)
+
+
+class MemEffAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, attn_bias=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+
+        q, k, v = unbind(qkv, 2)
+
+        x = self.attention_forward(q, k, v, attn_bias=attn_bias)
+        x = x.reshape([B, N, C])
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    @torch.compiler.disable()
+    def attention_forward(self, q, k, v, attn_bias=None):
+        return memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+
+
+# feedforward
+class GEGLU(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.0):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        dim_out = default(dim_out, dim)
+        project_in = nn.Sequential(nn.Linear(dim, inner_dim), nn.GELU()) if not glu else GEGLU(dim, inner_dim)
+
+        self.net = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def Normalize(in_channels, num_groups=32):
+    return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.scale = dim_head**-0.5
+        self.heads = heads
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+
+        q = self.to_q(x)
+        # print(f"Using context? {context is not None}. x shape: {x.shape}")
+        if context is not None and context.ndim == 2:
+            context = repeat(context, "b n -> b () n", b=x.shape[0])  #
+            # print(f"Context shape: {context.shape}")
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
+
+        sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
+
+        if exists(mask):
+            mask = rearrange(mask, "b ... -> b (...)")
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, "b j -> (b h) () j", h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+
+        out = einsum("b i j, b j d -> b i d", attn, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
+        return self.to_out(out)
+
+
+class BasicTransformerBlock(nn.Module):
+    def __init__(self, dim, n_heads, d_head, dropout=0.0, context_dim=None, gated_ff=True, checkpoint=False):
+        super().__init__()
+        self.attn1 = CrossAttention(
+            query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )  # is a self-attention
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.attn2 = CrossAttention(
+            query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )  # is self-attn if context is none
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.checkpoint = checkpoint
+
+    def forward(self, x, context=None):
+        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+
+    def _forward(self, x, context=None):
+        x = self.attn1(self.norm1(x)) + x
+        x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+
+class SpatialTransformer(nn.Module):
+    """
+    Transformer block for image-like data.
+    First, project the input (aka embedding)
+    and reshape to b, t, d.
+    Then apply standard transformer action.
+    Finally, reshape to image
+    """
+
+    def __init__(self, in_channels, n_heads, d_head, depth=1, dropout=0.0, context_dim=None):
+        super().__init__()
+        self.in_channels = in_channels
+        inner_dim = n_heads * d_head
+        num_groups = 32 if in_channels > 32 else in_channels
+        self.norm = Normalize(in_channels, num_groups=num_groups)
+
+        self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+                for d in range(depth)
+            ]
+        )
+
+        self.proj_out = zero_module(nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0))
+
+    def forward(self, x, context=None):
+        # note: if no context is given, cross-attention defaults to self-attention
+        b, c, h, w = x.shape
+        x_in = x
+        x = self.norm(x)
+        x = self.proj_in(x)
+        x = rearrange(x, "b c h w -> b (h w) c")
+        for block in self.transformer_blocks:
+            x = block(x, context=context)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+        x = self.proj_out(x)
+        return x + x_in

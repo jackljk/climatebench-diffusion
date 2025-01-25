@@ -1,0 +1,7 @@
+_target_: src.utilities.lr_scheduler.LinearWarmupCosineAnnealingLR
+warmup_epochs: 10
+max_epochs: ${trainer.max_epochs}
+warmup_start_lr: 1e-8
+eta_min: 1e-8
+last_epoch: -1
+interval: "step"

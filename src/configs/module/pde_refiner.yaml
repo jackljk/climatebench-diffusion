@@ -1,0 +1,14 @@
+# @package _global_
+
+# to execute this module run:
+# python run.py module=pde_refiner
+
+defaults:
+  - _base_multi_horizon_config.yaml
+  - _self_
+
+module:
+  _target_: src.experiment_types.forecasting_multi_horizon.PDERefinerModule
+
+model:
+  with_time_emb: True   # need to embed time for the diffusion model

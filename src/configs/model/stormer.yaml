@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - _base_model_config.yaml   # general, model independent, parameters
+
+_target_: src.models.stormer.vit_adaln.ViTAdaLN
+patch_size: 2
+embed_norm: true
+hidden_size: 1024
+depth: 24
+num_heads: 16
+mlp_ratio: 4.0
+with_time_emb: True
+
+# For ViT-Base model: (86M params)
+# hidden_size: 768
+# depth: 12
+# num_heads: 12
+# For ViT-Large model: (307M params)
+# hidden_size: 1024
+# depth: 24
+# num_heads: 16
+# For ViT-Huge model: (632M params)
+# hidden_size: 1280
+# depth: 32
+# num_heads: 16
+

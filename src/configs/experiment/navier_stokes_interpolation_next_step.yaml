@@ -1,0 +1,18 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=navier_stokes_interpolation_next_step
+
+defaults:
+  - navier_stokes.yaml
+  - override /module: interpolation_next_step.yaml
+  - _self_
+
+name: "NavierStokes-IpolNext${datamodule.horizon}h_${module.n_autoregressive_train_steps}k-"
+module:
+  enable_inference_dropout: True
+  monitor: "val/avg/crps"
+
+logger:
+  wandb:
+    tags: ["navier-stokes", "interpolation"]

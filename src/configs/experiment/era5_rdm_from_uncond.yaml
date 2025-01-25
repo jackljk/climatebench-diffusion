@@ -1,0 +1,35 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_rdm_from_uncond
+
+defaults:
+  - era5_rdm.yaml
+  - override /model: adm_tempo.yaml
+  - _self_
+
+name: "${datamodule.hourly_resolution}h-${datamodule.horizon}AR-RDMftU"
+
+model:
+  with_time_emb: True  # set to true to use time embeddings
+  model_channels: 256
+
+diffusion:
+  time_to_channels: False  # time is modeled as an extra dimension
+
+module:
+  stack_window_to_channel_dim: False
+  conv_padding_mode_global: "circular_width_only"
+  initialize_window: "regression"
+  regression_run_id: "4604747" # 6h-1AR_Attn23_ADM_EMA_320x1-2-3-4d_WMSE_adam_44lr_LC5:200_LV-pCW-128ebs
+  torch_compile: null
+#  GENIE-6h-1AR-EDM_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_adam_14lr_5Dr_fLV-Pm0Ps1.2-Uncond_11seed_23h52mDec16_4448800
+  from_pretrained_checkpoint_run_id: "4448800"
+  from_pretrained_frozen: True #  todo: unfreeze logvar?
+
+datamodule:
+  hourly_resolution: 6   # can be easily changed!
+#  batch_size_per_gpu: On 80Gb GPU RAM:
+# if horizon=12 --> batch_size_per_gpu=1
+# if horizon=8 --> batch_size_per_gpu<=2
+# if horizon=4 --> batch_size_per_gpu<=4  # 1h/epoch

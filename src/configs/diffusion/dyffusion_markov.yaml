@@ -1,0 +1,24 @@
+# @package _global_
+
+defaults:
+  - _base_dyffusion.yaml
+  - _self_
+
+diffusion:
+  _target_: src.diffusion.dyffusion_e2e.DYffusionMarkov
+
+  # IMPORTANT: One of the following must be specified:
+  # Option 1. Interpolator pytorch module
+  interpolator: null
+   # Option 2. Wandb run id of the interpolator (set the desired file name in interpolator_wandb_ckpt_filename, e.g. "last.ckpt")
+  interpolator_run_id: null
+  interpolator_wandb_ckpt_filename: "best-val_20ens_mems_ipol_avg_crps.ckpt"   # only used if interpolator_run_id is not None
+  # Option 3. Local path to the interpolator checkpoint (what is saved by, e.g., torch.save(model.state_dict(), path))
+  interpolator_local_checkpoint_path: null
+  # Contribution of the loss term to the total loss.
+  lambda_reconstruction: 1.0    # corresponds to the main loss term (diffusion loss)
+  lambda_reconstruction2: 0.0   # corresponds to the auxiliary loss term that simulates one step of the diffusion process
+  reconstruction2_detach_x_last: False   # True or False
+  #
+  refine_predictions: False
+  refinement_rounds: 0

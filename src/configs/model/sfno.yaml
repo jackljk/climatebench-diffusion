@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+  - _base_model_config.yaml   # general, model independent, parameters
+
+_target_: src.models.sfno.sfnonet.SphericalFourierNeuralOperatorNet
+embed_dim: 256
+spectral_transform: "sht"
+filter_type: "linear"
+operator_type: "dhconv"   # dhconv or diagonal
+num_layers: 8
+use_mlp: true
+mlp_ratio: 2.0
+scale_factor: 1
+separable: false
+spectral_layers: 3
+activation_function: "gelu"    # should use relu?
+pos_embed: True
+dropout_filter: 0.0
+dropout_mlp: 0.0
+pos_emb_dropout: 0.0
+drop_path_rate: 0.0
+num_blocks: 8
+sparsity_threshold: 0.0
+normalization_layer: "instance_norm"
+hard_thresholding_fraction: 1.0
+checkpointing: 0    # set to 1 or 3 for enabling gradient checkpointing
+time_scale_shift_before_filter: True
+data_grid: "equiangular" #legendre-gauss"     # "legendre-gauss" (for ACE-like) or "equiangular"
+time_dim_mult: 2
+time_rescale: False

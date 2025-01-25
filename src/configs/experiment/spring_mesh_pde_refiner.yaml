@@ -1,0 +1,14 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=spring_mesh_pde_refiner
+
+defaults:
+  - spring_mesh.yaml
+  - override /module: pde_refiner.yaml
+  - override /diffusion: pde_refiner.yaml
+  - _self_
+
+name: "SM-H${datamodule.horizon}-PDERef-${diffusion.num_refinement_steps}k-${diffusion.min_noise_std}minstd"
+datamodule:
+  horizon: 1

@@ -1,0 +1,39 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=fv3gfs
+
+defaults:
+  - override /datamodule: fv3gfs_prescriptive_only.yaml
+#  - override /model: unet_resnet.yaml
+  - _self_
+
+name: "FV3GFS"
+module:
+  use_ema: True
+  ema_decay: 0.9999
+  monitor: "val/avg/rmse"  # if using module.num_predictions > 1, automatically changes to "val/avg/crps"
+  optimizer:
+    name: FusedAdam  # or set to "adamw" if not using apex.FusedAdam
+    lr: 4e-4
+    weight_decay: 5e-3
+
+trainer:
+  max_epochs: 60
+  gradient_clip_val: 0.5
+  deterministic: True
+  precision: 16
+
+datamodule:
+  batch_size: 72    # global/effective batch size
+  eval_batch_size: 16
+  window: 1
+
+callbacks:
+  early_stopping: null
+
+logger:
+  wandb:
+    entity: "ai2cm"
+    project: "FME-v2-salva"
+    tags: ["fv3gfs"]

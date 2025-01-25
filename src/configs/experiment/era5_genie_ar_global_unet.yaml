@@ -1,0 +1,17 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_genie
+
+defaults:
+  - era5_genie_ar_global.yaml
+  - _self_
+
+name: "GENIE-${datamodule.hourly_resolution}h-${datamodule.horizon}AR-Global"
+
+model:
+  outer_sample_mode: "bilinear"
+  upsample_dims: [240, 128]
+  dim: 64
+  block_dropout: 0.1
+  block_dropout1: 0.0

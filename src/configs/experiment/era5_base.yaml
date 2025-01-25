@@ -1,0 +1,60 @@
+# @package _global_
+
+
+name: "ERA5"
+model:
+  loss_function: "wmse"
+
+module:
+  use_ema: True
+  num_predictions: 16
+  num_predictions_in_memory: 16
+  optimizer:
+    name: "FusedAdam"   # FusedAdam
+    lr: 3e-4
+    weight_decay: 1e-5
+
+trainer:
+  max_epochs: 200
+  gradient_clip_val: 0.8
+  deterministic: True
+  accumulate_grad_batches: 4
+  precision: 16
+
+datamodule:
+  batch_size: 2
+  eval_batch_size: 1
+  horizon: 6
+  window: 1
+  # num_workers: 24
+  prefetch_factor: 3 # 8
+  use_dask: False
+
+callbacks:
+  model_checkpoint_t2m:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: "val/t6/crps/2m_temperature"   # name of the logged metric which determines when model is improving
+    mode: "min"         # "max" means higher metric value is better, can be also "min"
+    save_top_k: 1               # save k best models (determined by above metric)
+    save_last: False             # additionally always save model from last epoch
+    verbose: ${verbose}
+    dirpath: ${ckpt_dir}
+    filename: "${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}_t2m"
+    auto_insert_metric_name: False
+  model_checkpoint_z500:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: "val/t12/rmse/geopotential_500"   # name of the logged metric which determines when model is improving
+#    monitor: "val/t12/crps/10m_u_component_of_wind"   # name of the logged metric which determines when model is improving
+    mode: "min"         # "max" means higher metric value is better, can be also "min"
+    save_top_k: 1               # save k best models (determined by above metric)
+    save_last: False             # additionally always save model from last epoch
+    verbose: ${verbose}
+    dirpath: ${ckpt_dir}
+    filename: "${name}_${name_suffix}_epoch{epoch:03d}_seed${seed}_u10m"
+    auto_insert_metric_name: False
+
+
+logger:
+  wandb:
+    project: "ERA5"
+    tags: ["era5"]

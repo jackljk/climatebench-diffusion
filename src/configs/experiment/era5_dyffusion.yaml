@@ -1,0 +1,34 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_rdm
+
+defaults:
+  - era5_genie_ar_global.yaml
+  - override /module: forecasting_multi_horizon_dyffusion.yaml
+  - override /model: adm.yaml
+  - override /diffusion: dyffusion.yaml
+  - _self_
+
+name: "${datamodule.hourly_resolution}h-${datamodule.horizon}AR-DY2s"
+
+model:
+  with_time_emb: True
+
+module:
+  enable_inference_dropout: False
+
+datamodule:
+  horizon: 6
+  hourly_resolution: 1
+  spatial_crop_outputs: null
+  output_mask_area: null
+
+diffusion:
+  forward_conditioning: "none"
+  interpolator_run_id: "4196091"  # Ipol-1h-6T-MH6_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_54lr_LC1:33_15Dr_LV-pCW_11seed_20h25mNov26_4196091
+  interpolator_wandb_ckpt_filename: "last.ckpt"  # "best-val_avg_crps.ckpt"
+  interpolator_use_ema: True
+  use_cold_sampling_for_intermediate_steps: False
+  use_cold_sampling_for_last_step: False
+  loss_function: "wmse"
