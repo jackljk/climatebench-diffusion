@@ -16,6 +16,10 @@ files = [
 ]
 s3_data_dir = "data/"
 
+# Ensure local data directory exists
+if not os.path.exists(local_data_dir):
+    os.makedirs(local_data_dir, exist_ok=True)
+
 for file in files:
     s3_file_path = os.path.join(s3_data_dir, file)
     local_file_path = os.path.join(local_data_dir, file)
