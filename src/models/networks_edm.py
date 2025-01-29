@@ -7,7 +7,7 @@
 
 """Model architectures and preconditioning schemes used in the paper
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
-from typing import Optional, Union
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -257,13 +257,15 @@ class UNetBlock(torch.nn.Module):
         init=dict(),
         init_zero=dict(init_weight=0),
         init_attn=None,
+        dimension: int = 2,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.emb_channels = emb_channels
+        self.attention = attention
         self.num_heads = (
-            0 if not attention else num_heads if num_heads is not None else out_channels // channels_per_head
+            0 if attention is False else num_heads if num_heads is not None else out_channels // channels_per_head
         )
         self.dropout = dropout
         self.skip_scale = skip_scale
@@ -277,6 +279,7 @@ class UNetBlock(torch.nn.Module):
             up=up,
             down=down,
             resample_filter=resample_filter,
+            dimension=dimension,
             **init,
         )
         affine_init = init_zero if emb_init_identity else init
@@ -286,7 +289,9 @@ class UNetBlock(torch.nn.Module):
             else None
         )
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
-        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
+        self.conv1 = Conv2d(
+            in_channels=out_channels, out_channels=out_channels, kernel=3, dimension=dimension, **init_zero
+        )
         self.dropout = torch.nn.Dropout(p=dropout)
         self.skip = None
         if out_channels != in_channels or up or down:
@@ -298,6 +303,7 @@ class UNetBlock(torch.nn.Module):
                 up=up,
                 down=down,
                 resample_filter=resample_filter,
+                dimension=dimension,
                 **init,
             )
 
@@ -308,10 +314,13 @@ class UNetBlock(torch.nn.Module):
                 out_channels=out_channels * 3,
                 kernel=1,
                 **(init_attn if init_attn is not None else init),
+                dimension=dimension,
             )
-            self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
+            self.proj = Conv2d(
+                in_channels=out_channels, out_channels=out_channels, kernel=1, dimension=dimension, **init_zero
+            )
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, shift=None, scale=None):
         orig = x
         # print(f"UNetBlock: {x.shape=}, {self.in_channels=}, {self.out_channels=}, {self.emb_channels=}")
         x = self.conv0(silu(self.norm0(x)))
@@ -320,11 +329,13 @@ class UNetBlock(torch.nn.Module):
             assert emb is None
             x = silu(self.norm1(x))
         else:  # elif emb is not None:
-            params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
             if self.adaptive_scale:
-                scale, shift = params.chunk(chunks=2, dim=1)
+                if shift is None and scale is None:
+                    params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
+                    scale, shift = params.chunk(chunks=2, dim=1)
                 x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))  # shift + (1 + scale) * norm(x)
             else:
+                params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
                 x = silu(self.norm1(x.add_(params)))
 
         x = self.conv1(self.dropout(x))
@@ -333,13 +344,14 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             # x.shape = (B, C, H, W) and let B' = B * num_heads and C' = C // num_heads
-            q, k, v = (
-                self.qkv(self.norm2(x))
-                .reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1)
-                .unbind(2)
-            )  # q = k = v.shape = (B', C', H * W)
+            B2, C2 = x.shape[0] * self.num_heads, x.shape[1] // self.num_heads  # B2 = B * num_heads * H * W
+            q, k, v = self.qkv(self.norm2(x)).reshape(B2, C2, 3, -1).unbind(2)
+            # q = k = v.shape = (B', C', H * W)
             # print(f"{q.shape=}, {k.shape=}, {v.shape=}, {x.shape=}")
-            w = AttentionOp.apply(q, k)  # w.shape = (B', H * W, H * W)
+            if self.attention == "causal":
+                w = AttentionOpCausal.apply(q, k)
+            else:
+                w = AttentionOp.apply(q, k)  # w.shape = (B', H * W, H * W)
             a = torch.einsum("nqk,nck->ncq", w, v)  # a.shape = (B', C', H * W)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
@@ -358,17 +370,24 @@ class _TemporalAttentionBlock(torch.nn.Module):
         init_zero=dict(init_weight=0),
         init_attn=None,
         causal: bool = False,
+        non_linear_proj: bool = False,
         cond_dim: int = None,
-        cond_type: str = "affine",
+        cond_type: str = "linear",
     ):
         super().__init__()
         # Assume that input is of shape (B * H * W, C, T), reshaped from (B, C, T, H, W)
         assert (
             num_heads is not None or channels_per_head is not None
         ), "num_heads or channels_per_head must be provided"
+        in_channels_qkv = dim
+        if cond_type == "concat":
+            in_channels_qkv += 1
+
         self.num_heads = num_heads if num_heads is not None else dim // channels_per_head
-        self.norm = GroupNorm(num_channels=dim, eps=eps)
-        self.qkv = Conv2d(in_channels=dim, out_channels=dim * 3, kernel=1, **(init_attn or {}), dimension=1)
+        self.norm = GroupNorm(num_channels=in_channels_qkv, eps=eps)
+        self.qkv = Conv2d(
+            in_channels=in_channels_qkv, out_channels=dim * 3, kernel=1, **(init_attn or {}), dimension=1
+        )
         # 1x1 conv on C
         self.proj = Conv2d(in_channels=dim, out_channels=dim, kernel=1, **init_zero, dimension=1)  # 1x1 conv on C
         self.cond_type = cond_type
@@ -376,7 +395,7 @@ class _TemporalAttentionBlock(torch.nn.Module):
         if cond_dim is None:
             self.affine = None
         elif cond_type == "linear":
-            self.affine = torch.nn.Linear(cond_dim, 3 * dim, bias=True)
+            self.affine = Linear(cond_dim, 2 * dim, **init_zero)
         elif cond_type == "conv":
             self.affine = torch.nn.Conv1d(cond_dim, 3 * dim, kernel_size=3, padding=1)
         elif cond_type == "non-linear":
@@ -399,9 +418,8 @@ class _TemporalAttentionBlock(torch.nn.Module):
         q, k, v = self.qkv(self.norm(x)).reshape(B2, C2, 3, -1).unbind(2)  # q = k = v.shape = (B', C', T)
         weight = AttentionOp.apply(q, k) if not self.causal else AttentionOpCausal.apply(q, k)
         attn = torch.einsum("nqk,nck->ncq", weight, v)
-        if self.affine is None:
-            x = self.proj(attn.reshape(*x.shape))
-        else:
+        gate = None
+        if self.cond_type is not None:
             if "conv" in self.cond_type:
                 emb = rearrange(emb, "(b t) c -> b c t", t=self.T)
                 if self.emb_map is not None:
@@ -411,13 +429,26 @@ class _TemporalAttentionBlock(torch.nn.Module):
                 emb = rearrange(emb, "(b t) c -> b t c", t=self.T)
                 if self.emb_map is not None:
                     emb = silu(self.emb_map(emb))
-                shift, scale, gate = self.affine(emb).chunk(3, dim=-1)
-                shift, scale, gate = shift.transpose(1, 2), scale.transpose(1, 2), gate.transpose(1, 2)
+
+                # shift, scale, gate = self.affine(emb).chunk(3, dim=-1)
+                # shift, scale, gate = shift.transpose(1, 2), scale.transpose(1, 2), gate.transpose(1, 2)
+                shift, scale = self.affine(emb).chunk(2, dim=-1)
+                shift, scale = shift.transpose(1, 2), scale.transpose(1, 2)
+
             if shift.shape[0] > 1:
                 shift = repeat(shift, "b c t -> (b h w) c t", h=h, w=w)
                 scale = repeat(scale, "b c t -> (b h w) c t", h=h, w=w)
-                gate = repeat(gate, "b c t -> (b h w) c t", h=h, w=w)
-            x = gate * self.proj(modulate(attn.reshape(*x.shape), shift, scale))
+                gate = repeat(gate, "b c t -> (b h w) c t", h=h, w=w) if gate is not None else None
+
+        if self.affine is None:
+            x = self.proj(attn.reshape(*x.shape))
+        else:
+            if gate is None:
+                x = self.proj(torch.addcmul(shift, attn.reshape(*x.shape), scale + 1))  # shift + (1 + scale) * norm(x)
+            else:
+                x = gate * self.proj(modulate(attn.reshape(*x.shape), shift, scale))
+        # if False:
+        #     x = self.conv5(silu(torch.addcmul(shift, self.norm5(x), scale + 1)))
         if self.alpha is not None:
             # if 1 (at init), pass through (identity). Can be useful when fine-tuning a non-temporal model
             with torch.no_grad():
@@ -440,9 +471,10 @@ class TemporalAttentionBlock(_TemporalAttentionBlock):
         n_temporal_channels=None,
         pos_encoding: str = None,
         mixing_factor: bool = False,
+        cond_type: str = "linear",
         **kwargs,
     ):
-        super().__init__(dim=dim, **kwargs)
+        super().__init__(dim=dim, cond_type=cond_type, **kwargs)
         self.T = n_temporal_channels
         self.alpha = torch.nn.Parameter(torch.ones(1)) if mixing_factor else None
         if pos_encoding == "learned":
@@ -472,7 +504,6 @@ class TemporalAttentionBlock2(torch.nn.Module):
         channels_per_head=None,
         n_temporal_channels=None,
         pos_encoding: str = None,
-        mixing_factor: bool = False,
         mlp_ratio=4.0,
         cond_dim: int = None,
         causal: bool = False,
@@ -480,7 +511,7 @@ class TemporalAttentionBlock2(torch.nn.Module):
     ):
         super().__init__()
         from src.models.modules.attention import MemEffAttention
-        assert mixing_factor is False, "Mixing factor not implemented"
+
         assert causal is False, "Causal attention not implemented"
         self.T = n_temporal_channels
         assert (
@@ -535,6 +566,78 @@ class TemporalAttentionBlock2(torch.nn.Module):
             x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
         x = rearrange(x, "(b h w) t c -> (b t) c h w", t=self.T, h=h, w=w)
+        return x
+
+
+class TemporalAttentionBlock3(UNetBlock):
+    def __init__(
+        self,
+        dim: int,
+        n_temporal_channels=None,
+        pos_encoding: str = None,
+        cond_dim: int = None,
+        cond_type: str = "linear",
+        init_attn=None,
+        conv_dim: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            in_channels=dim,
+            out_channels=dim,
+            emb_channels=cond_dim,
+            adaptive_scale=cond_dim is not None,
+            emb_init_identity=True,
+            dimension=conv_dim,
+            init=init_attn,
+            init_attn=init_attn,
+            **kwargs,
+        )
+        self.T = n_temporal_channels
+        self.conv_dim = conv_dim
+        if pos_encoding == "learned":
+            log.info(f"Using learned temporal positional encoding with max_frames={n_temporal_channels}")
+            self.temporal_pos_encoding = torch.nn.Parameter(torch.randn(1, dim, n_temporal_channels) * 0.02)
+        else:
+            self.temporal_pos_encoding = None
+            assert pos_encoding is None, f"Unknown pos_encoding: {pos_encoding}"
+        self.cond_type = cond_type
+        if cond_type == "conv":
+            self.affine = Conv2d(cond_dim, 2 * dim, kernel=3, **init_attn, dimension=1)
+
+    def forward(self, x, emb):
+        h, w = x.shape[-2:]
+        from_pattern = "(b t) c h w"
+        if self.conv_dim == 1:
+            to_pattern = "(b h w) c t"
+        elif self.conv_dim == 3:
+            to_pattern = "b c t h w"
+        else:
+            raise ValueError(f"Invalid conv_dim: {self.conv_dim}")
+        x = rearrange(x, f"{from_pattern} -> {to_pattern}", t=self.T)
+        if self.temporal_pos_encoding is not None:
+            x = x + self.temporal_pos_encoding
+
+        shift, scale = None, None
+        if self.affine is None:
+            del emb
+        else:
+            if self.cond_type == "conv":
+                emb = rearrange(emb, "(b t) c -> b c t", t=self.T) if emb.ndim == 2 else emb
+                shift, scale = self.affine(emb).chunk(2, dim=1)
+            else:
+                emb = rearrange(emb, "(b t) c -> b t c", t=self.T)
+                shift, scale = self.affine(emb).chunk(2, dim=-1)
+                shift, scale = shift.transpose(1, 2), scale.transpose(1, 2)
+            if self.conv_dim == 3:
+                shift = shift.unsqueeze(-1).unsqueeze(-1)
+                scale = scale.unsqueeze(-1).unsqueeze(-1)
+            elif shift.shape[0] > 1 and self.conv_dim == 1:
+                shift = repeat(shift, "b c t -> (b h w) c t", h=h, w=w)
+                scale = repeat(scale, "b c t -> (b h w) c t", h=h, w=w)
+
+        # Run attn
+        x = super().forward(x, emb=None, shift=shift, scale=scale)
+        x = rearrange(x, f"{to_pattern} -> {from_pattern}", t=self.T, h=h, w=w)
         return x
 
 
@@ -795,7 +898,7 @@ class DhariwalUNet(BaseModel):
         # ), "Only square images are supported."
         self.save_hyperparameters()
         if self.hparams.debug_mode:
-            self.log_text.info("Running in debug mode with toy  parameters.")
+            self.log_text.info("Running in debug mode with toy parameters.")
             self.hparams.channel_mult = channel_mult = (1, 2, 4)
             self.hparams.model_channels = model_channels = 32
             self.hparams.num_blocks = num_blocks = 2
@@ -812,7 +915,9 @@ class DhariwalUNet(BaseModel):
         init = self.init = dict(init_mode="kaiming_uniform", init_weight=np.sqrt(1 / 3), init_bias=np.sqrt(1 / 3))
         init_zero = self.init_zero = dict(init_mode="kaiming_uniform", init_weight=0, init_bias=0)
 
-        self.initialize_non_spatial_conditioning(non_spatial_conditioning_mode, non_spatial_cond_hdim)
+        self.initialize_non_spatial_conditioning(
+            non_spatial_conditioning_mode, non_spatial_cond_hdim, null_embedding_for_non_spatial_cond
+        )
         # Mapping.
         self.with_time_emb, self.augment_dim, self.label_dim = with_time_emb, augment_dim, label_dim
         if with_time_emb or non_spatial_conditioning_mode == "adaLN":
@@ -915,18 +1020,6 @@ class DhariwalUNet(BaseModel):
                 torch.nn.GELU(),
                 torch.nn.Linear(condition_head_in_dim, self.non_spatial_cond_hdim),
             )
-        if self.non_spatial_cond_hdim is not None and self.non_spatial_cond_hdim > 0:
-            if null_embedding_for_non_spatial_cond == "learn":
-                _non_spatial_cond_null_emb = torch.zeros(self.non_spatial_cond_hdim)
-                self._non_spatial_cond_null_emb = torch.nn.Parameter(_non_spatial_cond_null_emb, requires_grad=True)
-            elif null_embedding_for_non_spatial_cond == "zeros":  # not trainable
-                self.register_buffer("_non_spatial_cond_null_emb", torch.zeros(self.non_spatial_cond_hdim))
-            else:
-                raise NotImplementedError(
-                    f"{null_embedding_for_non_spatial_cond=}, need to adjust hard-coding null embs"
-                )
-                self._non_spatial_cond_null_emb = None
-                assert null_embedding_for_non_spatial_cond == "noop"
 
         # Decoder.
         self.dec = torch.nn.ModuleDict()
@@ -963,6 +1056,7 @@ class DhariwalUNet(BaseModel):
         self,
         inputs,
         time=None,  # was called noise_labels
+        time_emb_2=None,
         class_labels=None,
         augment_labels=None,
         condition=None,
@@ -974,9 +1068,6 @@ class DhariwalUNet(BaseModel):
         x = self.concat_condition_if_needed(inputs, condition, dynamical_condition, static_condition)
         orig_x_shape = x.shape[-2:]
         x = self.upsampler(x) if self.upsampler is not None else x
-        if condition_non_spatial is not None:
-            if condition_non_spatial.shape[-1] != self.non_spatial_cond_hdim:
-                condition_non_spatial = self.non_spatial_cond_preprocessing(condition_non_spatial)
 
         # Mapping.
         if self.non_spatial_conditioning_mode == "adaLN":
@@ -984,13 +1075,7 @@ class DhariwalUNet(BaseModel):
             # Text emb is null if all features are zero. Check for each batch element and replace with null embedding.
             # Calculate L2 norm along embedding dimension
             assert len(condition_non_spatial.shape) == 2, f"{condition_non_spatial.shape=}"
-            norms: torch.Tensor = torch.norm(condition_non_spatial, p=2, dim=1)
-            # Create mask for zero embeddings (null)
-            null_mask: torch.Tensor = norms == 0
-            if null_mask.any():  # replace with null embedding (can be None, if no-op: skip AdaLN)
-                condition_non_spatial[null_mask] = self._non_spatial_cond_null_emb
-
-            ada_ln_input = condition_non_spatial
+            ada_ln_input = self.preprocess_non_spatial_conditioning(condition_non_spatial)
         elif time is not None:
             ada_ln_input = time
         else:
@@ -1010,13 +1095,21 @@ class DhariwalUNet(BaseModel):
             emb = silu(emb)
         else:
             emb = None
+        if time_emb_2 is None:
+            time_emb_2 = emb
 
-        blocks_with_emb = (UNetBlock, TemporalAttentionBlock, TemporalAttentionBlock2)
-        temporal_blocks = (TemporalAttentionBlock, TemporalAttentionBlock2)
+        # blocks_with_emb = (UNetBlock, TemporalAttentionBlock, TemporalAttentionBlock2)
+        temporal_blocks = (TemporalAttentionBlock, TemporalAttentionBlock2, TemporalAttentionBlock3)
         # Encoder.
         skips = []
         for block in self.enc.values():
-            x = block(x, emb) if isinstance(block, blocks_with_emb) else block(x)
+            if isinstance(block, UNetBlock):
+                x = block(x, emb)
+            elif isinstance(block, temporal_blocks):
+                x = block(x, time_emb_2)
+            else:
+                x = block(x)
+
             if not isinstance(block, temporal_blocks):
                 skips.append(x)
 
@@ -1042,7 +1135,13 @@ class DhariwalUNet(BaseModel):
             # print(f"dec block: {block_name}, {x.shape=}, {skips[-1].shape=}, {emb is None}")
             if not isinstance(block, temporal_blocks) and x.shape[1] != block.in_channels:
                 x = torch.cat([x, skips.pop()], dim=1)
-            x = block(x, emb)
+            if isinstance(block, UNetBlock):
+                x = block(x, emb)
+            elif isinstance(block, temporal_blocks):
+                x = block(x, time_emb_2)
+            else:
+                x = block(x)
+
         # log.info(f"final x shape: {x.shape}")
         if self.upsampler is not None:
             # x = F.interpolate(x, orig_x_shape, mode='bilinear', align_corners=False)
@@ -1060,6 +1159,7 @@ class DhariwalUNetTemporal(DhariwalUNet):
     def __init__(
         self,
         temporal_op: Optional[str] = None,  # Temporal operation: 'attn', 'causal_attn'.
+        temporal_resolutions: Optional[List[int]] = None,  # List of resolutions to use temporal operation.
         init_temporal_op: bool = True,  # use temporal block after first conv or not
         temporal_op_before_down: Optional[bool] = None,
         # use temporal block before downsampling or not. If False, use after downsampling.
@@ -1068,7 +1168,8 @@ class DhariwalUNetTemporal(DhariwalUNet):
         use_mixing_factor: bool = False,
         temporal_attn_type: str = "adm",  # or "vit"
         causal_attn: bool = False,
-        use_time_emb_for_temporal_layers: Union[str, bool] = None,
+        use_time_emb_for_temporal_layers: str = None,
+        extra_time_emb_mlp: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1080,29 +1181,63 @@ class DhariwalUNetTemporal(DhariwalUNet):
         last_block = self.hparams.num_blocks - 1
         max_res = self.spatial_shape_out[0]
         kv_out_channels = None
-        if use_time_emb_for_temporal_layers is True:
-            use_time_emb_for_temporal_layers = "linear"
         t_attn_kwargs = dict(
             channels_per_head=self.hparams.channels_per_head,
             n_temporal_channels=self.num_temporal_channels,
             pos_encoding=temporal_pos_encoding,
-            mixing_factor=use_mixing_factor,
-            causal=causal_attn,
             cond_dim=self.emb_channels if use_time_emb_for_temporal_layers else None,
-            cond_type=use_time_emb_for_temporal_layers
         )
+        self.cond_type = use_time_emb_for_temporal_layers
         if temporal_attn_type == "adm":
             temporal_attn_class = TemporalAttentionBlock
             t_attn_kwargs["init_zero"] = self.init_zero
             t_attn_kwargs["init_attn"] = self.init
+            t_attn_kwargs["mixing_factor"] = use_mixing_factor
+            t_attn_kwargs["cond_type"] = use_time_emb_for_temporal_layers
+            t_attn_kwargs["causal"] = causal_attn
+        elif "adm_block" in temporal_attn_type:
+            temporal_attn_class = TemporalAttentionBlock3
+            t_attn_kwargs["init_zero"] = self.init_zero
+            t_attn_kwargs["init_attn"] = self.init
+            t_attn_kwargs["cond_type"] = use_time_emb_for_temporal_layers
+            # Check if ends with a number for conv dimensions (1 vs 3)
+            conv_dim = 1
+            if temporal_attn_type[-1].isdigit():
+                t_attn_kwargs["conv_dim"] = conv_dim = int(temporal_attn_type[-1])
+            if conv_dim == 1:
+                t_attn_kwargs["attention"] = "causal" if causal_attn else True
+            else:
+                t_attn_kwargs["attention"] = False
         elif temporal_attn_type == "vit":
+            t_attn_kwargs["causal"] = causal_attn
             temporal_attn_class = TemporalAttentionBlock2
+
         else:
             raise ValueError(f"Unknown attn_type: {temporal_attn_type}")
+
+        self.extra_time_emb_mlp = extra_time_emb_mlp
+        if extra_time_emb_mlp:
+            log.info("Using extra time embedding MLP")
+            model_channels = self.hparams.model_channels
+            self.map_noise_T = PositionalEmbedding(num_channels=model_channels)
+            if use_time_emb_for_temporal_layers == "linear":
+                self.map_layer0_T = Linear(in_features=model_channels, out_features=self.emb_channels, **self.init)
+                self.map_layer1_T = Linear(in_features=self.emb_channels, out_features=self.emb_channels, **self.init)
+            elif use_time_emb_for_temporal_layers == "conv":
+                log.info("Using conv for time embedding")
+                self.map_layer0_T = Conv2d(model_channels, self.emb_channels, kernel=3, **self.init, dimension=1)
+                self.map_layer1_T = Conv2d(self.emb_channels, self.emb_channels, kernel=3, **self.init, dimension=1)
+            else:
+                raise ValueError(f"Unknown time_emb_for_temporal_layers: {use_time_emb_for_temporal_layers}")
 
         new_enc = torch.nn.ModuleDict()
         for k, v in self.enc.items():
             res = int(k.split("x")[0])
+            if temporal_resolutions is not None and res not in temporal_resolutions:
+                new_enc[k] = v
+                kv_out_channels = v.out_channels
+                continue
+
             if "_down" in k and temporal_op_before_down is True:
                 # Insert temporal block before downsampling
                 new_enc[f"{res}x{res}_temporal_before_down"] = temporal_attn_class(kv_out_channels, **t_attn_kwargs)
@@ -1128,6 +1263,10 @@ class DhariwalUNetTemporal(DhariwalUNet):
         new_dec = torch.nn.ModuleDict()
         for k, v in self.dec.items():
             res = int(k.split("x")[0])
+            if temporal_resolutions is not None and res not in temporal_resolutions:
+                new_dec[k] = v
+                kv_out_channels = v.out_channels
+                continue
 
             if "_up" in k and temporal_op_before_down is True:
                 # Insert temporal block before downsampling
@@ -1189,7 +1328,15 @@ class DhariwalUNetTemporal(DhariwalUNet):
             static_condition = kwargs["static_condition"]
             kwargs["static_condition"] = repeat(static_condition, "b c2 h w -> (b t) c2 h w", t=t)
 
+        emb_t = None
+        if self.extra_time_emb_mlp:
+            emb_t = self.map_noise_T(time)
+            if self.cond_type == "conv":
+                emb_t = rearrange(emb_t, "(b t) c -> b c t", b=b, t=t)
+
+            emb_t = silu(self.map_layer1_T(silu(self.map_layer0_T(emb_t))))
+
         # self.log_text.info(f"\n{inputs.shape=}, {x.shape=}, time.shape: {time.shape if time is not None else None}")
-        x = super().forward(x, time=time, **kwargs)
+        x = super().forward(x, time=time, time_emb_2=emb_t, **kwargs)
         x = rearrange(x, "(b t) c h w -> b c t h w", b=b)
         return x

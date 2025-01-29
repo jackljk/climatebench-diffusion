@@ -22,8 +22,9 @@ from src.diffusion.dyffusion_e2e import (
 )
 from src.diffusion.pderefiner import PDERefiner
 from src.experiment_types._base_experiment import BaseExperiment
-from src.interface import reload_checkpoint_from_wandb
+from src.interface import NoTorchModuleWrapper
 from src.models.modules.ema import LitEma
+from src.utilities.checkpointing import reload_checkpoint_from_wandb
 from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.utils import (
     freeze_model,
@@ -970,27 +971,9 @@ class PDERefinerModule(AbstractSimultaneousMultiHorizonForecastingModule):
         return loss
 
 
-class NoTorchModuleWrapper:
-    """A wrapper to avoid registering the model as a torch module"""
-
-    def __init__(self, module: torch.nn.Module):
-        self.module = module
-
-    def __getattr__(self, name):
-        return getattr(self.module, name)
-
-    def __setattr__(self, name, value):
-        if name == "module":
-            super().__setattr__(name, value)  # avoid recursion
-        else:
-            setattr(self.module, name, value)
-
-    def __call__(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-
 class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
     _pretrained_is_conditional: False
+
     def __init__(
         self,
         initialize_window: str = "regression",
@@ -1002,11 +985,6 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         regression_use_ema: bool = False,
         regression_inference_dropout: bool = False,
         regression_overrides: Optional[List[str]] = None,  # a dot list, e.g. ["model.hidden_dims=128"]
-        from_pretrained_checkpoint_run_id: Dict[str, Any] = None,
-        from_pretrained_checkpoint_filename: Optional[str] = "last.ckpt",
-        from_pretrained_frozen: bool = True,
-        from_pretrained_exclude_keys: Optional[List[str]] = None,
-        from_pretrained_lr_multiplier: float = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1023,6 +1001,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                 epoch="last",
                 ckpt_filename=regression_wandb_ckpt_filename,
                 override_key_value=regression_overrides,
+                print_name="Init. window regression model",
             )
 
             self.skip_every_n_reg_step = 1
@@ -1058,37 +1037,23 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
 
     def reload_weights_or_freeze_some(self):
         """Reload weights from a pretrained model, potentially freezing some layers."""
-        if self.hparams.from_pretrained_checkpoint_run_id is not None:
-            # todo: Do we want to reload the EMA weights instead of the model weights?
-            reloaded_pretrained_ckpt = reload_checkpoint_from_wandb(
-                run_id=self.hparams.from_pretrained_checkpoint_run_id,
-                local_checkpoint_path=self.hparams.regression_local_checkpoint_path,
-                ckpt_filename=self.hparams.from_pretrained_checkpoint_filename,
-                model=self,
-                also_datamodule=False,
-                exclude_state_dict_keys=self.hparams.from_pretrained_exclude_keys,
-            )
-            reloaded_state_dict = reloaded_pretrained_ckpt["state_dict"]
+        reloaded_pretrained_ckpt = super().reload_weights_or_freeze_some()
+        if reloaded_pretrained_ckpt is not None:
             # Check that reloaded model is consistent with HPs of the current model
-            pretrained_unconditional = reloaded_pretrained_ckpt["config"]["diffusion"].get("force_unconditional", False)
+            pretrained_unconditional = reloaded_pretrained_ckpt["config"]["diffusion"].get(
+                "force_unconditional", False
+            )
             if pretrained_unconditional == self.model.hparams.conditional:
                 # If the reloaded model is unconditional, the current model must be unconditional
                 raise ValueError(f"{pretrained_unconditional=} mustn't be equal to {self.model.hparams.conditional=}")
             self._pretrained_is_conditional = not pretrained_unconditional
-
-            if self.hparams.from_pretrained_frozen:
-                assert self.hparams.from_pretrained_lr_multiplier is None, "Cannot freeze and change LR"
-                # Freeze the reloaded parameters (those that were pretrained)
-                params_to_freeze = [k for k in reloaded_state_dict.keys() if "model_ema." not in k]
-                # params_to_freeze = [k.replace("_orig_mod.", "") for k in params_to_freeze]
-                freeze_model(self, params_subset=params_to_freeze)
-
+        return reloaded_pretrained_ckpt
 
     @property
     def lr_groups(self):
         if self.hparams.from_pretrained_lr_multiplier is not None:
             assert not self.hparams.from_pretrained_frozen, "If frozen, do not change LR"
-            # Use a negative match to train the pretrained model with a different LR
+            # Use a negative match to train the pretrained model with a different (lower) LR
             return {"!_temporal": self.hparams.from_pretrained_lr_multiplier}
         return None
 
@@ -1144,7 +1109,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
 
         if self.model.hparams.conditional:  # self.diffusion_config.conditional:
             if self._pretrained_is_conditional:
-                cond = batch["dynamics"][:, self.window-1: self.window + self.horizon-1, ...]
+                cond = batch["dynamics"][:, self.window - 1 : self.window + self.horizon - 1, ...]
                 extra_kwargs["condition"] = self.pack_data(cond, input_or_output="input")
             else:
                 extra_kwargs["condition"] = inputs
@@ -1168,6 +1133,10 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         if self.model.hparams.learnable_schedule:
             self.log("model/rho_proxy", self.model.exp.detach().item())
             self.log("model/rho", self.model.get_exp().detach().item())
+        if self.model.hparams.variance_loss:
+            times_vars = self.get_logvar("times").exp().detach()
+            times_vars = {f"train/learned_var/time_{i}": float(v) for i, v in enumerate(times_vars)}
+            self.log_dict(times_vars, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         return super().on_train_batch_end(*args, **kwargs)
 
     def get_preds_at_t_for_batch(

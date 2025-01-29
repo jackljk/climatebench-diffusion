@@ -2,17 +2,20 @@ import hashlib
 import json
 import os
 from datetime import datetime
-from typing import Dict, Any, Union
-
-import numpy as np
-import h5py
 from pathlib import Path
-from tqdm import tqdm
+from typing import Any, Dict, Union
+
+import h5py
+import numpy as np
 import torch
-from transformers import BertModel, BertTokenizer, AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, BertModel, BertTokenizer
+
 from src.utilities.utils import get_logger
 
+
 log = get_logger(__name__)
+
 
 def get_llama_embedding(text, tokenizer=None, model=None, pooling=True, last_layer=True):
     """
@@ -38,7 +41,7 @@ def get_llama_embedding(text, tokenizer=None, model=None, pooling=True, last_lay
         target_hidden_state = hidden_states[len(hidden_states) // 2]
 
     # Mask padding tokens
-    attention_mask = inputs['attention_mask']
+    attention_mask = inputs["attention_mask"]
     masked_embeddings = target_hidden_state * attention_mask.unsqueeze(-1)
 
     if pooling:
@@ -50,6 +53,7 @@ def get_llama_embedding(text, tokenizer=None, model=None, pooling=True, last_lay
         sentence_embedding = masked_embeddings[:, -1, :]
 
     return sentence_embedding[0].cpu().numpy()
+
 
 def get_bert_embeddings(text, tokenizer, model, max_length=512):
     # Tokenize input text
@@ -69,6 +73,7 @@ def get_dict_hash(d, length=8):
     dhash = hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()
     return dhash[:length]
 
+
 def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False, metadata: Dict = None):
     """
     Load embeddings if they exist, otherwise create and save them.
@@ -86,27 +91,31 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
     save_path = None
     if save_dir is not None:
         save_dir = Path(save_dir)
-        save_filename = f"{model_name}"
+        save_filename = str(model_name)
         if metadata is not None:
             save_filename += str(get_dict_hash(metadata))
         save_filename += "-embeddings.h5"
         save_path = save_dir / save_filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"save_path: {save_path}")
 
     # Try to load existing embeddings
     if save_dir is not None and save_path.exists() and not force_recreate:
         log.info(f"Loading existing embeddings from {save_path}")
         try:
-            with h5py.File(save_path, 'r') as f:
+            with h5py.File(save_path, "r") as f:
                 if metadata is not None:
                     for key, value in metadata.items():
-                        if f.attrs.get(key) != value:
-                            log.warning(f"Metadata mismatch: {key}={f.attrs.get(key)} vs {value}")
+                        value_f = None if f.attrs.get(key) == "None" else f.attrs.get(key)
+                        if value_f != value:
+                            log.warning(
+                                f"Metadata mismatch: {key}={value_f} (type={type(value_f)}) vs {value} (type={type(value)})"
+                            )
                             raise ValueError("Metadata mismatch")
-                num_saved = f.attrs.get('num_embeddings', 0)
+                num_saved = f.attrs.get("num_embeddings", 0)
                 if num_saved == len(corpus):  # Only use if complete
-                    return [f['embeddings'][i] for i in range(num_saved)]
+                    embeddings = f["embeddings"][:]  # Load embeddings into memory
+                    log.info(f"Loaded {num_saved} embeddings (shape={embeddings.shape} from {save_path}.")
+                    return embeddings  # [f['embeddings'][i] for i in range(num_saved)]
                 else:
                     log.warning(f"Found incomplete embeddings ({num_saved} vs {len(corpus)} needed)")
         except Exception as e:
@@ -116,17 +125,23 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
     log.info(f"Computing {model_name} embeddings for text data...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     load_kwargs = dict()
+    embed_kwargs = dict()
+    embed_type_id = None
+    model_name_base = model_name.rsplit("_")[0]  # split off any "_pool" or "_last" suffix
+    if model_name_base != model_name:
+        embed_type_id = model_name.rsplit("_")[-1]
     if "bert" in model_name.lower():
         if os.environ.get("PSCRATCH") is not None:
-            maybe_from = os.path.join(os.environ["PSCRATCH"], "huggingface", model_name)
+            maybe_from = os.path.join(os.environ["PSCRATCH"], "huggingface", model_name_base)
             if os.path.exists(maybe_from):
                 # Useful on SLURM when the model is already downloaded and network is not available/slow
-                model_name = maybe_from
-                log.info(f"Loading BERT model locally from {model_name}")
+                model_name_base = maybe_from
+                log.info(f"Loading BERT model locally from {model_name_base}")
 
         model_class = BertModel
         tokenizer_class = BertTokenizer
         embedding_func = get_bert_embeddings
+        embed_kwargs["max_length"] = 512
     elif "llama" in model_name.lower():
         from huggingface_hub import login
         from huggingface_hub.hf_api import HfFolder
@@ -140,42 +155,45 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
         login(token=token)
         HfFolder.save_token(token)
 
-        cache_dir = "/trunk/model-hub"
-        if os.environ.get("PSCRATCH") is not None:
-            cache_dir = os.path.join(os.environ["PSCRATCH"], "huggingface", model_name)
+        cache_dir = os.path.join(save_dir, model_name_base)
         model_class = AutoModelForCausalLM
         tokenizer_class = AutoTokenizer
         load_kwargs["cache_dir"] = cache_dir
         embedding_func = get_llama_embedding
+        if embed_type_id is None:
+            embed_kwargs.update({"pooling": True, "last_layer": True})
+        else:
+            embed_kwargs.update({"pooling": "pool" in embed_type_id, "last_layer": "last" in embed_type_id})
+            log.info(f"Using pooling={embed_kwargs['pooling']} and last_layer={embed_kwargs['last_layer']}")
     else:
         raise ValueError(f"Unknown model name {model_name}")
 
-    model = model_class.from_pretrained(model_name, **load_kwargs)
+    model = model_class.from_pretrained(model_name_base, **load_kwargs)
     model.eval()
     model.to(device)
-    tokenizer = tokenizer_class.from_pretrained(model_name, **load_kwargs)
+    tokenizer = tokenizer_class.from_pretrained(model_name_base, **load_kwargs)
 
     text_features = []
     # embeddings = corpus.apply(lambda x: get_bert_embeddings(x, tokenizer=tokenizer, model=model, device=device))
     for x in tqdm(corpus, desc=f"{model_name} embeddings", total=len(corpus)):
-        embedding = embedding_func(x, tokenizer=tokenizer, model=model, pooling=True, last_layer=True)
+        embedding = embedding_func(x, tokenizer=tokenizer, model=model, **embed_kwargs)
         embedding = np.array(embedding, dtype=np.float32)
         text_features.append(embedding)
 
     embedding_dim = len(text_features[0])
     try:
         # Save embeddings
-        with h5py.File(save_path, 'w') as f:
+        with h5py.File(save_path, "w") as f:
             embeddings_array = np.stack(text_features, axis=0)
             f.create_dataset(
-                'embeddings',
+                "embeddings",
                 data=embeddings_array,
-                compression='gzip',
+                compression="gzip",
                 compression_opts=4,
-                chunks=(min(1000, len(embeddings_array)), embedding_dim)
+                chunks=(min(1000, len(embeddings_array)), embedding_dim),
             )
-            f.attrs['num_embeddings'] = len(embeddings_array)
-            f.attrs['embedding_dim'] = embedding_dim
+            f.attrs["num_embeddings"] = len(embeddings_array)
+            f.attrs["embedding_dim"] = embedding_dim
             if metadata is not None:
                 for key, value in metadata.items():
                     f.attrs[key] = convert_to_saveable_type(value)
@@ -187,6 +205,7 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
         raise
     # del model
     return text_features
+
 
 def convert_to_saveable_type(value: Any) -> Union[str, int, float, np.ndarray]:
     """Convert Python objects to HDF5-compatible types."""

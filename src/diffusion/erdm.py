@@ -10,9 +10,11 @@ import torch
 from src.diffusion._base_diffusion import BaseDiffusion
 from src.utilities.utils import get_logger, sample_random_real
 
+
 log = get_logger(__name__)
 
 # ----------------------------------------------------------------------------
+
 
 # @persistence.persistent_class
 class ERDM(BaseDiffusion):
@@ -142,6 +144,10 @@ class ERDM(BaseDiffusion):
         else:
             return self.tmin
 
+    @property
+    def channel_dim(self):
+        return self.time_dim - 1  # channels are before time
+
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
         """Return the loss function used for training.
         Function will be called when needed by the BaseModel class.
@@ -155,11 +161,6 @@ class ERDM(BaseDiffusion):
                 kwargs["learned_var_dim_name_to_idx_and_n_dims"] = lvdn_to_i_n
                 if self.hparams.variance_loss == "with_channel":
                     kwargs["learn_per_dim"] = False  # Learn a (C, T) matrix rather than (C,) and (T,) vectors
-
-        if kwargs.get("learned_var_dim_name_to_idx_and_n_dims", {}).get("channels") is not None:
-            chan_i, chan_n = kwargs["learned_var_dim_name_to_idx_and_n_dims"].get("channels", (None, None))
-            chan_i = self.time_dim - 1  # channels are before time
-            kwargs["learned_var_dim_name_to_idx_and_n_dims"]["channels"] = (chan_i, chan_n)
 
         return super()._get_loss_callable_from_name_or_config(loss_function, **kwargs)
 
@@ -359,7 +360,9 @@ class ERDM(BaseDiffusion):
                 assert condition is not None, "Condition must be provided for conditional RDM"
                 # Reshape condition to repeat it along the time dimension, copying it to the batch dimension
                 if condition.shape[2] == 1:
-                    raise ValueError("Condition shape must have time dimension, got 1")  # not necessary, but let's be sure for now we don't mess up
+                    raise ValueError(
+                        "Condition shape must have time dimension, got 1"
+                    )  # not necessary, but let's be sure for now we don't mess up
                     condition = einops.repeat(condition, "b c 1 h w -> (b t) c h w", t=self.seq_len)
                 else:
                     # condition.shape=torch.Size([B, 69, 8, 240, 121]), x_in.shape=torch.Size([B, 69, 8, 240, 121])

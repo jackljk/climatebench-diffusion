@@ -180,7 +180,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
             elif self.hparams.multi_horizon:
                 numpy_tensors = self.create_dataset_multi_horizon(**dkwargs)
             else:
-                raise ValueError(f"Please use ``datamodule.multi_horizon=True`` for this datamodule.")
+                raise ValueError("Please use ``datamodule.multi_horizon=True`` for this datamodule.")
                 numpy_tensors = self.create_dataset_single_horizon(**dkwargs)
 
             # Create the pytorch tensor dataset

@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from src.diffusion._base_diffusion import BaseDiffusion
 from src.experiment_types.interpolation import InterpolationExperiment
-from src.interface import get_checkpoint_from_path_or_wandb
+from src.utilities.checkpointing import get_checkpoint_from_path_or_wandb
 from src.utilities.utils import freeze_model, raise_error_if_invalid_value
 
 

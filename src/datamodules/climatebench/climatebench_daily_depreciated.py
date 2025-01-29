@@ -7,7 +7,6 @@ from typing import Dict, Optional, Sequence
 import cftime
 import numpy as np
 import torch
-import glob
 import xarray as xr
 from einops import rearrange
 from torch import Tensor
@@ -16,10 +15,11 @@ from torch.utils.data import Dataset
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.datamodules.climatebench.daily_helpers import timeInterpolateMiddle
 from src.evaluation.one_step.main import OneStepAggregator
-from src.utilities.utils import get_logger, get_files
+from src.utilities.utils import get_files, get_logger
 
 
 log = get_logger(__name__)
+
 
 def get_rsdt(
     data_path: str,
@@ -27,10 +27,10 @@ def get_rsdt(
 ) -> xr.Dataset:
     """
     Load the raw data from the given path and return it as a dictionary of xarray datasets.
-    
+
     Avaliable rsdt simulations are:
-    - 'CESM2-rsdt-Amon-gn-piControl.nc', 
-    - 'CESM2-rsdt-Amon-gn-ssp126.nc', 
+    - 'CESM2-rsdt-Amon-gn-piControl.nc',
+    - 'CESM2-rsdt-Amon-gn-ssp126.nc',
     - 'CESM2-rsdt-Amon-gn-historical.nc'
 
     Args:
@@ -41,17 +41,17 @@ def get_rsdt(
     """
     rsdt = dict()
     rsdt_paths = get_files(data_path, "Amon")
-    if 'historical' in simulations:
+    if "historical" in simulations:
         # get the file with historical
-        rsdt_path = [path for path in rsdt_paths if 'historical' in path][0]
+        rsdt_path = [path for path in rsdt_paths if "historical" in path][0]
         log.info(f"Loading historical rsdt data from {rsdt_path}")
-        rsdt['historical'] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
-        
+        rsdt["historical"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
+
     # For now don't load piControl
-    rsdt_path = [path for path in rsdt_paths if 'ssp126' in path][0]
+    rsdt_path = [path for path in rsdt_paths if "ssp126" in path][0]
     log.info(f"Loading rsdt data from {rsdt_path}")
-    rsdt['ssp'] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
-    
+    rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
+
     # Squeeze the nbnd & member_id dimension from the output datasets
     for k, v in rsdt.items():
         if "nbnd" in v.dims:
@@ -60,8 +60,7 @@ def get_rsdt(
         if "member_id" in v.dims:
             rsdt[k] = v.drop_vars("member_id")
             print(f"dropping member_id dimension from the rsdt{k} variable datasets")
-        
-    
+
     return rsdt
 
 
@@ -72,7 +71,7 @@ def get_raw_data(
     mean_over_ensemble: bool = False,
     Debug_dataset_size: int = None,
     scale_inputs: str = None,
-) -> tuple(Dict[str, xr.Dataset], Dict[str, xr.Dataset]): # type: ignore
+) -> tuple(Dict[str, xr.Dataset], Dict[str, xr.Dataset]):  # type: ignore
     """
     Load the raw data from the given path and return it as a dictionary of xarray datasets.
 
@@ -174,7 +173,7 @@ def get_raw_data(
             X_train[simu], Y_train[simu] = _scaleInterpolateLinear(
                 X_train[simu], Y_train[simu], scale_type=scale_inputs
             )
-    
+
     log.info(f"Finished pre-processing data for {simulations}")
     return X_train, Y_train
 

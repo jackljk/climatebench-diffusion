@@ -129,9 +129,13 @@ def run_model(config: DictConfig) -> float:
             model._default_global_step = global_step
             model._default_epoch = epoch
             if trainer.logger is not None:
-                step_of_ckpt = {"epoch": epoch, "global_step": global_step, "ckpt_path_orig": ckpt_path_orig}
+                step_of_ckpt = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "ckpt_path_orig": ckpt_path_orig,
+                    "ckpt_script_path": ckpt.get("script_path", None),
+                }
                 trainer.logger.log_hyperparams(step_of_ckpt)
-
 
     else:
         if hasattr(signal, "SIGUSR1"):  # Windows does not support signals

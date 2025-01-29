@@ -116,10 +116,10 @@ def to_torch_and_device(x, device):
 
 
 def rrearrange(
-        data: Union[Tensor, torch.distributions.Distribution, TensorDictBase],
-        pattern: str,
-        find_batch_size_max: bool = True,
-        **axes_lengths,
+    data: Union[Tensor, torch.distributions.Distribution, TensorDictBase],
+    pattern: str,
+    find_batch_size_max: bool = True,
+    **axes_lengths,
 ):
     """Extend einops.rearrange to work with distributions."""
     if torch.is_tensor(data) or isinstance(data, np.ndarray):
@@ -431,7 +431,7 @@ def rhasattr(obj, attr, *args):
 
 
 def to_tensordict(
-        x: Dict[str, torch.Tensor], find_batch_size_max: bool = False, force_same_device: bool = False, device=None
+    x: Dict[str, torch.Tensor], find_batch_size_max: bool = False, force_same_device: bool = False, device=None
 ) -> TensorDict:
     """Converts a dictionary of tensors to a TensorDict."""
     if torch.is_tensor(x):
@@ -476,10 +476,10 @@ def raise_error_if_invalid_type(value: Any, possible_types: Sequence[Any], name:
 
 
 def raise_if_invalid_shape(
-        value: Union[np.ndarray, Tensor],
-        expected_shape: Sequence[int] | int,
-        axis: int = None,
-        name: str = None,
+    value: Union[np.ndarray, Tensor],
+    expected_shape: Sequence[int] | int,
+    axis: int = None,
+    name: str = None,
 ):
     if isinstance(expected_shape, int):
         if value.shape[axis] != expected_shape:
@@ -540,11 +540,11 @@ def set_seed(seed, device="cuda"):
 
 
 def auto_gpu_selection(
-        usage_max: float = 0.2,
-        mem_max: float = 0.6,
-        num_gpus: int = 1,
-        raise_error_if_insufficient_gpus: bool = True,
-        verbose: bool = False,
+    usage_max: float = 0.2,
+    mem_max: float = 0.6,
+    num_gpus: int = 1,
+    raise_error_if_insufficient_gpus: bool = True,
+    verbose: bool = False,
 ):
     """Auto set CUDA_VISIBLE_DEVICES for gpu  (based on utilization)
 
@@ -617,12 +617,12 @@ def auto_gpu_selection(
 
 
 def print_gpu_memory_usage(
-        prefix: str = "",
-        tqdm_bar=None,
-        add_description: bool = True,
-        keep_old: bool = False,
-        empty_cache: bool = False,
-        log_func: Optional[Callable] = None,
+    prefix: str = "",
+    tqdm_bar=None,
+    add_description: bool = True,
+    keep_old: bool = False,
+    empty_cache: bool = False,
+    log_func: Optional[Callable] = None,
 ):
     """Use this function to print the GPU memory usage (logged or in a tqdm bar).
     Use this to narrow down memory leaks, by printing the GPU memory usage before and after a function call
@@ -647,7 +647,7 @@ def print_gpu_memory_usage(
 
 
 def get_pl_trainer_kwargs_for_evaluation(
-        trainer_config: DictConfig = None,
+    trainer_config: DictConfig = None,
 ) -> (Dict[str, Any], torch.device):
     """Get kwargs for pytorch-lightning Trainer for evaluation and select <=1 GPU if available"""
     # GPU or not:
@@ -829,9 +829,9 @@ def flatten_dict(dictionary: Dict[Any, Any], save: bool = True) -> Dict[Any, Any
 
 
 def find_config_differences(
-        configs: List[Dict[str, Any]],
-        keys_to_tolerated_percent_diff: Dict[str, float] = None,
-        sort_by_name: bool = True,
+    configs: List[Dict[str, Any]],
+    keys_to_tolerated_percent_diff: Dict[str, float] = None,
+    sort_by_name: bool = True,
 ) -> List[List[str]]:
     """
     Find and return the differences between multiple nested configurations.
@@ -908,8 +908,8 @@ def find_config_differences(
                 # Check if the key is in the keys_to_percent_diff dictionary
                 if key in keys_to_tolerated_percent_diff.keys():
                     if any(
-                            abs(value - other.get(key, value)) > keys_to_tolerated_percent_diff[key] * abs(value)
-                            for other in flat_configs
+                        abs(value - other.get(key, value)) > keys_to_tolerated_percent_diff[key] * abs(value)
+                        for other in flat_configs
                     ):
                         diff.append(f"{key}={config[key]}")
                         # print(f"key={key}, value={value}. diff={[abs(value - other.get(key, value)) for other in flat_configs]}. tol={keys_to_tolerated_percent_diff[key] * abs(value)}")
@@ -921,16 +921,16 @@ def find_config_differences(
 
 
 def find_config_differences_return_as_joined_str(
-        configs: List[Dict[str, Any]], join_with: str = " ", **kwargs
+    configs: List[Dict[str, Any]], join_with: str = " ", **kwargs
 ) -> List[str]:
     differences_list = find_config_differences(configs, **kwargs)
     return [join_with.join(differences) for differences in differences_list]
 
 
 def concatenate_array_dicts(
-        arrays_dicts: List[Dict[str, np.ndarray]],
-        axis: int = 0,
-        keys: List[str] = None,
+    arrays_dicts: List[Dict[str, np.ndarray]],
+    axis: int = 0,
+    keys: List[str] = None,
 ) -> Dict[str, np.ndarray]:
     """Concatenates the given dicts of arrays along the given axis. The dict may be nested.
     Args:
@@ -990,7 +990,7 @@ def split3d_and_merge_variables(results_dict, level_names) -> Dict[str, Any]:
 
 
 def split3d_and_merge_variables_maybe(
-        results_dict, result_key: str, multiple_result_keys: List[str], level_names: List[str]
+    results_dict, result_key: str, multiple_result_keys: List[str], level_names: List[str]
 ) -> Dict[str, Any]:
     if result_key in results_dict.keys():
         return results_dict[result_key]
@@ -1013,7 +1013,7 @@ def get_common_substrings(strings, min_length):
 
             for match in seq_matcher.get_matching_blocks():
                 if match.size >= min_length:
-                    common_substrings.add(s1[match.a: match.a + match.size])
+                    common_substrings.add(s1[match.a : match.a + match.size])
 
     return common_substrings
 

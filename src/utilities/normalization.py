@@ -11,35 +11,35 @@ class StandardNormalizer(torch.nn.Module):
 
     def __init__(self, means: Dict[str, torch.Tensor], stds: Dict[str, torch.Tensor], names=None):
         super().__init__()
-        if isinstance(means, dict):
-            for k in means.keys():
-                if means[k].ndim == 1:
-                    # Add singleton dimensions for broadcasting over lat/lon dimensions
-                    means[k] = torch.reshape(means[k], (-1, 1, 1))
-                    stds[k] = torch.reshape(stds[k], (-1, 1, 1))
-                elif means[k].ndim > 1:
-                    raise ValueError(f"Means tensor {k} has more than one dimension!")
+        # if isinstance(means, dict):
+        #     for k in means.keys():
+        #         if means[k].ndim == 1:
+        #             Add singleton dimensions for broadcasting over lat/lon dimensions
+                    # means[k] = torch.reshape(means[k], (-1, 1, 1))
+                    # stds[k] = torch.reshape(stds[k], (-1, 1, 1))
+                # elif means[k].ndim > 1:
+                #     raise ValueError(f"Means tensor {k} has more than one dimension!")
         # Make sure that means and stds move to the same device
         self.means = means
         self.stds = stds
         self.names = names
 
-        if torch.is_tensor(means):
+        if torch.is_tensor(means) or isinstance(means, float):
             self._normalize = _normalize
             self._denormalize = _denormalize
         else:
-            assert isinstance(means, dict), "Means and stds must be either both tensors or both dictionaries!"
+            assert isinstance(means, dict), "Means and stds must be either both tensors, floats, or dictionaries!"
             self._normalize = _normalize_dict
             self._denormalize = _denormalize_dict
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn)  # , recurse=recurse)
         if isinstance(self.means, dict):
-            self.means = {k: fn(v) for k, v in self.means.items()}
-            self.stds = {k: fn(v) for k, v in self.stds.items()}
+            self.means = {k: fn(v) if torch.is_tensor(v) else v for k, v in self.means.items()}
+            self.stds = {k: fn(v) if torch.is_tensor(v) else v for k, v in self.stds.items()}
         else:
-            self.means = fn(self.means)
-            self.stds = fn(self.stds)
+            self.means = fn(self.means) if torch.is_tensor(self.means) else self.means
+            self.stds = fn(self.stds) if torch.is_tensor(self.stds) else self.stds
 
     def normalize(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return self._normalize(tensors, means=self.means, stds=self.stds)

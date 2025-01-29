@@ -74,7 +74,9 @@ def get_dims_of_dataset(datamodule_config: DictConfig):
     elif "climatebench" in target:
         output_vars = datamodule_config.get("output_vars")
         additional_vars = datamodule_config.get("additional_vars", [])
-        input_dim = 4 + len(additional_vars)
+        input_dim = 4
+        if additional_vars is not None:
+            input_dim += len(additional_vars)
         output_dim = 1 if isinstance(output_vars, str) else len(output_vars)
         # conditional_dim = len(additional_vars)
         spatial_dims = (96, 144)  # input spatial dimensions

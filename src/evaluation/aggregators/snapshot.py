@@ -1,4 +1,4 @@
-from typing import List, Mapping, Optional, Any
+from typing import Any, List, Mapping, Optional
 
 import matplotlib.pyplot as plt
 import torch
@@ -51,7 +51,7 @@ class SnapshotAggregator:
         gen_data: Mapping[str, torch.Tensor],
         target_data_norm: Mapping[str, torch.Tensor],
         gen_data_norm: Mapping[str, torch.Tensor],
-        metadata: Mapping[str, Any],
+        metadata: Mapping[str, Any] = None,
         loss=None,
         i_time_start: int = 0,
     ):
@@ -71,7 +71,7 @@ class SnapshotAggregator:
         self._gen_data = to_cpu(gen_data)
         self._target_data_norm = to_cpu(target_data_norm)
         self._gen_data_norm = to_cpu(gen_data_norm)
-        self._metadata = metadata
+        self._metadata = metadata if metadata is not None else {}
         if self.target_time is not None:
             assert (
                 self.target_time_in_batch <= data_steps
@@ -159,8 +159,9 @@ class SnapshotAggregator:
             fig_full_field.colorbar(pcm_ff, ax=ax_full_field, **cbar_kwargs)
             fig_error.colorbar(pcm_err, ax=ax_error, **cbar_kwargs)
             # Add a main title to the figure which is the target time
-            fig_full_field.suptitle(f"Target time: {target_datetime}", y=0.95)
-            fig_error.suptitle(f"Target time: {target_datetime}", y=0.95)
+            y = 0.8  # 0.9, 0.95 are way too high
+            fig_full_field.suptitle(f"Target time: {target_datetime}", y=y)
+            fig_error.suptitle(f"Target time: {target_datetime}", y=y)
             # Set titles
             # fig_full_field.suptitle(f"{name_label} full field; (left) generated and (right) target.", y=title_y)
             # fig_error.suptitle(f"{name_label} error (generated - target).", y=title_y)

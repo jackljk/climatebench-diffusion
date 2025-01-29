@@ -60,6 +60,7 @@ class BaseModel(LightningModule):
         predict_non_spatial_condition: bool = False,
         learned_channel_variance_loss: bool = False,  # Please use module.learned_channel_variance_loss to set this
         datamodule_config: Optional[DictConfig] = None,
+        channel_dim: int = 1,
         debug_mode: bool = False,
         name: str = "",
         verbose: bool = True,
@@ -75,6 +76,7 @@ class BaseModel(LightningModule):
         if not self.verbose:  # turn off info level logging
             self.log_text.setLevel(logging.WARN)
 
+        self._channel_dim = channel_dim
         self.num_input_channels = num_input_channels
         self.num_output_channels = num_output_channels
         self.num_output_channels_raw = num_output_channels_raw
@@ -116,7 +118,6 @@ class BaseModel(LightningModule):
             else:
                 self.criterion = {"preds": criterion}
 
-        self._channel_dim = None
         self.ema_scope = None  # EMA scope for the model. May be set by the BaseExperiment instance
         # self._parent_module = None    # BaseExperiment instance (only needed for edge cases)
 
@@ -144,7 +145,7 @@ class BaseModel(LightningModule):
         if self.hparams.learned_channel_variance_loss:
             # todo: make this more general (e.g. let each model specify the channel dim).
             lvdn_to_i_n = kwargs.get("learned_var_dim_name_to_idx_and_n_dims", {})
-            lvdn_to_i_n["channels"] = (-3, self.num_output_channels_raw)  # Tuple: (idx, n_dims)
+            lvdn_to_i_n["channels"] = (self.channel_dim, self.num_output_channels_raw)  # Tuple: (idx, n_dims)
             kwargs["learned_var_dim_name_to_idx_and_n_dims"] = lvdn_to_i_n
 
         loss = self._get_loss_callable_from_name_or_config(loss_function, reduction=reduction, **kwargs)
@@ -164,8 +165,6 @@ class BaseModel(LightningModule):
 
     @property
     def channel_dim(self):
-        if self._channel_dim is None:
-            self._channel_dim = 1
         return self._channel_dim
 
     def evaluation_results_to_xarray(self, results: Dict[str, np.ndarray], **kwargs) -> Dict[str, xr.DataArray]:
@@ -185,7 +184,12 @@ class BaseModel(LightningModule):
         """
         raise NotImplementedError("Base model is an abstract class!")
 
-    def initialize_non_spatial_conditioning(self, non_spatial_conditioning_mode, non_spatial_cond_hdim: int):
+    def initialize_non_spatial_conditioning(
+        self,
+        non_spatial_conditioning_mode,
+        non_spatial_cond_hdim: int,
+        null_embedding_for_non_spatial_cond: str = None,
+    ):
         valid_cond_modes = ["cross_attn", "adaLN", None]
         raise_error_if_invalid_value(non_spatial_conditioning_mode, valid_cond_modes, "non_spatial_conditioning_mode")
         if non_spatial_conditioning_mode == "adaLN" and self.hparams.with_time_emb:
@@ -217,6 +221,29 @@ class BaseModel(LightningModule):
                 self.log_text.info("non_spatial_cond_hdim is None, using Identity for non_spatial_cond_preprocessing")
                 self.non_spatial_cond_preprocessing = nn.Identity()
                 self.non_spatial_cond_hdim = self.num_conditional_channels_non_spatial
+
+            if self.non_spatial_cond_hdim is not None and self.non_spatial_cond_hdim > 0:
+                if null_embedding_for_non_spatial_cond == "learn":
+                    _non_spatial_cond_null_emb = torch.zeros(self.non_spatial_cond_hdim)
+                    self._non_spatial_cond_null_emb = torch.nn.Parameter(
+                        _non_spatial_cond_null_emb, requires_grad=True
+                    )
+                elif null_embedding_for_non_spatial_cond == "zeros":  # not trainable
+                    self.register_buffer("_non_spatial_cond_null_emb", torch.zeros(self.non_spatial_cond_hdim))
+                else:
+                    self._non_spatial_cond_null_emb = None
+                    assert null_embedding_for_non_spatial_cond == "noop"
+
+    def preprocess_non_spatial_conditioning(self, condition_non_spatial: Tensor):
+        if self.non_spatial_conditioning_mode == "adaLN" and self._non_spatial_cond_null_emb is not None:
+            norms: torch.Tensor = torch.norm(condition_non_spatial, p=2, dim=1)
+            # Create mask for zero embeddings (null)
+            null_mask: torch.Tensor = norms == 0
+            if null_mask.any():  # replace with null embedding (can be None, if no-op: skip AdaLN)
+                condition_non_spatial[null_mask] = self._non_spatial_cond_null_emb
+        if condition_non_spatial.shape[-1] != self.non_spatial_cond_hdim:
+            condition_non_spatial = self.non_spatial_cond_preprocessing(condition_non_spatial)
+        return condition_non_spatial
 
     def concat_condition_if_needed(
         self,

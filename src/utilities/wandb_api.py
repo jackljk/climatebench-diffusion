@@ -247,10 +247,7 @@ def get_wandb_ckpt_name(run_path: str, epoch: Union[str, int] = "best") -> str:
 
 def restore_model_from_wandb_cloud(
     run_path: str,
-    local_checkpoint_path: str = None,
     ckpt_filename: str = "best",  # was None
-    throw_error_if_local_not_found: bool = False,
-    config: DictConfig = None,
     **kwargs,
 ) -> str:
     """
@@ -263,55 +260,44 @@ def restore_model_from_wandb_cloud(
     Returns:
         The ckpt filename that can be used to reload the model locally.
     """
-    if local_checkpoint_path is True:
-        assert ckpt_filename is not None, "If local_checkpoint_path is True, please specify ckpt_filename"
-        local_checkpoint_path = get_local_ckpt_path(
-            config,
-            wandb_run=get_run_api(run_path=run_path),
-            ckpt_filename=ckpt_filename,
-            throw_error_if_local_not_found=throw_error_if_local_not_found,
-        )
 
     entity, project, wandb_id = run_path.split("/")
-    if isinstance(local_checkpoint_path, (str,)):
-        ckpt_path = os.path.abspath(local_checkpoint_path)
-        log.info(f"Restoring model from local absolute path: {ckpt_path}")
+    if ckpt_filename is None:
+        ckpt_filename = get_wandb_ckpt_name(run_path, **kwargs)
+        ckpt_filename = ckpt_filename.split("/")[-1]  # in case the file contains local dir structure
+
+    expected_ckpt_path = os.path.join(os.getcwd(), ckpt_filename)
+    if wandb_id in expected_ckpt_path:
+        ckpt_path = expected_ckpt_path
     else:
-        if ckpt_filename is None:
-            ckpt_filename = get_wandb_ckpt_name(run_path, **kwargs)
-            ckpt_filename = ckpt_filename.split("/")[-1]  # in case the file contains local dir structure
+        # rename best_model_fname to add a unique prefix to avoid conflicts with other runs
+        # (e.g. if the same model is reloaded twice). Replace only filename part of the path, not the dir structure
+        ckpt_path = os.path.join(os.getcwd(), f"{wandb_id}-{ckpt_filename}")
 
-        expected_ckpt_path = os.path.join(os.getcwd(), ckpt_filename)
-        if wandb_id in expected_ckpt_path:
-            ckpt_path = expected_ckpt_path
-        else:
-            # rename best_model_fname to add a unique prefix to avoid conflicts with other runs
-            # (e.g. if the same model is reloaded twice). Replace only filename part of the path, not the dir structure
-            ckpt_path = os.path.join(os.getcwd(), f"{wandb_id}-{ckpt_filename}")
+    ckpt_path_tmp = ckpt_path
+    if not os.path.exists(ckpt_path):
+        try:
+            from src.utilities.s3utils import download_s3_object
 
-        ckpt_path_tmp = ckpt_path
-        if not os.path.exists(ckpt_path):
-            try:
-                from src.utilities.s3utils import download_s3_object
+            s3_file_path = f"{project}/checkpoints/{wandb_id}/{ckpt_filename}"
+            download_s3_object(s3_file_path, ckpt_path, throw_error=True)
+        except Exception:
+            # IMPORTANT ARGS replace=True: see https://github.com/wandb/client/issues/3247
+            ckpt_path_tmp = wandb.restore(ckpt_filename, run_path=run_path, replace=True, root=os.getcwd()).name
+            assert os.path.abspath(ckpt_path_tmp) == expected_ckpt_path
 
-                s3_file_path = f"{project}/checkpoints/{wandb_id}/{ckpt_filename}"
-                download_s3_object(s3_file_path, ckpt_path, throw_error=True)
-            except Exception:
-                # IMPORTANT ARGS replace=True: see https://github.com/wandb/client/issues/3247
-                ckpt_path_tmp = wandb.restore(ckpt_filename, run_path=run_path, replace=True, root=os.getcwd()).name
-                assert os.path.abspath(ckpt_path_tmp) == expected_ckpt_path
-
-        # if os.path.exists(ckpt_path):
-        #     # if DDP and multiple processes are restoring the same model, this may happen. check if is_rank_zero
-        #     if ckpt_path != ckpt_path_tmp:
-        #         os.remove(ckpt_path)  # remove if one exists from before
-        if os.path.exists(ckpt_path_tmp):
-            os.rename(ckpt_path_tmp, ckpt_path)
+    # if os.path.exists(ckpt_path):
+    #     # if DDP and multiple processes are restoring the same model, this may happen. check if is_rank_zero
+    #     if ckpt_path != ckpt_path_tmp:
+    #         os.remove(ckpt_path)  # remove if one exists from before
+    if os.path.exists(ckpt_path_tmp):
+        os.rename(ckpt_path_tmp, ckpt_path)
     return ckpt_path
 
 
 def load_hydra_config_from_wandb(
     run_path: str | wandb.apis.public.Run,
+    local_dir: str = None,
     override_config: Optional[DictConfig] = None,
     override_key_value: List[str] = None,
     update_config_in_cloud: bool = False,
@@ -319,6 +305,7 @@ def load_hydra_config_from_wandb(
     """
     Args:
         run_path (str): the wandb ENTITY/PROJECT/ID (e.g. ID=2r0l33yc) corresponding to the config to-be-reloaded
+        local_dir (str): if not None, the hydra_config file will be searched in this directory
         override_config (DictConfig): each of its keys will override the corresponding entry loaded from wandb
         override_key_value: each element is expected to have a "=" in it, like datamodule.num_workers=8
         update_config_in_cloud: if True, the config in the cloud will be updated with the new overrides
@@ -346,16 +333,26 @@ def load_hydra_config_from_wandb(
     if work_dir is not None and run.id not in work_dir:
         work_dir = os.path.join(os.path.dirname(work_dir), run.id)
     is_local = False
-    if work_dir is not None and os.path.exists(work_dir):
-        wandb_dir = os.path.join(work_dir, "wandb")
-        if os.path.exists(os.path.join(wandb_dir, "latest-run")):
-            wandb_dir = os.path.join(wandb_dir, "latest-run")
-        # Find hydra_config file in wandb directory or subdirectories using glob
-        hydra_config_files = glob.glob(f"{wandb_dir}/**/hydra_config*.yaml", recursive=True)
-        log.info(f"[rank: {rank}] Found {len(hydra_config_files)} files in {wandb_dir}: {hydra_config_files}")
-        # assert len(hydra_config_files) > 0, f"Could not find any hydra_config file in {wandb_dir}"
-        is_local = True
-        # torch.distributed.barrier()
+    possible_cfg_dirs = [os.path.join(work_dir, "wandb")]
+    if isinstance(local_dir, str):
+        if run.id not in local_dir and os.path.exists(os.path.join(local_dir, run.id)):
+            local_dir = os.path.join(local_dir, run.id)
+        if os.path.isfile(local_dir):
+            local_dir = os.path.dirname(local_dir)
+        possible_cfg_dirs.append(local_dir)
+        possible_cfg_dirs.append(local_dir.replace("checkpoints", "configs"))
+        possible_cfg_dirs.append(local_dir.replace("checkpoints", "wandb"))
+    for possible_cfg_dir in possible_cfg_dirs:
+        if possible_cfg_dir is not None and os.path.exists(possible_cfg_dir):
+            if os.path.exists(os.path.join(possible_cfg_dir, "latest-run")):
+                possible_cfg_dir = os.path.join(possible_cfg_dir, "latest-run")
+            # Find hydra_config file in wandb directory or subdirectories using glob
+            hydra_config_files = glob.glob(f"{possible_cfg_dir}/**/hydra_config*.yaml", recursive=True)
+            if len(hydra_config_files) > 0:
+                log.info(f"[{rank=}] Found {len(hydra_config_files)} files in {possible_cfg_dir}: {hydra_config_files}")
+                is_local = True
+                break
+            # torch.distributed.barrier()
     if not is_local or len(hydra_config_files) == 0:
         # Find latest hydra_config-v{VERSION}.yaml file in wandb cloud (Skip versions labeled as 'old')
         hydra_config_files = [f.name for f in run.files() if "hydra_config" in f.name and "old" not in f.name]
@@ -375,13 +372,14 @@ def load_hydra_config_from_wandb(
         hydra_config_files = sorted(hydra_config_files, key=lambda x: int(x.split("-v")[-1].split(".")[0]))
 
     hydra_config_file = hydra_config_files[-1]
-    if not hydra_config_file.endswith("hydra_config.yaml"):
-        log.info(f" Reloading from hydra config file: {hydra_config_file}")
+    # if not hydra_config_file.endswith("hydra_config.yaml"):
+    #     log.info(f" Reloading from hydra config file: {hydra_config_file}")
 
     # Download from wandb cloud
     if is_local or (os.path.exists(hydra_config_file) and rank not in ["0", 0]):
-        pass
+        log.info(f"Loading local hydra config file: {hydra_config_file}")
     else:
+        log.info(f"Downloading hydra config file: {hydra_config_file}")
         wandb_restore_kwargs = dict(run_path=run_path, replace=True, root=os.getcwd())
         wandb.restore(hydra_config_file, **wandb_restore_kwargs)
 

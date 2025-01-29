@@ -36,18 +36,16 @@ class EmulationExperiment(BaseExperiment):
         return num_input_channels
 
     @property
+    def target_key(self) -> str:
+        return "targets"
+
+    @property
     def main_data_keys(self) -> List[str]:
-        return ["inputs", "targets"]
+        return ["inputs", self.target_key]
 
     @property
     def main_data_keys_val(self) -> List[str]:
         return self.main_data_keys
-
-    @property
-    def normalize_data_keys_val(self) -> List[str]:
-        # only normalize inputs during validation
-        # That is, inside _evaluation_step the inputs are normalized, but the targets are not
-        return ["inputs"]
 
     @torch.inference_mode()
     def _evaluation_step(
@@ -64,7 +62,7 @@ class EmulationExperiment(BaseExperiment):
 
         # pop metadata from batch since not needed for evaluation
         metadata = batch.pop("metadata", None)
-        
+        raw_targets = batch.pop("raw_targets", None)  # Unnormalized (raw scale) data, used to compute targets
         if isinstance(self.model, BaseDiffusion) and split == "val":
             # log validation loss
             loss = self.get_loss(batch)
@@ -75,9 +73,9 @@ class EmulationExperiment(BaseExperiment):
                 log_dict = {f"{split}/loss": float(loss)}
             self.log_dict(log_dict, on_step=False, on_epoch=True)
 
+        _ = batch.pop("targets", None)  # Remove normalized targets if present, not needed any more
         # Get predictions
-        targets_unpacked = self.unpack_data(batch.pop("targets"), input_or_output="output")
-        targets = self.get_target_variants(targets_unpacked, is_normalized=False)
+        targets = self.get_target_variants(raw_targets, is_normalized=False)
         inputs = self.transform_inputs(batch.pop("inputs"), split=split, ensemble=True)
         results = self.predict(inputs, **batch)
 
@@ -120,11 +118,11 @@ class EmulationExperiment(BaseExperiment):
         inputs = self.transform_inputs(batch["inputs"], split=split, ensemble=False)
         targets = batch["targets"]
         # Uncomment below if targets is a dict of variable to variable target data
-        # targets = self.pack_data(targets, input_or_output="output")
-        
+        targets = self.pack_data(targets, input_or_output="output")
+
         # Remove metadata from batch as not needed for loss computation
         batch.pop("metadata", None)
-        
+
         extra_kwargs = {k: v for k, v in batch.items() if k not in ["inputs", "targets"]}
         loss = self.model.get_loss(inputs=inputs, targets=targets, **extra_kwargs)
         return loss

@@ -1,12 +1,15 @@
 from abc import abstractmethod
+from typing import Optional
 
 import numpy as np
 import torch
 
 # from src.utilities.torch_utils import persistence
 from src.diffusion._base_diffusion import BaseDiffusion
+from src.interface import NoTorchModuleWrapper
 from src.losses.losses import AbstractWeightedLoss, crps_ensemble
-from src.utilities.utils import get_logger
+from src.utilities.checkpointing import reload_checkpoint_from_wandb
+from src.utilities.utils import freeze_model, get_logger
 
 
 log = get_logger(__name__)
@@ -152,6 +155,9 @@ class EDMPrecond(BaseDiffusion):
         S_max=float("inf"),  # Maximum noise level for increased noise.
         S_noise=1,  # Noise level for increased noise.
         heun: bool = True,  # Use Heun's method for the sampling loop.
+        guidance: float = 1,  # Guidance strength for the sampling loop. Default: 1 (no guidance).
+        guidance_run_id: str = None,  # Run ID for the guidance model.
+        guidance_ckpt_filename: str = "latest",  # Checkpoint filename for the guidance model.
         dtype="double",  # double or float
         **kwargs,  # Keyword arguments for the underlying model.
     ):
@@ -169,6 +175,24 @@ class EDMPrecond(BaseDiffusion):
         self.log_text.info(
             f"EDM: {sigma_min=}, {self.sigma_max_inf=}, {num_steps=}, {rho=}, {S_churn=}, {S_min=}, {S_max=}"
         )
+        self._guidance_model = None
+        if guidance != 1:
+            assert guidance_run_id is not None, "Guidance model run ID must be provided."
+            guidance_model = reload_checkpoint_from_wandb(
+                run_id=guidance_run_id,
+                local_checkpoint_path=True,
+                ckpt_filename=guidance_ckpt_filename,
+                also_datamodule=False,
+                print_name="Guidance model",
+            )["model"]
+            self._guidance_model = NoTorchModuleWrapper(guidance_model.cpu())
+            freeze_model(self.guidance_model)
+
+    @property
+    def guidance_model(self) -> Optional[torch.nn.Module]:
+        if self._guidance_model is None:
+            return None
+        return self._guidance_model.module  # unwrap the NoTorchModuleWrapper
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
         """Return the loss function used for training.
@@ -197,20 +221,17 @@ class EDMPrecond(BaseDiffusion):
                     mask = torch.rand(x.shape[0], device=x.device) < self.hparams.force_unconditional
                     x[mask] = 0
                 else:
-                    pass  # conditional sampling. todo: implement CFG: https://arxiv.org/pdf/2207.12598
+                    pass  # conditional sampling.
             else:
                 _ = model_kwargs.pop("condition", None)
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-        class_labels = (
-            None
-            if self.label_dim == 0
-            else (
-                torch.zeros([1, self.label_dim], device=x.device)
-                if class_labels is None
-                else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-            )
-        )
+        if self.label_dim == 0:
+            class_labels = None
+        elif class_labels is None:
+            class_labels = torch.zeros([1, self.label_dim], device=x.device)
+        else:
+            class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == "cuda") else torch.float32
 
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
@@ -242,12 +263,29 @@ class EDMPrecond(BaseDiffusion):
 
     def edm_sampler(
         self,
-        latents,
-        class_labels=None,
+        noise,
         randn_like=torch.randn_like,
         # sigma_min=0.002, sigma_max=80,
         **kwargs,
     ):
+        dtype = torch.float64 if self.hparams.dtype == "double" else torch.float32
+        if self.guidance_model is not None:
+            self.guidance_model.to(self.device)
+
+        def denoise(x, t):
+            denoised = self(x, t, **kwargs).to(dtype)
+            if self.hparams.guidance == 1:
+                return denoised
+            # Guided denoiser.
+            kwargs_g = kwargs
+            if self.guidance_model.model.hparams.force_unconditional:
+                kwargs_g = {k: v for k, v in kwargs.items() if k != "dynamical_condition"}
+            with self.guidance_model.ema_scope(condition=True):  # , context=f"Guidance EMA"):
+                ref_Dx = self.guidance_model(x, t, **kwargs_g).to(dtype)
+            denoised = ref_Dx.lerp(denoised, self.hparams.guidance)
+            # = ref_Dx + guidance * (denoised - ref_Dx) = guidance * denoised + (1 - guidance) * ref_Dx
+            return denoised
+
         # Adjust noise levels based on what's supported by the network.
         sigma_min = self.sigma_min  # max(sigma_min, self.sigma_min)
         sigma_max = self.sigma_max_inf  # min(sigma_max, self.sigma_max)
@@ -257,29 +295,31 @@ class EDMPrecond(BaseDiffusion):
         S_max = self.hparams.S_max
         S_noise = self.hparams.S_noise
         num_steps = self.hparams.num_steps
-        dtype = torch.float64 if self.hparams.dtype == "double" else torch.float32
         # Time step discretization.
-        step_indices = torch.arange(num_steps, dtype=dtype, device=latents.device)
+        step_indices = torch.arange(num_steps, dtype=dtype, device=noise.device)
         step_indices_normed = step_indices / (num_steps - 1)
         t_steps = self.edm_discretization(step_indices_normed, sigma_min, sigma_max, rho)
-        t_steps = torch.cat(
-            [self.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]
-        )  # t_N = 0, but never actually given to network.
+        t_steps = torch.cat([self.round_sigma(t_steps), torch.zeros_like(t_steps[:1])])
+        # t_N = 0, but never actually given to network.
         # if self.hparams.dtype == "double":
         # self.model.double()
         # Main sampling loop
-        x_next = latents.to(dtype) * t_steps[0]
+        x_next = noise.to(dtype) * t_steps[0]
         # kwargs = {k: v.to(dtype) if torch.is_tensor(v) else v for k, v in kwargs.items()}
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):  # 0, ..., N-1
             x_cur = x_next
 
             # Increase noise temporarily.
-            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-            t_hat = self.round_sigma(t_cur + gamma * t_cur)
-            x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * randn_like(x_cur)
+            if S_churn > 0 and S_min <= t_cur <= S_max:
+                gamma = min(S_churn / num_steps, np.sqrt(2) - 1)
+                t_hat = t_cur + gamma * t_cur
+                x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * randn_like(x_cur)
+            else:
+                t_hat = t_cur
+                x_hat = x_cur
 
             # Euler step.
-            denoised = self(x_hat, t_hat, class_labels, **kwargs).to(dtype)
+            denoised = denoise(x_hat, t_hat).to(dtype)
             d_cur = (x_hat - denoised) / t_hat
             x_next = x_hat + (t_next - t_hat) * d_cur
             #      = x_hat + (t_next - t_hat) * (x_hat - denoised) / t_hat.
@@ -287,10 +327,12 @@ class EDMPrecond(BaseDiffusion):
 
             # Apply 2nd order correction.
             if self.heun and i < num_steps - 1:
-                denoised = self(x_next, t_next, class_labels, **kwargs).to(dtype)
+                denoised = denoise(x_next, t_next).to(dtype)
                 d_prime = (x_next - denoised) / t_next
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
+        if self.guidance_model is not None:
+            self.guidance_model.cpu()
         return x_next.to(self.dtype)
 
     @torch.inference_mode()

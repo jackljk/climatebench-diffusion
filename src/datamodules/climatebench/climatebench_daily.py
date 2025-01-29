@@ -2,30 +2,29 @@ from __future__ import annotations
 
 import os.path
 from datetime import timedelta
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple, Any, Union
 
+import cftime
 import numpy as np
 import torch
 import xarray as xr
-from einops import rearrange
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from src.evaluation.metrics_wb import get_lat_weights
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
-
-
 from src.utilities.climatebench_datamodule_utils import (
-    yearlyInterpolator,
-    monthlyInterpolator,
-    standardize_output_xr,
-    handle_ensemble,
     get_mean_std_of_variables,
-    normalize_data,
     get_rsdt,
+    handle_ensemble,
+    monthlyInterpolator,
+    normalize_data,
+    standardize_output_xr,
+    yearlyInterpolator,
 )
-from src.utilities.utils import get_logger
-import cftime
+from src.utilities.utils import get_logger, to_torch_and_device
+from src.utilities.normalization import StandardNormalizer
 
 log = get_logger(__name__)
 
@@ -36,17 +35,18 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         data_dir: str = "~/data/climate-analytics-lab-shared/ClimateBench/daily/data",
         simulations: Sequence[str] = ("ssp126", "ssp370", "ssp585"),
         sim_validation: str = "ssp370",
-        validation_ensemble: str = "first", # only used when mean_over_ensemble is 'stack'
+        validation_ensemble: str = "first",  # only used when mean_over_ensemble is 'stack'
         validation_size: int = 45,
         normalize_vars: Sequence[str] = ("CO2", "CH4", "SO2", "BC"),
         additional_vars: Sequence[str] = None,
         simulations_raw: Sequence[str] = None,
         simulations_anom_type: str = "piControl",
+        normalization_type: str = None,  # "standard",
         window: int = 10,  # == slider
         output_vars: Sequence[str] | str = "tas",
         mean_over_ensemble: bool = True,
-        num_ensemble_members: int|str = "all",
-        scale_inputs: str = None,  
+        num_ensemble_members: int | str = "all",
+        scale_inputs: str = None,
         DEBUG_dataset_size: int = None,
         **kwargs,
     ):
@@ -61,23 +61,21 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             mean_over_ensemble,
             **kwargs,
         )
+        self.hparams.additional_vars = additional_vars if additional_vars is not None else []
         self.TEST_SIM = "ssp245"
         self._sigma_data = None
-        
+
         if isinstance(self.hparams.output_vars, str):
             self.hparams.output_vars = [self.hparams.output_vars]
-            
+
         if self.hparams.mean_over_ensemble == "stack":
             self.hparams.sim_validation = {
-                'X': self.hparams.sim_validation,
-                'Y': self.hparams.sim_validation + "_ensemble_0"
+                "X": self.hparams.sim_validation,
+                "Y": self.hparams.sim_validation + "_ensemble_0",
             }
         else:
-            self.hparams.sim_validation = {
-                'X': self.hparams.sim_validation,
-                'Y': self.hparams.sim_validation
-            }
-            
+            self.hparams.sim_validation = {"X": self.hparams.sim_validation, "Y": self.hparams.sim_validation}
+
         # DEBUGGING MODE
         if self.hparams.DEBUG_dataset_size is not None:
             self.hparams.validation_size = self.hparams.DEBUG_dataset_size - window
@@ -94,8 +92,6 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
     @property
     def sigma_data(self) -> float:
         # Return standard deviation of the training targets
-        if self._sigma_data is None:
-            raise NotImplementedError("FIX")
         return self._sigma_data
 
     def preprocess_xarray_datasets(self, simulations: Sequence[str], mean_over_ensemble: bool = False):
@@ -103,22 +99,22 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         for i, simu in enumerate(simulations):
             # Read in the data
             input_name = os.path.join(self.hparams.data_dir, "inputs_" + simu + ".nc")
-            if self.hparams.simulations_raw and simu in self.hparams.simulations_raw:
+            simulations_raw = self.hparams.simulations_raw
+            if simulations_raw is not None and (simulations_raw == "all" or simu in simulations_raw):
                 # If the raw data is used for different normalizations
                 output_name = os.path.join(self.hparams.data_dir, "outputs_" + simu + "_daily_raw.nc")
                 log.info(f"Using raw data for {simu}")
+                is_raw = True
             else:
                 output_name = os.path.join(self.hparams.data_dir, "outputs_" + simu + "_daily.nc")
+                is_raw = False
 
             input_xr = xr.open_dataset(input_name).compute()
-            if self.hparams.simulations_raw:
-                log.info(f"Loading and Normalizing raw data for {simu}")
-                output_xr = xr.open_dataset(output_name)
-                output_xr = self._normalize_raw_data(output_xr)
-                log.info(f"Finished normalizing data for {simu}")
-            else:
-                log.info(f"Loading data pre-normalized data for {simu}")
-                output_xr = xr.open_dataset(output_name).compute()
+            log.info(f"Loading data for {simu}")
+            output_xr = xr.open_dataset(output_name) #.compute()
+            if self.hparams.simulations_anom_type not in ["none", None]:
+                assert is_raw, "oops"
+                output_xr = self._normalize_raw_data(output_xr, name=simu)
 
             # DEBUGGING MODE
             if self.hparams.DEBUG_dataset_size is not None:
@@ -136,7 +132,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             # input has no members
             X_train[simu] = input_xr
             # Add the data to the training set
-            if type(output_xr) == dict:
+            if isinstance(output_xr, dict):
                 Y_train.update(output_xr)
             else:
                 Y_train[simu] = output_xr
@@ -166,18 +162,28 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         if self.var_to_meanstd is None:
             # Compute mean and std of variables in training set
             self.var_to_meanstd = get_mean_std_of_variables(X_train, self.hparams.normalize_vars)
-            if len(self.output_vars) == 1:
-                #  Compute standard deviation of the training targets, required for EDM.
-                #  To improve:
-                #  1a. Compute the standard deviation of the training targets for each output variable, use them separately in EDM (for each channel)
-                #  1b. To use multiple output_vars, a first step could simply set sigma_data to the avg of the std of the output_vars
-                #  2. Compute it over all training simulations, not one.
-                log.info("Computing sigma_data")
-                self._sigma_data = Y_train[sim_val['Y']].std()[self.output_vars[0]].item()
-                log.info(f"sigma_data: {self._sigma_data}")
+            #  Compute standard deviation of the training targets, required for EDM.
+            #  To improve:
+            #  1a. Compute the standard deviation of the training targets for each output variable, use them separately in EDM (for each channel)
+            #  1b. To use multiple output_vars, a first step could simply set sigma_data to the avg of the std of the output_vars
+            #  2. Compute it over all training simulations, not one.
+            if self.hparams.normalization_type == "standard":
+                # Compute the mean and std of the output variables
+                log.info(f"Computing mean and std of the output variables")
+                data_mean = Y_train[sim_val["Y"]].mean()
+                data_std = Y_train[sim_val["Y"]].std()
+                data_mean_act, data_std_act = dict(), dict()
+                for ovar in self.output_vars:
+                    data_mean_act[ovar] = torch.tensor(data_mean[self.ovar_to_var_id[ovar]].item())
+                    data_std_act[ovar] = torch.tensor(data_std[self.ovar_to_var_id[ovar]].item())
+                log.info(f"Standardizing data with mean: {data_mean_act}, std: {data_std_act}")
+                self.normalizer_targets = StandardNormalizer(means=data_mean_act, stds=data_std_act)
+                self._sigma_data = 1.0
             else:
-                self._sigma_data = lambda x: NotImplementedError
-            log.info(f"Computed mean and std of variables.")
+                assert self.hparams.normalization_type is None, f"{self.hparams.normalization_type} not implemented yet"
+                assert len(self.output_vars) == 1, f"{self.output_vars} not implemented yet for multiple output_vars"
+                self._sigma_data = Y_train[sim_val["Y"]].std()[self.output_vars[0]].item()
+                log.info(f"sigma_data: {self._sigma_data}")
 
         # Normalize data
         if stage in ["fit", "validate", None]:
@@ -187,17 +193,14 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
 
         if stage in ["test", "predict", None]:
             X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM])
-
             set_test = self._setup_test(X_test, Y_test)
         else:
             set_test = None
 
         # Get rsdt data
-        rsdt = (
-            get_rsdt(self.hparams.data_dir, self.hparams.simulations)
-            if "rsdt" in self.hparams.additional_vars
-            else None
-        )
+        rsdt = None
+        if "rsdt" in self.hparams.additional_vars:
+            rsdt = get_rsdt(self.hparams.data_dir, self.hparams.simulations)
 
         ds_splits = {
             "train": set_train,
@@ -216,16 +219,15 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         self.print_data_sizes(stage)
 
     def _setup_train_val(self, X_train, Y_train):
-        sim_val_X = self.hparams.sim_validation['X']
-        sim_val_Y = self.hparams.sim_validation['Y']
+        sim_val_X = self.hparams.sim_validation["X"]
+        sim_val_Y = self.hparams.sim_validation["Y"]
 
         # Handle the val inputs set
         X_val = X_train[sim_val_X].isel(time=slice(-self.hparams.validation_size, None))
         X_train[sim_val_X] = X_train[sim_val_X].isel(time=slice(None, -self.hparams.validation_size))
-        
+
         sim_val_start_year = X_val.time[0].item()
-        
-        
+
         Y_val = Y_train[sim_val_Y].sel(time=slice(self._get_validation_start_date(sim_val_start_year), None))
 
         # Remove the validation set from the training set
@@ -237,7 +239,10 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         )
 
         # Log the validation set
-        log.info(f"Validating on {sim_val_Y} from {X_val.time[0].item()} to {X_val.time[-1].item()}") if self.hparams.mean_over_ensemble == 'stack' else log.info(f"Validating on {sim_val_X} from {Y_val.time[0].item()} to {Y_val.time[-1].item()}")
+        if self.hparams.mean_over_ensemble == "stack":
+            log.info(f"Validating on {sim_val_Y} from {X_val.time[0].item()} to {X_val.time[-1].item()}")
+        else:
+            log.info(f"Validating on {sim_val_X} from {Y_val.time[0].item()} to {Y_val.time[-1].item()}")
 
         return X_train, Y_train, X_val, Y_val
 
@@ -245,8 +250,8 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         """
         Setup Helper for normalizing the training and validation set
         """
-        sim_val_X = self.hparams.sim_validation['X']
-        sim_val_Y = self.hparams.sim_validation['Y']
+        sim_val_X = self.hparams.sim_validation["X"]
+        sim_val_Y = self.hparams.sim_validation["Y"]
         X_train = {k: normalize_data(x, self.var_to_meanstd) for k, x in X_train.items()}
         X_val = {sim_val_X: normalize_data(X_val, self.var_to_meanstd)}
 
@@ -274,7 +279,6 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         Helper to set up the tensor datasets for the given splits
         """
         for split, xarrays in ds_splits.items():
-            print(f"Setting up {split} dataset")
             if xarrays is None:
                 continue
             data_kwargs = dict(
@@ -284,16 +288,17 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
                 output_var=self.output_vars,
                 additional_vars=ds_vars,
             )
-            # Create the pytorch tensor dataset and set to to self._data_{split}
+            # Create the pytorch tensor dataset and set to self._data_{split}
             if isinstance(xarrays, (list, tuple)):
                 setattr(self, f"_data_{split}", [DailyTensorDataset(t, **data_kwargs) for t in xarrays])
             else:
                 setattr(self, f"_data_{split}", DailyTensorDataset(xarrays, **data_kwargs))
 
-    def _normalize_raw_data(self, xarray_data: xr.Dataset):
+    def _normalize_raw_data(self, xarray_data: xr.Dataset, name: str) -> xr.Dataset:
         """
         Helper function to subtract the piControl data from the training data
         """
+        log.info(f"Subtracting {self.hparams.simulations_anom_type} data from the training data ``{name}``")
         if self.hparams.simulations_anom_type == "piControl":
             piControl = xr.open_dataset(
                 os.path.join(self.hparams.data_dir, "CESM2_piControl_r1i1p1f1_climatology_daily.nc")
@@ -315,13 +320,11 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             if "nbnd" in v.dims:
                 outputs[k] = v.drop("nbnd")
                 log.info(f"dropping nbnd dimension from the {k} output datasets")
-            else:
-                log.info(f"There is no nbnd dimension in the {k} output datasets, retaining the original dataset")
-                
+            # else:
+            #     log.info(f"There is no nbnd dimension in the {k} output datasets, retaining the original dataset")
+
         return outputs
-                
-            
-                
+
     def _get_start_date(self, xarray_dict: Dict[str, xr.Dataset]) -> Dict[str, str]:
         """
         Get the start date of the xarray datasets.
@@ -343,11 +346,18 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         device: torch.device = None,
         verbose: bool = True,
     ) -> Dict[str, OneStepAggregator]:
-        aggr_kwargs = dict(is_ensemble=is_ensemble)
+        # Use area weights for the aggregators to compute weighted metrics
+        split_ds = getattr(self, f"_data_{split}")
+        if split == "val" and isinstance(split_ds, list):
+            split_ds = split_ds[0]  # just need it for the area weights
+
+        area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
+        aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
+
         aggregator = OneStepAggregator(
             record_rmse=True,
             use_snapshot_aggregator=True,
-            record_normed=False,
+            record_normed=self.hparams.normalization_type is not None,
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
             snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
             **aggr_kwargs,
@@ -379,9 +389,25 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         subsample_val: int = 1,
         additional_vars: Dict[str, xr.DataArray] = None,
     ):
-        self.ds_inputs = tensors["inputs"]  # Has ssps126, ssps370, ssps585, historical
-        self.ds_outputs = tensors["targets"]  # Has ssps126, ssps370, ssps585, historical
+        self.output_var = output_var
+        self.ovar_to_var_id = {
+            "tas": "tas",
+            "dtr": "diurnal_temperature_range",
+            "pr": "pr",
+            "pr90": "pr90",  # pr90 is the 90th percentile of daily precipitation
+        }
+        output_var_ids = [self.ovar_to_var_id[ovar] for ovar in output_var]  # to remove unnecessary output variables
+        # Bot dses below may have as keys: ssps126, ssps370, ssps585, historical, etc.
+        self.ds_inputs = tensors["inputs"]
+        self.ds_outputs = {k: v[output_var_ids] for k, v in tensors["targets"].items()}
         self._parse_additional_vars(additional_vars)
+        # Set area weights
+        any_output_ds = list(self.ds_outputs.values())[0]
+        self._area_weights = get_lat_weights(any_output_ds)
+        self._area_weights_tensor = torch.as_tensor(self.area_weights.values, dtype=torch.float32).repeat(
+            any_output_ds.longitude.size, 1
+        ).T  # (lat, lon)
+
         # Get the List of ssps
         ds_ssps = {
             "inputs": list(self.ds_inputs.keys()),
@@ -391,74 +417,96 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         # Gettting the sizes of the datasets
         if dataset_id == "val":
             # get only the validation size as the number of years
-            self.ssp_sizes = {ssp: self.ds_inputs[ssp].sizes["time"] for ssp in ds_ssps['inputs']}
-            if mean_over_mems == 'stack':
+            self.ssp_sizes = {ssp: self.ds_inputs[ssp].sizes["time"] for ssp in ds_ssps["inputs"]}
+            if mean_over_mems == "stack":
                 # go through ssp_sizes and change the key to be equal to the ds_ssps['targets'] to handle ensem 'stack'
-                self.ssp_sizes = {ds_ssps['targets'][i]: size for i, size in enumerate(self.ssp_sizes.values())}
-                
+                self.ssp_sizes = {ds_ssps["targets"][i]: size for i, size in enumerate(self.ssp_sizes.values())}
+
             self.dataset_size = sum(self.ssp_sizes.values())
         else:
-            self.ssp_sizes = {ssp: self.ds_outputs[ssp].sizes["time"] for ssp in ds_ssps['targets']}
+            self.ssp_sizes = {ssp: self.ds_outputs[ssp].sizes["time"] for ssp in ds_ssps["targets"]}
             self.dataset_size = sum(self.ssp_sizes.values())
 
         # Get the cutoffs for the datasets for indexing
         self.ssp_cutoffs = (
-            {ssp: sum([self.ssp_sizes[ssp_] for ssp_ in ds_ssps['targets'][:i]]) for i, ssp in enumerate(ds_ssps['targets'])}
-            if len(ds_ssps['targets']) > 1
-            else {ds_ssps['targets'][0]: 0}
+            {
+                ssp: sum([self.ssp_sizes[ssp_] for ssp_ in ds_ssps["targets"][:i]])
+                for i, ssp in enumerate(ds_ssps["targets"])
+            }
+            if len(ds_ssps["targets"]) > 1
+            else {ds_ssps["targets"][0]: 0}
         )
 
         # assert the size of the total dataset is equal to the max idx
         assert (
-            self.dataset_size == max(self.ssp_cutoffs.values()) + self.ssp_sizes[ds_ssps['targets'][-1]]
+            self.dataset_size == max(self.ssp_cutoffs.values()) + self.ssp_sizes[ds_ssps["targets"][-1]]
         ), "Size mismatch between datasets"
 
         # Class Variables
         self.dataset_id = dataset_id
         self.start_datetimes = {
-            ssp: self.ds_outputs[ssp].time.values[0] for ssp in ds_ssps['targets']
+            ssp: self.ds_outputs[ssp].time.values[0] for ssp in ds_ssps["targets"]
         }  # cftime.DatetimeNoLeap values
-        self.end_datetimes = {ssp: self.ds_outputs[ssp].time.values[-1] for ssp in ds_ssps['targets']}
+        self.end_datetimes = {ssp: self.ds_outputs[ssp].time.values[-1] for ssp in ds_ssps["targets"]}
 
         self.interpolation_type = interpolation_type
-        self.mean_over_mems = mean_over_mems  
+        self.mean_over_mems = mean_over_mems
         self.window = window
-        self.output_var = output_var
-        self.ovar_to_var_id = {
-            "tas": "tas",
-            "dtr": "diurnal_temperature_range",
-            "pr": "pr",
-            "pr90": "pr90",  # pr90 is the 90th percentile of daily precipitation
-        }
         # Handle ensemble members if mean_over_mems is 'stack'
-        self.handle_ensemble = lambda ssp: ssp.split('_')[0] if self.mean_over_mems == 'stack' else ssp
+        self.handle_ensemble = lambda ssp: ssp.split("_")[0] if self.mean_over_mems == "stack" else ssp
 
-    def __getitem__(self, index) -> Dict[str, Tensor]:
+    def __getitem__(self, index) -> Dict[str, Union[Tensor, Any]]:
         # Using the index value find which ssp that index belongs too
         ssp = [ssp for ssp, cutoff in self.ssp_cutoffs.items() if index >= cutoff][-1]
 
-        
-        inputs_ssp = self.ds_inputs[self.handle_ensemble(ssp)] # handle ensemble naming for input
-        outputs_ssp = self.ds_outputs[ssp]
+        inputs_ssp = self.ds_inputs[self.handle_ensemble(ssp)]  # handle ensemble naming for input
 
         if self.dataset_id == "val":
-            outputs, ssp_index_datetime = self._sample_validation(ssp, index, outputs_ssp)
+            outputs, ssp_index_datetime = self._sample_validation(ssp, index)
         else:
-            outputs, ssp_index_datetime = self._get_outputs(ssp, index, outputs_ssp)
+            outputs, ssp_index_datetime = self._get_outputs(ssp, index)
 
         # Interpolate the input data to daily resolution of X (Function handles the edge cases at first and last year)
-        inputs = self._handle_interpolation_yearly(ssp, inputs_ssp, ssp_index_datetime) # ssp var needed for output ds with ensem so not using handle_ensemble
-        additional_vars = self._handle_additional_vars(self.additional_vars, self.handle_ensemble(ssp), ssp_index_datetime) # additional vars are inputs with no ensemble handling so using handle_ensemble
-        dset = self._reshape_raw_data(inputs, outputs, additional_vars)
+        #   ssp var needed for output ds with ensem so not using handle_ensemble
+        inputs = self._handle_interpolation_yearly(ssp, inputs_ssp, ssp_index_datetime)
+        # additional vars are inputs with no ensemble handling so using handle_ensemble
+        additional_vars = self._handle_additional_vars(
+            self.additional_vars, self.handle_ensemble(ssp), ssp_index_datetime
+        )
+        if self.mean_over_mems or "member" not in inputs.dims:
+            assert "member" not in inputs.dims and "member" not in outputs.dims
+            transpose_dims = ["variable", "latitude", "longitude"]
+        else:
+            transpose_dims = ["member", "variable", "latitude", "longitude"]
 
-        
-        # Add metadata to dset
-        dset["metadata"] = {
-            "ssp": ssp,
-            "datetime": ssp_index_datetime.strftime("%Y-%m-%d"), # convert to string for pytorch 
+            # Add the additional vars to the inputs
+        for var_name, var_data in additional_vars.items():
+            inputs = inputs.assign(
+                {var_name: (("latitude", "longitude"), var_data[var_name].transpose("latitude", "longitude").data)}
+            )
+
+        inputs_tensor = inputs.to_array().transpose(*transpose_dims).data.astype(np.float32)  # (C_in, H, W)
+        # Shouldn't be necessary: outputs = outputs.transpose(*[d for d in transpose_dims if d != "variable"])
+        # outputs = outputs.to_array().data.astype(np.float32)  # (C_out, H, W)
+        outputs = {ovar: outputs[ovar].data.astype(np.float32) for ovar in self.output_var}
+
+        # No historical data for right now TODO add when we get the historical data for daily resolution
+        # Remove member handling as instead of meaning, (TODO Implementing to get more data by appending to the end treating them as different/new samples)
+        # pad the input data to make it shape (1, variable, lat, lon)
+        inputs_tensor = np.expand_dims(inputs_tensor, axis=0)
+
+        # bring into shape (variable, lat, lon)
+        # assert Y_np.shape[0] == len(self.output_var)
+        assert inputs_tensor.shape == (1, len(inputs.data_vars), *list(inputs.dims.values())[::-1])
+        batch_element = {
+            "inputs": inputs_tensor,
+            "targets": outputs,
+            "metadata": {  # Add metadata to dset
+                "ssp": ssp,
+                "datetime": ssp_index_datetime.strftime("%Y-%m-%d"),  # convert to string for pytorch
+            },
         }
-        
-        return dset
+        return batch_element
 
     def _handle_additional_vars(
         self, vars: list[str], ssp: str, ssp_index_datetime: cftime.datetime
@@ -497,7 +545,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
                 # handle for rsdt
                 self.rsdt = var_data if var_name == "rsdt" else None
 
-    def _get_outputs(self, ssp: str, index: int, outputs_ssp: xr.Dataset):
+    def _get_outputs(self, ssp: str, index: int) -> Tuple[xr.Dataset, cftime.datetime]:
         """
         Helper function to get the outputs for a given ssp and index
 
@@ -512,10 +560,10 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         # Get the index of the ssp
         ssp_index = index - self.ssp_cutoffs[ssp]
         # Get the outputs for that index
-        outputs = outputs_ssp.isel(time=ssp_index)
+        outputs = self.ds_outputs[ssp].isel(time=ssp_index)
         return outputs, outputs.time.item()
 
-    def _sample_validation(self, ssp: str, index: int, output_ssp: xr.Dataset):
+    def _sample_validation(self, ssp: str, index: int):
         """
         Subsamples a random day from a given year in the validation set (Validation set should just be x years in size)
         NOTE: This is to ensure that the validation set is not biased towards the start or end of the year
@@ -532,7 +580,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         index_year = self.start_datetimes[ssp].year + index
 
         # Get the all values from that year in output_ssp
-        year_values = output_ssp.sel(time=str(index_year))
+        year_values = self.ds_outputs[ssp].sel(time=str(index_year))
 
         # Get a random day from that year
         random_day = np.random.randint(0, year_values.sizes["time"])
@@ -589,46 +637,17 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
 
         return inputs
 
-    def _reshape_raw_data(
-        self, inputs: Dict[str, xr.Dataset], outputs: Dict[str, xr.Dataset], additional_vars: Dict[str, xr.Dataset]
-    ) -> Dict[str, Tensor]:
-        if self.mean_over_mems or "member" not in inputs.dims:
-            assert "member" not in inputs.dims and "member" not in outputs.dims
-            transpose_dims = ["variable", "latitude", "longitude"]
-        else:
-            transpose_dims = ["member", "variable", "latitude", "longitude"]
+    @property
+    def area_weights(self):
+        return self._area_weights
 
-        outputs = outputs.transpose(*[d for d in transpose_dims if d != "variable"])
+    @property
+    def area_weights_tensor(self):
+        return self._area_weights_tensor
 
-        # Add the additional vars to the inputs
-        for var_name, var_data in additional_vars.items():
-            inputs = inputs.assign(
-                {var_name: (("latitude", "longitude"), var_data[var_name].transpose("latitude", "longitude").data)}
-            )
-
-        X_np = inputs.to_array().transpose(*transpose_dims).data
-        Y_np = np.stack(
-            [outputs[self.ovar_to_var_id[ovar]].data for ovar in self.output_var], axis=-1
-        )  # TODO: figure out how to handle self.output_var
-
-        # No historical data for right now TODO add when we get the historical data for daily resolution
-        # Remove window since not handling
-        # Remove member handling as instead of meaning, (TODO Implementing to get more data by appending to the end treating them as different/new samples)
-
-        # Reshape Y to (variable, lat, lon)
-        Y_np = rearrange(Y_np, "lat lon var -> var lat lon")
-
-        # pad the input data to make it shape (1, variable, lat, lon)
-        X_np = np.expand_dims(X_np, axis=0)
-
-        # Cast to float32
-        X_np = X_np.astype(np.float32)
-        Y_np = Y_np.astype(np.float32)
-
-        # bring into shape (variable, lat, lon)
-        assert Y_np.shape[0] == len(self.output_var)
-        assert X_np.shape == (1, len(inputs.data_vars), *list(inputs.dims.values())[::-1])
-        return {"inputs": X_np, "targets": Y_np}
+    @property
+    def loss_weights_tensor(self) -> Optional[torch.Tensor]:
+        return self.area_weights_tensor
 
     def __len__(self):
         return self.dataset_size

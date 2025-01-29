@@ -26,11 +26,13 @@ from src.models._base_model import BaseModel
 from src.models.gan import BaseGAN
 from src.models.modules import padding
 from src.models.modules.ema import LitEma
+from src.utilities.checkpointing import reload_checkpoint_from_wandb
 from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.lr_scheduler import get_scheduler
 from src.utilities.utils import (
     AlreadyLoggedError,
     concatenate_array_dicts,
+    freeze_model,
     get_logger,
     print_gpu_memory_usage,
     raise_error_if_invalid_value,
@@ -40,8 +42,10 @@ from src.utilities.utils import (
     torch_to_numpy,
 )
 
+
 class StopTraining(Exception):
     pass
+
 
 class BaseExperiment(LightningModule):
     r"""This is a template base class, that should be inherited by any stand-alone ML model.
@@ -98,6 +102,12 @@ class BaseExperiment(LightningModule):
         conv_padding_mode_global: Optional[str] = None,
         learned_channel_variance_loss: bool = False,
         reset_optimizer: bool = False,
+        from_pretrained_checkpoint_run_id: Dict[str, Any] = None,
+        from_pretrained_local_path: Optional[str] = None,
+        from_pretrained_checkpoint_filename: Optional[str] = "last.ckpt",
+        from_pretrained_frozen: bool = False,
+        from_pretrained_exclude_keys: Optional[List[str]] = None,
+        from_pretrained_lr_multiplier: float = None,
         torch_compile: str = None,
         num_predictions: int = 1,
         num_predictions_in_memory: int = None,
@@ -138,7 +148,9 @@ class BaseExperiment(LightningModule):
         self.diffusion_config = diffusion_config
         self.num_predictions = num_predictions
         self.num_predictions_in_mem = num_predictions_in_memory or num_predictions
-        assert num_predictions % self.num_predictions_in_mem == 0, f"{num_predictions_in_memory=} % {num_predictions=} != 0"
+        assert (
+            num_predictions % self.num_predictions_in_mem == 0
+        ), f"{num_predictions_in_memory=} % {num_predictions=} != 0"
         self.num_prediction_loops = num_predictions // self.num_predictions_in_mem
         self.is_diffusion_model = diffusion_config is not None and diffusion_config.get("_target_", None) is not None
         self.dims = get_dims_of_dataset(self.datamodule_config)
@@ -150,7 +162,8 @@ class BaseExperiment(LightningModule):
         # Instantiate the model
         self.model = self.instantiate_model()
         # Potentially, reload some weights and/or freeze some layers
-        #   Do this before initializing the EMA model, as the frozen layers should not be part of the EM[A
+        #   Do this before initializing the EMA model, as the frozen layers should not be part of the EMA
+        self.reloaded_state_dict_keys = None
         self.reload_weights_or_freeze_some()
 
         # Initialize the EMA model, if needed
@@ -284,9 +297,12 @@ class BaseExperiment(LightningModule):
                 return None
             self._datamodule = self.trainer.datamodule
             # Make sure that normalizer means and stds are on same device as model
-            if hasattr(self._datamodule, "normalizer"):
-                self.log_text.info(f"Moving normalizer means and stds to same device as model: device={self.device}")
-                self._datamodule.normalizer.to(self.device)
+            for b_key in set(self.main_data_keys + self.main_data_keys_val + [""]):
+                normalizer_name = f"normalizer_{b_key}" if b_key else "normalizer"
+                if hasattr(self._datamodule, normalizer_name):
+                    self.log_text.info(f"Moving {normalizer_name} means and stds to same device={self.device} as model")
+                    getattr(self._datamodule, normalizer_name).to(self.device)
+
         return self._datamodule
 
     def _instantiate_auxiliary_modules(self):
@@ -298,6 +314,14 @@ class BaseExperiment(LightningModule):
     def extra_model_kwargs(self) -> dict:
         """Return extra kwargs for the model instantiation."""
         return {}
+
+    @property
+    def channel_dim(self):
+        channel_dim = self.CHANNEL_DIM
+        if self.datamodule_config.get("spatial_crop_during_training"):
+            channel_dim += 1
+        return channel_dim
+
 
     def instantiate_model(self, *args, **kwargs) -> BaseModel:
         r"""Instantiate the model, e.g. by calling the constructor of the class :class:`BaseModel` or a subclass thereof."""
@@ -311,6 +335,7 @@ class BaseExperiment(LightningModule):
         assert isinstance(out_channels, (int, dict)), f"Expected int, got {type(out_channels)} for out_channels."
         kwargs["datamodule_config"] = self.datamodule_config
         kwargs["learned_channel_variance_loss"] = self.hparams.learned_channel_variance_loss
+        kwargs["channel_dim"] = self.channel_dim
         model = hydra.utils.instantiate(
             self.model_config,
             num_input_channels=in_channels,
@@ -345,10 +370,29 @@ class BaseExperiment(LightningModule):
 
         return model
 
-    def reload_weights_or_freeze_some(self):
+    def reload_weights_or_freeze_some(self) -> Dict[str, Any]:
         """Reload weights from a pretrained model, potentially freezing some layers."""
-        # todo: Do we need to reload the EMA weights too?
-        pass
+        reloaded_pretrained_ckpt = None
+        if self.hparams.from_pretrained_checkpoint_run_id is not None:
+            # todo: Do we want to reload the EMA weights instead of the model weights?
+            local_checkpoint_path = self.hparams.from_pretrained_local_path or True
+            reloaded_pretrained_ckpt = reload_checkpoint_from_wandb(
+                run_id=self.hparams.from_pretrained_checkpoint_run_id,
+                local_checkpoint_path=local_checkpoint_path,  # If True, search in file system
+                ckpt_filename=self.hparams.from_pretrained_checkpoint_filename,
+                model=self,
+                also_datamodule=False,
+                exclude_state_dict_keys=self.hparams.from_pretrained_exclude_keys,
+                print_name="Pretrained model",
+            )
+            self.reloaded_state_dict_keys = reloaded_pretrained_ckpt["state_dict"]
+            if self.hparams.from_pretrained_frozen:
+                assert self.hparams.from_pretrained_lr_multiplier is None, "Cannot freeze and change LR"
+                # Freeze the reloaded parameters (those that were pretrained and not in the exclude list)
+                params_to_freeze = [k for k in self.reloaded_state_dict_keys if "model_ema." not in k]
+                # params_to_freeze = [k.replace("_orig_mod.", "") for k in params_to_freeze]
+                freeze_model(self, params_subset=params_to_freeze)
+        return reloaded_pretrained_ckpt
 
     def forward(self, *args, **kwargs) -> Any:
         y = self.model(*args, **kwargs)
@@ -490,39 +534,51 @@ class BaseExperiment(LightningModule):
                 context = f"``{context}``:" if context else ""
                 self.log_text.info(f"Elapsed time {context} {time.time() - start_time:.{precision}f}s")
 
-    def normalize_data(self, x: Dict[str, Tensor]) -> TensorDict:
+    def get_normalizer(self, batch_key: str):
+        possible_keys = [
+            f"normalizer_{batch_key}", # Allow for different normalizers for different batch keys
+            "normalizer"
+        ]
+        for normalizer_name in possible_keys:
+            if hasattr(self.datamodule, normalizer_name):
+                return getattr(self.datamodule, normalizer_name)
+        return None
+
+    def normalize_data(self, x: Dict[str, Tensor], batch_key: str) -> TensorDict:
         """Normalize the data."""
-        #  to_tensordict(x) is no-op if x is a tensor
-        if hasattr(self.datamodule, "normalizer"):
-            x = self.datamodule.normalizer.normalize(x)
-        return to_tensordict(x)
+        normalizer = self.get_normalizer(batch_key)
+        if normalizer is not None:
+            x = normalizer.normalize(x)
+
+        return to_tensordict(x)   #  to_tensordict(x) is no-op if x is a tensor
 
     def normalize_batch(
-        self, batch: Dict[str, Dict[str, Tensor]] | Dict[str, Tensor] | Tensor
+        self, batch: Dict[str, Dict[str, Tensor]] | Dict[str, Tensor] | Tensor, batch_key: str
     ) -> Dict[str, TensorDict] | TensorDict:
         """Normalize the batch. If the batch is a nested dictionary, normalize each nested dictionary separately."""
         if torch.is_tensor(batch) or isinstance(next(iter(batch.values())), Tensor):
-            return self.normalize_data(batch)
+            return self.normalize_data(batch, batch_key)
         elif isinstance(batch, TensorDict):
-            return TensorDict({k: self.normalize_data(v) for k, v in batch.items()}, batch_size=batch.batch_size)
+            return TensorDict({k: self.normalize_data(v, batch_key) for k, v in batch.items()}, batch_size=batch.batch_size)
         else:
-            return {k: self.normalize_data(v) for k, v in batch.items()}
+            return {k: self.normalize_data(v, batch_key) for k, v in batch.items()}
 
-    def denormalize_data(self, x: Dict[str, Tensor]) -> TensorDict:
+    def denormalize_data(self, x: Dict[str, Tensor], batch_key: str) -> TensorDict:
         """Denormalize the data."""
-        if hasattr(self.datamodule, "normalizer"):
-            x = self.datamodule.normalizer.denormalize(x)
+        normalizer = self.get_normalizer(batch_key)
+        if normalizer is not None:
+            x = normalizer.denormalize(x)
         return to_tensordict(x)
 
     def denormalize_batch(
-        self, x: Dict[str, Dict[str, Tensor]] | Dict[str, Tensor]
+        self, x: Dict[str, Dict[str, Tensor]] | Dict[str, Tensor], batch_key: str
     ) -> Dict[str, TensorDict] | TensorDict:
         if torch.is_tensor(x) or isinstance(next(iter(x.values())), Tensor):
-            return self.denormalize_data(x)
+            return self.denormalize_data(x, batch_key)
         elif isinstance(x, TensorDict):
-            return TensorDict({k: self.denormalize_data(v) for k, v in x.items()}, batch_size=x.batch_size)
+            return TensorDict({k: self.denormalize_data(v, batch_key) for k, v in x.items()}, batch_size=x.batch_size)
         else:
-            return {k: self.denormalize_data(v) for k, v in x.items()}
+            return {k: self.denormalize_data(v, batch_key) for k, v in x.items()}
 
     def predict_packed(self, *inputs: Tensor, **kwargs) -> Dict[str, Tensor]:
         # check if model has sample_loop method with argument num_predictions
@@ -579,7 +635,9 @@ class BaseExperiment(LightningModule):
         # By default, we predict the entire batch at once (i.e. num_prediction_loops=1)
         full_batch_size = inputs[0].shape[0] if len(inputs) > 0 else kwargs[list(kwargs.keys())[0]].shape[0]
         actual_batch_size = full_batch_size // base_num_predictions  # self.num_predictions
-        assert actual_batch_size > 0, f"{actual_batch_size=}, {full_batch_size=}, {self.num_predictions=}, {base_num_predictions=}"
+        assert (
+            actual_batch_size > 0
+        ), f"{actual_batch_size=}, {full_batch_size=}, {self.num_predictions=}, {base_num_predictions=}"
         inputs_offset_factor = self.num_predictions_in_mem * actual_batch_size
         for i in range(self.num_prediction_loops):
             start_i, end_i = i * inputs_offset_factor, (i + 1) * inputs_offset_factor
@@ -611,11 +669,12 @@ class BaseExperiment(LightningModule):
         # results['preds_packed'] = packed_preds  # packed and normalized
         if self.datamodule is not None:
             # Unpack and denormalize the predictions. Keys are renamed from <var>_normed to <var>
-            results.update(
-                {k.replace("_normed", ""): self.denormalize_batch(v) for k, v in results.items() if "preds" in k}
-            )
-        # for k, v in results.items():
-        # print(k, v.shape if torch.is_tensor(v) else v)
+            for k in list(results.keys()):
+                if "preds" in k:
+                    batch_p_key = self.target_key
+                    unnormed_key = k.replace("_normed", "")
+                    results[unnormed_key] = self.denormalize_batch(results[k], batch_key=batch_p_key)
+        # for k, v in results.items(): print(k, v.shape if torch.is_tensor(v) else v)
         return results
 
     def predict(self, inputs: Union[Tensor, TensorDictBase], **kwargs) -> Dict[str, Tensor]:
@@ -701,10 +760,10 @@ class BaseExperiment(LightningModule):
     def get_target_variants(self, targets: Tensor, is_normalized: bool = False) -> Dict[str, Tensor]:
         if is_normalized:
             targets_normed = targets
-            targets_raw = self.denormalize_batch(targets_normed)
+            targets_raw = self.denormalize_batch(targets_normed, batch_key=self.target_key)
         else:
             targets_raw = targets
-            targets_normed = self.normalize_batch(targets_raw)
+            targets_normed = self.normalize_batch(targets_raw, batch_key=self.target_key)
         return {
             "targets": targets_raw.contiguous(),
             "targets_normed": targets_normed.contiguous(),
@@ -773,50 +832,71 @@ class BaseExperiment(LightningModule):
     def channels_logvar(self):
         if not self.hparams.learned_channel_variance_loss:
             return None
+        return self.get_logvar("channels")
+
+    def get_logvar(self, dim_name: str):
         if not isinstance(self.model.criterion, (dict, torch.nn.ModuleDict)):
-            return self.model.criterion.channels_logvar_vector
+            return self.model.criterion.logvar_vector(dim_name)
         else:
             assert isinstance(self.model.criterion, torch.nn.ModuleDict), "Criterion must be a ModuleDict."
             for k, criterion_k in self.model.criterion.items():
-                if hasattr(criterion_k, "channels_logvar_vector"):
-                    return criterion_k.channels_logvar_vector
+                if hasattr(criterion_k, "logvar_vector"):
+                    return criterion_k.logvar_vector(dim_name)
 
     def _reshape_loss_weights(self, loss_weights: Tensor) -> Tensor:
         return loss_weights
 
     def _set_loss_weights(self, split: str = "fit") -> None:
-        """Set the loss weights for the model. split: which dataloader to take the weights from."""
-        # Set weights of MSE loss, if needed
+        """
+        Configure weights for the weighted loss function based on dataset attribute "loss_weights_tensor".
+
+        Args:
+            split (str): The dataset split to use for getting loss weights.
+        """
+
+        def _set_criterion_weights(criterion):
+            if not hasattr(criterion, "weights") or criterion.weights is not None:
+                return False
+
+            loss_weights = self.get_dataset_attribute("loss_weights_tensor", split)
+            if loss_weights is None:
+                return False
+
+            weights = self._reshape_loss_weights(loss_weights.to(self.device))
+            self.log_text.info(f"Setting loss weights of shape {weights.shape} for weighted loss function.")
+            criterion.weights = weights
+            return True
+
         if not isinstance(self.model.criterion, (dict, torch.nn.ModuleDict)):
-            if hasattr(self.model.criterion, "weights") and self.model.criterion.weights is None:
-                loss_weights = self.get_dataset_attribute("loss_weights_tensor", split)
-                if loss_weights is not None:
-                    weights = self._reshape_loss_weights(loss_weights.to(self.device))
-                    self.log_text.info(f"Setting loss weights of shape {weights.shape} for weighted loss function.")
-                    self.model.criterion.weights = weights
+            boo = _set_criterion_weights(self.model.criterion)         # Handle single criterion case
+            assert not boo or self.model.criterion.weights is not None, "Loss weights must be set."
         else:
-            for k, criterion_k in self.model.criterion.items():
-                if hasattr(criterion_k, "weights") and criterion_k.weights is None:
-                    loss_weights = self.get_dataset_attribute("loss_weights_tensor", split)
-                    if loss_weights is not None:
-                        weights = self._reshape_loss_weights(loss_weights.to(self.device))
-                        self.log_text.info(
-                            f"Setting loss weights of shape {weights.shape} for weighted loss function."
-                        )
-                        self.model.criterion[k].weights = weights
+            for key, criterion in self.model.criterion.items():
+                boo = _set_criterion_weights(criterion)                # Handle ModuleDict case
+                assert not boo or self.model.criterion[key].weights is not None, "Loss weights must be set."
+
 
     def on_train_epoch_start(self) -> None:
         self._start_epoch_time = time.time()
-        if self.hparams.stop_after_n_epochs is not None and self._n_epochs_since_init >= self.hparams.stop_after_n_epochs:
-            raise StopTraining(f"Stopping training after {self.hparams.stop_after_n_epochs} epochs. "
-                               f"To disable this, set `module.stop_after_n_epochs=None`.")
+        if (
+            self.hparams.stop_after_n_epochs is not None
+            and self._n_epochs_since_init >= self.hparams.stop_after_n_epochs
+        ):
+            raise StopTraining(
+                f"Stopping training after {self.hparams.stop_after_n_epochs} epochs. "
+                f"To disable this, set `module.stop_after_n_epochs=None`."
+            )
 
     def train_step_initial_log_dict(self) -> dict:
         return dict()
 
     @property
+    def target_key(self) -> str:
+        return "dynamics"
+
+    @property
     def main_data_keys(self) -> List[str]:
-        return ["dynamics"]
+        return [self.target_key]
 
     @property
     def main_data_keys_val(self) -> List[str]:
@@ -851,7 +931,7 @@ class BaseExperiment(LightningModule):
                 batch[main_data_key] = to_tensordict(batch[main_data_key], find_batch_size_max=True)
             else:
                 batch[main_data_key] = to_tensordict(batch[main_data_key])
-            batch[main_data_key] = self.normalize_batch(batch[main_data_key])
+            batch[main_data_key] = self.normalize_batch(batch[main_data_key], batch_key=main_data_key)
 
         # Normalize data and convert to tensor dict (if it's a dict)
         # Print mean and std of the data before normalization
@@ -933,7 +1013,9 @@ class BaseExperiment(LightningModule):
 
         for k in self.main_data_keys_val:
             if k not in batch.keys():
-                raise ValueError(f"Could not find key {k} in batch. You need to either return it in your pytorch dataset or need to edit main_data_keys{{_val}} of this module.")
+                raise ValueError(
+                    f"Could not find key {k} in batch. You need to either return it in your pytorch dataset or need to edit main_data_keys{{_val}} of this module."
+                )
             if isinstance(batch[k], dict):
                 batch[k] = {k: to_tensordict(v) for k, v in batch[k].items()}
                 batch[k] = to_tensordict(batch[k], find_batch_size_max=True)
@@ -941,12 +1023,12 @@ class BaseExperiment(LightningModule):
                 batch[k] = to_tensordict(batch[k])
 
         for k in self.normalize_data_keys_val:
-            if k == "dynamics":
+            if k == self.target_key:
                 # Store the raw data, if needed for post-processing/using ground truth data
                 batch[f"raw_{k}"] = batch[k].clone()
 
             # Normalize data
-            batch[k] = self.normalize_batch(batch[k])
+            batch[k] = self.normalize_batch(batch[k], batch_key=k)
 
         with self.ema_scope():  # use the EMA parameters for the validation step (if using EMA)
             with self.inference_dropout_scope():  # Enable dropout during inference
@@ -962,7 +1044,7 @@ class BaseExperiment(LightningModule):
                     return batch[k].shape
                 else:
                     # add singleton dim for channel
-                    return batch[k].unsqueeze(self.CHANNEL_DIM).shape
+                    return batch[k].unsqueeze(self.channel_dim).shape
         raise ValueError(f"Could not find any of the keys {self.main_data_keys=}, {self.main_data_keys_val=}")
 
     def evaluation_results_to_xarray(self, results: Dict[str, np.ndarray], **kwargs) -> xr.Dataset:
@@ -1196,7 +1278,7 @@ class BaseExperiment(LightningModule):
                 val_media.update(logs_media)
 
                 if not (agg_name.startswith("t") and len(agg_name) <= 5):  # up to t9999
-                    print(f"Skipping aggregator {agg_name} for mean metrics.")
+                    self.log_text.info(f"Skipping aggregator ``{agg_name}`` for mean metrics.")
                     # Don't use these aggregators for the mean metrics (not temporal)
                     continue
 
@@ -1391,6 +1473,10 @@ class BaseExperiment(LightningModule):
         If a dict, the keys are patterns to match the parameter names and the values are the lr multipliers.
           (i.e. a Dict mapping parameter patterns to learning rate multipliers)
         """
+        if self.hparams.from_pretrained_lr_multiplier is not None:
+            assert not self.hparams.from_pretrained_frozen, "If frozen, do not change LR"
+            # Use a negative match to train the pretrained model with a different (lower) LR
+            return {k: self.hparams.from_pretrained_lr_multiplier for k in self.reloaded_state_dict_keys}
         return None
 
     def _get_optim(self, optim_name: str, model_handle=None, lr_groups=None, **kwargs):
@@ -1583,6 +1669,9 @@ class BaseExperiment(LightningModule):
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """Save a model checkpoint with extra info"""
+        script_path = os.environ.get("SCRIPT_NAME", None)
+        if script_path is not None:
+            checkpoint["script_path"] = script_path.split("/")[-1]  # get only the script name
         # Save wandb run info, if available
         if self.logger is not None and hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "id"):
             checkpoint["wandb"] = {

@@ -55,6 +55,8 @@ class BaseDiffusion(BaseModel):
     @sigma_data.setter
     def sigma_data(self, value):
         self._sigma_data = value
+        if hasattr(self, "guidance_model") and self.guidance_model is not None:
+            self.guidance_model.model.sigma_data = value
         for k, v in self.criterion.items():  # Set the sigma_data for the loss function
             if hasattr(v, "sigma_data"):
                 v.sigma_data = value

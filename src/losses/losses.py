@@ -165,7 +165,9 @@ class AbstractWeightedLoss(torch.nn.Module):
             # Register in __init__ to make it part of the model's parameters
             # We implement the variance-weighted loss by simply learning a list of scalars, one per frame
             if learn_per_dim:
-                setattr(self, f"{dim_name}_logvar", nn.Parameter(torch.zeros(n_dims, requires_grad=True)))
+                setattr(self, f"{dim_name}_logvar", nn.Parameter(torch.randn(n_dims, requires_grad=True) * 0.01))
+                # Double check it's just as good as:
+                # setattr(self, f"{dim_name}_logvar", nn.Parameter(torch.zeros(n_dims, requires_grad=True)))
                 if verbose:
                     log.info(f"Using loss with learned ``{dim_name}`` logvar with {n_dims=}, {dim_idx=}.")
 
@@ -173,13 +175,11 @@ class AbstractWeightedLoss(torch.nn.Module):
             # Learn a scalar for each entry in dim_0 x dim_1 x ... x dim_n
             assert len(dim_sizes) > 0, f"Number of dimensions must be positive. {dim_sizes=}"
             self.logvars = nn.Parameter(torch.zeros(*dim_sizes, requires_grad=True))
+            self._dim_to_logvar_dim = {
+                dim_k: dim_idx for dim_idx, dim_k in enumerate(learned_var_dim_name_to_idx_and_n_dims)
+            }
             if verbose:
                 log.info(f"Using loss function with learned logvar with dimensions {dim_sizes}.")
-
-        self._channel_dim = None
-        if "channels" in self.learned_var_dim_name_to_idx_and_n_dims:
-            self._channel_dim = self.learned_var_dim_name_to_idx_and_n_dims["channels"][0]
-            # assert self._channel_dim == dim0_idx, f"Channel dimension must be the first learned variance dimension. {self._channel_dim=}, {dim0_idx=}"
 
     @property
     def weights(self):
@@ -191,12 +191,17 @@ class AbstractWeightedLoss(torch.nn.Module):
 
     @property
     def channels_logvar_vector(self):
-        if self._channel_dim is None:
-            raise AttributeError("No learned variance dimension named 'channels' found.")
+        return self.logvar_vector("channels")
+
+    def logvar_vector(self, dim_name):
+        # Generally, the lower the variance, the higher the weight
+        if dim_name not in self.learned_var_dim_name_to_idx_and_n_dims:
+            raise AttributeError(f"{dim_name=} not found in {self.learned_var_dim_name_to_idx_and_n_dims=}.")
         if self.learn_per_dim:
-            return self.channels_logvar
-        # Take mean over non-channel dimensions
-        return self.logvars.mean(dim=tuple(range(1, self.logvars.ndim)))
+            return getattr(self, f"{dim_name}_logvar")
+        # Take mean over non-dim_name dimensions
+        dim_idx = self._dim_to_logvar_dim[dim_name]
+        return self.logvars.mean(dim=tuple([idx for idx in range(self.logvars.ndim) if idx != dim_idx]))
 
     def weigh_loss(self, loss, add_weight=None, multiply_weight=None):
         if self.weights is not None:
@@ -257,7 +262,6 @@ class AbstractWeightedLoss(torch.nn.Module):
                 log_var_name = next(iter(self.learned_var_dim_name_to_idx_and_n_dims.keys()))
                 log_vars = getattr(self, f"{log_var_name}_logvar")
             elif self.learn_per_dim:
-                # TODO: fix this. Seems like it doesn't backpropagate through the log_vars
                 log_vars = [
                     getattr(self, f"{log_var_name}_logvar")
                     for log_var_name in self.learned_var_dim_name_to_idx_and_n_dims
@@ -299,7 +303,7 @@ class WeightedMAE(AbstractWeightedLoss):
 
 class WeightedCRPS(AbstractWeightedLoss):
     def forward(self, preds, targets):
-        error = self.weigh_loss(crps_ensemble(predicted=preds, observations=truth, reduction="none"))
+        error = self.weigh_loss(crps_ensemble(predicted=preds, truth=targets, reduction="none"))
         return error
 
 

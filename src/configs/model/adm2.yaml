@@ -1,0 +1,14 @@
+defaults:
+  - _self_
+  - _base_model_config.yaml   # general, model independent, parameters
+
+_target_: src.models.networks_edm2.UNet
+model_channels: 192
+channel_mult: [1, 2, 3, 4]
+channel_mult_noise: null
+channel_mult_emb: null
+num_blocks: 3
+attn_resolutions: [32, 16, 8]
+attn_levels: null
+dropout: 0.0
+emb_init_identity: False # initialize time embeddings to 0 (no effect as adaLN conditioning)

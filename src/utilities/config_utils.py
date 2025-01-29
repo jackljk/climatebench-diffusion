@@ -392,7 +392,7 @@ def extras(
                 cli_arg.replace("+", "") for cli_arg in sys.argv[1:] if "=" in cli_arg and len(cli_arg) <= 64
             ]  # wandb tag limit is 64 chars
             if config.logger.wandb.get("project_test") is None and config.model is not None:
-                config.logger.wandb.resume = "allow" #"must"
+                config.logger.wandb.resume = "allow"  # "must"
                 config.logger.wandb.training_id = config.logger.wandb.id
                 wandb_api._PROJECT_TRAIN = config.logger.wandb.project
                 train_run_path = (

@@ -27,3 +27,4 @@ logger:
     save_last_ckpt: False    # Save last checkpoint to cloud storage. If True, one of the below must be True
     save_to_wandb: False     # Save to wandb storage
     save_to_s3_bucket: False # Save to s3 bucket (see s3utils.py)
+  # ++logger.wandb.save_best_ckpt=False ++logger.wandb.save_last_ckpt=False ++logger.wandb.save_to_s3_bucket=False

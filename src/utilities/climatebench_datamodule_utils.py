@@ -1,18 +1,20 @@
 # General imports/constants
-import xarray as xr
-from src.utilities.utils import get_logger, get_files
 from typing import Dict, Optional, Sequence, Union
+
 import numpy as np
+import xarray as xr
+
+from src.utilities.utils import get_files, get_logger
 
 
 log = get_logger(__name__)
 
 # imports/constants DM
-from os.path import join
 
 
 # imports/constants ds
 import cftime
+
 
 NO_DAYS_IN_YEAR = 365
 NO_DAYS_IN_MONTH = 30
@@ -71,7 +73,7 @@ def standardize_output_xr(
 
 
 def handle_ensemble(
-    output_xr: xr.Dataset, mean_over_ensemble: Optional[Union[str, bool]], simulation: str, num_ensemble: int|str
+    output_xr: xr.Dataset, mean_over_ensemble: Optional[Union[str, bool]], simulation: str, num_ensemble: Union[int ,str]
 ) -> Union[xr.Dataset, dict]:
     """
     Handle ensemble data by either averaging over the ensemble, selecting the first ensemble member or stacking the
@@ -102,9 +104,7 @@ def handle_ensemble(
         else:
             if num_ensemble > output_xr.sizes["member_id"]:
                 raise ValueError(f"num_ensemble {num_ensemble} is greater than the number of ensemble members")
-            output_xr = {
-                f"{simulation}_ensemble_{i}": output_xr.isel(member_id=i) for i in range(num_ensemble)
-            }
+            output_xr = {f"{simulation}_ensemble_{i}": output_xr.isel(member_id=i) for i in range(num_ensemble)}
     else:
         log.info(f"Ensemble data not handled for {simulation}")
         raise KeyError(f"Option {mean_over_ensemble} not supported for ensemble handling")
@@ -162,7 +162,7 @@ def get_rsdt(
 #     mean_over_ensemble: bool = False,
 #     Debug_dataset_size: int = None,
 #     scale_inputs: str = None,
-# ) -> tuple(Dict[str, xr.Dataset], Dict[str, xr.Dataset]):  
+# ) -> tuple(Dict[str, xr.Dataset], Dict[str, xr.Dataset]):
 #     """
 #     Load the raw data from the given path and return it as a dictionary of xarray datasets.
 
@@ -370,7 +370,7 @@ def yearlyInterpolator(
     try:
         # Get the values for the current year
         E_curr = input_xr.sel(time=YEAR)
-    except Exception as e:
+    except Exception:
         # Use the nearest year if the current year is not available
         # Due to the lone 2101 in output, we can just use the 2100 input data
         E_curr = input_xr.sel(time=YEAR, method="nearest")
@@ -381,7 +381,7 @@ def yearlyInterpolator(
             # Get the values for the next year
             # NOTE: Interpolates with same year if there is no previous year
             E_next = input_xr.sel(time=YEAR + 1) if not no_next_year else input_xr.sel(time=YEAR)
-        except Exception as e:
+        except Exception:
             # Get the values using the same year
             E_next = input_xr.sel(time=YEAR, method="nearest")  # Need to figure out why YEAR became 2101
         # Calculate the interpolated values
@@ -393,7 +393,7 @@ def yearlyInterpolator(
             # Get the values for the previous year
             # NOTE: Interpolates with same year if there is no next year
             E_prev = input_xr.sel(time=YEAR - 1) if not no_prev_year else input_xr.sel(time=YEAR)
-        except Exception as e:
+        except Exception:
             # Use the same year for interpolation
             E_prev = input_xr.sel(time=YEAR, method="nearest")
 
@@ -427,16 +427,16 @@ def monthlyInterpolator(input_xr: xr.Dataset, index_datetime: cftime.datetime) -
     try:
         # Get the values for the current month
         curr = input_xr.sel(time=f"{YEAR}-{MONTH:02d}")
-    except Exception as e:
+    except Exception:
         # Use the nearest month if the current month is not available
         # Due to the lone 2101 in output, we can just use the 2100 input data
         try:
             if YEAR == 2101:
-                curr = input_xr.sel(time=f"2100-12")
+                curr = input_xr.sel(time="2100-12")
             else:
                 curr = input_xr.sel(time=f"{YEAR-1}-{MONTH:02d}")
-        except Exception as e:
-            curr = input_xr.sel(time=f"2100-12")  # Need to figure out why YEAR became 2101
+        except Exception:
+            curr = input_xr.sel(time="2100-12")  # Need to figure out why YEAR became 2101
             print("Error occured during interpolation")
             print(f"Year: {YEAR}, Month: {MONTH}")
 
@@ -447,7 +447,7 @@ def monthlyInterpolator(input_xr: xr.Dataset, index_datetime: cftime.datetime) -
             next_month_string = f"{YEAR}-{MONTH + 1:02d}" if MONTH < 12 else f"{YEAR + 1}-{1:02d}"
             # Get the values for the next month
             next_month = input_xr.sel(time=next_month_string)
-        except Exception as e:
+        except Exception:
             # Use the same month for interpolation if the next month is not available (i.e. December 2100)
             next_month = input_xr.sel(time=f"{YEAR}-{MONTH:02d}")
 
@@ -460,7 +460,7 @@ def monthlyInterpolator(input_xr: xr.Dataset, index_datetime: cftime.datetime) -
             prev_month_string = f"{YEAR}-{MONTH - 1:02d}" if MONTH > 1 else f"{YEAR - 1}-{12:02d}"
             # Get the values for the previous month
             prev_month = input_xr.sel(time=prev_month_string)
-        except Exception as e:
+        except Exception:
             # Use the same month for interpolation if the previous month is not available (i.e. January 2015)
             prev_month = input_xr.sel(time=f"{YEAR}-{MONTH:02d}")
 

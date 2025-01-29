@@ -477,6 +477,8 @@ def clean_name(class_name, mixer=None, dm_type=None) -> str:
         s = "SimpleGAN"
     elif "edm.DhariwalUNet" in class_name:
         s = "ADM"
+    elif "edm2.UNet" in class_name:
+        s = "ADM2"
     elif "stormer.vit_adaln.ViTAdaLN" in class_name:
         s = "StormerViT"
     else:
