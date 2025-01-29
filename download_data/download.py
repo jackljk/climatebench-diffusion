@@ -5,7 +5,7 @@ os.environ["S3_BUCKET_NAME"] = "climatebench"
 from src.utilities.s3utils import download_s3_object
 
 # -------------- Edit this to the directory where you'd like the data to be in --------------
-local_data_dir = "./data"
+local_data_dir = "/data"
 # ---------------------------------------
 files = [
     "outputs_ssp126_daily_raw.nc",
