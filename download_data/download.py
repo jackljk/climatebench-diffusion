@@ -12,7 +12,7 @@ files = [
     # "outputs_ssp245_daily.nc",
     # "outputs_ssp370_daily.nc",
     # "outputs_ssp585_daily.nc",
-    "outputs_historical_daily_raw.nc",
+    # "outputs_historical_daily_raw.nc",
     "CESM2_piControl_r1i1p1f1_climatology_daily.nc",
     "inputs_ssp126.nc",
     "inputs_ssp245.nc",
