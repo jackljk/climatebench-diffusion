@@ -8,7 +8,20 @@ from src.utilities.s3utils import download_s3_object
 local_data_dir = "/data"
 # ---------------------------------------
 files = [
-    "outputs_ssp126_daily_raw.nc",
+    "outputs_ssp126_daily.nc",
+    "outputs_ssp245_daily.nc",
+    "outputs_ssp370_daily.nc",
+    "outputs_ssp585_daily.nc",
+    "outputs_historical_daily.nc",
+    "inputs_ssp126.nc",
+    "inputs_ssp245.nc",
+    "inputs_ssp370.nc",
+    "inputs_ssp585.nc",
+    "inputs_historical.nc",
+    "CESM2-rsdt-Amon-gn-ssp126.nc",
+    "CESM2-rsdt-Amon-gn-historical.nc",
+    "CESM2-rsdt-Amon-gn-piControl.nc",
+    # "outputs_ssp126_daily_raw.nc",
     # "outputs_ssp245_daily_raw.nc",
     # "outputs_ssp370_daily_raw.nc",
     # "outputs_ssp585_daily_raw.nc",
