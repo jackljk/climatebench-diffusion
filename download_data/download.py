@@ -21,7 +21,7 @@ files = [
     # "CESM2-rsdt-Amon-gn-ssp126.nc",
     # "CESM2-rsdt-Amon-gn-historical.nc",
     # "CESM2-rsdt-Amon-gn-piControl.nc",
-    "outputs_ssp126_daily_raw.nc",
+    # "outputs_ssp126_daily_raw.nc",
     "outputs_ssp245_daily_raw.nc",
     "outputs_ssp370_daily_raw.nc",
     "outputs_ssp585_daily_raw.nc",
