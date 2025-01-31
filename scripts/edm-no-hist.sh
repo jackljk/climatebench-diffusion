@@ -8,7 +8,7 @@ export SCRIPT_NAME=$(basename "$0")
 python run.py "$@" \
     experiment=climatebench_daily_edm \
     datamodule=climatebench_daily \
-    datamodule.data_dir=/data/raw \ 
+    datamodule.data_dir=/data/raw \
     datamodule.mean_over_ensemble='first' \
     datamodule.simulations=["ssp126","ssp370","ssp585"] \
     datamodule.window=1 \
