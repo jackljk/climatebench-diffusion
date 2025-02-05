@@ -14,7 +14,7 @@ python run.py "$@" \
     datamodule.window=1 \
     datamodule.batch_size=128 \
     datamodule.eval_batch_size=3 \
-    datamodule.batch_size_per_gpu=6 \
+    datamodule.batch_size_per_gpu=8 \
     datamodule.simulations_anom_type="none" \
     datamodule.simulations_raw="all" \
     datamodule.normalization_type="standard" \
