@@ -18,9 +18,10 @@ python run.py "$@" \
     datamodule.simulations_anom_type="none" \
     datamodule.simulations_raw="all" \
     datamodule.normalization_type="standard" \
+    datamodule.num_workers = 48 \
     datamodule.output_vars='pr' \
     trainer=ddp \
-    trainer.devices=8 \
+    trainer.devices=12 \
     trainer.max_epochs=100 \
     model.dim=128 \
     module.num_predictions=5 module.prediction_inputs_noise=0.0 \
