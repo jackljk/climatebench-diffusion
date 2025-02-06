@@ -12,7 +12,7 @@ python run.py "$@" \
     datamodule.mean_over_ensemble='first' \
     datamodule.simulations=["ssp126","ssp370","ssp585"] \
     datamodule.window=1 \
-    datamodule.batch_size=128 \
+    datamodule.batch_size=196 \
     datamodule.eval_batch_size=3 \
     datamodule.batch_size_per_gpu=4 \
     datamodule.simulations_anom_type="none" \
