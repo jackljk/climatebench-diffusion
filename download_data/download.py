@@ -9,27 +9,27 @@ local_data_dir = "/data"
 # ---------------------------------------
 files = [
     # Outputs daily
-    "outputs_ssp126_daily.nc",
-    "outputs_ssp245_daily.nc",
-    "outputs_ssp370_daily.nc",
-    "outputs_ssp585_daily.nc",
-    # PI Control
-    "CESM2_piControl_r1i1p1f1_climatology_daily.nc",
-    # Inputs
-    "inputs_ssp126.nc",
-    "inputs_ssp245.nc",
-    "inputs_ssp370.nc",
-    "inputs_ssp585.nc",
-    "inputs_historical.nc",
-    # RSDT
-    "CESM2-rsdt-Amon-gn-ssp126.nc",
-    "CESM2-rsdt-Amon-gn-historical.nc",
-    "CESM2-rsdt-Amon-gn-piControl.nc",
-    # Raw data daily
-    "outputs_ssp126_daily_raw.nc",
-    "outputs_ssp245_daily_raw.nc",
-    "outputs_ssp370_daily_raw.nc",
-    "outputs_ssp585_daily_raw.nc",
+    # "outputs_ssp126_daily.nc",
+    # "outputs_ssp245_daily.nc",
+    # "outputs_ssp370_daily.nc",
+    # "outputs_ssp585_daily.nc",
+    # # PI Control
+    # "CESM2_piControl_r1i1p1f1_climatology_daily.nc",
+    # # Inputs
+    # "inputs_ssp126.nc",
+    # "inputs_ssp245.nc",
+    # "inputs_ssp370.nc",
+    # "inputs_ssp585.nc",
+    # "inputs_historical.nc",
+    # # RSDT
+    # "CESM2-rsdt-Amon-gn-ssp126.nc",
+    # "CESM2-rsdt-Amon-gn-historical.nc",
+    # "CESM2-rsdt-Amon-gn-piControl.nc",
+    # # Raw data daily
+    # "outputs_ssp126_daily_raw.nc",
+    # "outputs_ssp245_daily_raw.nc",
+    # "outputs_ssp370_daily_raw.nc",
+    # "outputs_ssp585_daily_raw.nc",
     "outputs_historical_daily_raw.nc",
 ]
 
