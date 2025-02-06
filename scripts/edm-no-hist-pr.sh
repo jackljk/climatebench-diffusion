@@ -18,7 +18,7 @@ python run.py "$@" \
     datamodule.simulations_anom_type="none" \
     datamodule.simulations_raw="all" \
     datamodule.normalization_type="standard" \
-    datamodule.num_workers = 48 \
+    datamodule.num_workers=48 \
     datamodule.output_vars='pr' \
     trainer=ddp \
     trainer.devices=12 \
