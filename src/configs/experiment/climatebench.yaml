@@ -20,7 +20,6 @@ trainer:
   max_epochs: 100
   gradient_clip_val: 1.0
   deterministic: True
-  accumulate_grad_batches: 1
 
 datamodule:
   batch_size: 64

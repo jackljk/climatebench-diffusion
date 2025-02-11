@@ -1,4 +1,4 @@
-""" Exponential Moving Average (EMA) module """
+"""Exponential Moving Average (EMA) module"""
 
 import torch
 from torch import nn

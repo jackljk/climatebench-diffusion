@@ -1,15 +1,12 @@
 from abc import abstractmethod
-from typing import Optional
 
 import numpy as np
 import torch
 
 # from src.utilities.torch_utils import persistence
 from src.diffusion._base_diffusion import BaseDiffusion
-from src.interface import NoTorchModuleWrapper
 from src.losses.losses import AbstractWeightedLoss, crps_ensemble
-from src.utilities.checkpointing import reload_checkpoint_from_wandb
-from src.utilities.utils import freeze_model, get_logger
+from src.utilities.utils import get_logger
 
 
 log = get_logger(__name__)
@@ -155,9 +152,6 @@ class EDMPrecond(BaseDiffusion):
         S_max=float("inf"),  # Maximum noise level for increased noise.
         S_noise=1,  # Noise level for increased noise.
         heun: bool = True,  # Use Heun's method for the sampling loop.
-        guidance: float = 1,  # Guidance strength for the sampling loop. Default: 1 (no guidance).
-        guidance_run_id: str = None,  # Run ID for the guidance model.
-        guidance_ckpt_filename: str = "latest",  # Checkpoint filename for the guidance model.
         dtype="double",  # double or float
         **kwargs,  # Keyword arguments for the underlying model.
     ):
@@ -175,24 +169,6 @@ class EDMPrecond(BaseDiffusion):
         self.log_text.info(
             f"EDM: {sigma_min=}, {self.sigma_max_inf=}, {num_steps=}, {rho=}, {S_churn=}, {S_min=}, {S_max=}"
         )
-        self._guidance_model = None
-        if guidance != 1:
-            assert guidance_run_id is not None, "Guidance model run ID must be provided."
-            guidance_model = reload_checkpoint_from_wandb(
-                run_id=guidance_run_id,
-                local_checkpoint_path=True,
-                ckpt_filename=guidance_ckpt_filename,
-                also_datamodule=False,
-                print_name="Guidance model",
-            )["model"]
-            self._guidance_model = NoTorchModuleWrapper(guidance_model.cpu())
-            freeze_model(self.guidance_model)
-
-    @property
-    def guidance_model(self) -> Optional[torch.nn.Module]:
-        if self._guidance_model is None:
-            return None
-        return self._guidance_model.module  # unwrap the NoTorchModuleWrapper
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
         """Return the loss function used for training.
@@ -269,8 +245,6 @@ class EDMPrecond(BaseDiffusion):
         **kwargs,
     ):
         dtype = torch.float64 if self.hparams.dtype == "double" else torch.float32
-        if self.guidance_model is not None:
-            self.guidance_model.to(self.device)
 
         def denoise(x, t):
             denoised = self(x, t, **kwargs).to(dtype)
@@ -280,8 +254,7 @@ class EDMPrecond(BaseDiffusion):
             kwargs_g = kwargs
             if self.guidance_model.model.hparams.force_unconditional:
                 kwargs_g = {k: v for k, v in kwargs.items() if k != "dynamical_condition"}
-            with self.guidance_model.ema_scope(condition=True):  # , context=f"Guidance EMA"):
-                ref_Dx = self.guidance_model(x, t, **kwargs_g).to(dtype)
+            ref_Dx = self.guidance_model(x, t, **kwargs_g).to(dtype)
             denoised = ref_Dx.lerp(denoised, self.hparams.guidance)
             # = ref_Dx + guidance * (denoised - ref_Dx) = guidance * denoised + (1 - guidance) * ref_Dx
             return denoised
@@ -331,8 +304,6 @@ class EDMPrecond(BaseDiffusion):
                 d_prime = (x_next - denoised) / t_next
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
-        if self.guidance_model is not None:
-            self.guidance_model.cpu()
         return x_next.to(self.dtype)
 
     @torch.inference_mode()

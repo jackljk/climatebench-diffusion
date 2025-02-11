@@ -13,3 +13,7 @@ name: "CB-Daily"
 
 datamodule:
   window: 1 # no window since the granularity is daily (for now)
+  num_workers: 16
+
+model:
+  loss_function: "wmse"

@@ -13,7 +13,6 @@ name: "GENIE-${datamodule.hourly_resolution}h-${datamodule.horizon}l"
 
 trainer:
   max_epochs: 200
-  accumulate_grad_batches: 1
 #  precision: 32   # 16-bit precision if commented out
 
 datamodule:

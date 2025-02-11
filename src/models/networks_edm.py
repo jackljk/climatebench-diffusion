@@ -397,13 +397,13 @@ class _TemporalAttentionBlock(torch.nn.Module):
         elif cond_type == "linear":
             self.affine = Linear(cond_dim, 2 * dim, **init_zero)
         elif cond_type == "conv":
-            self.affine = torch.nn.Conv1d(cond_dim, 3 * dim, kernel_size=3, padding=1)
+            self.affine = torch.nn.Conv1d(cond_dim, 2 * dim, kernel_size=3, padding=1)
         elif cond_type == "non-linear":
             self.emb_map = torch.nn.Linear(cond_dim, cond_dim)
-            self.affine = torch.nn.Linear(cond_dim, 3 * dim, bias=True)
+            self.affine = torch.nn.Linear(cond_dim, 2 * dim, bias=True)
         elif cond_type == "non-linear-conv":
             self.emb_map = torch.nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1)
-            self.affine = torch.nn.Conv1d(cond_dim, 3 * dim, kernel_size=3, padding=1)
+            self.affine = torch.nn.Conv1d(cond_dim, 2 * dim, kernel_size=3, padding=1)
         else:
             raise ValueError(f"Unknown cond_type: {cond_type}")
 
@@ -424,7 +424,7 @@ class _TemporalAttentionBlock(torch.nn.Module):
                 emb = rearrange(emb, "(b t) c -> b c t", t=self.T)
                 if self.emb_map is not None:
                     emb = silu(self.emb_map(emb))
-                shift, scale, gate = self.affine(emb).chunk(3, dim=1)
+                shift, scale = self.affine(emb).chunk(2, dim=1)
             else:
                 emb = rearrange(emb, "(b t) c -> b t c", t=self.T)
                 if self.emb_map is not None:
@@ -1064,6 +1064,8 @@ class DhariwalUNet(BaseModel):
         condition_non_spatial=None,
         static_condition=None,
         return_time_emb: bool = False,
+        skip_temporal_blocks: bool = False,
+        metadata=None,
     ):
         x = self.concat_condition_if_needed(inputs, condition, dynamical_condition, static_condition)
         orig_x_shape = x.shape[-2:]
@@ -1106,7 +1108,7 @@ class DhariwalUNet(BaseModel):
             if isinstance(block, UNetBlock):
                 x = block(x, emb)
             elif isinstance(block, temporal_blocks):
-                x = block(x, time_emb_2)
+                x = block(x, time_emb_2) if not skip_temporal_blocks else x
             else:
                 x = block(x)
 
@@ -1138,7 +1140,7 @@ class DhariwalUNet(BaseModel):
             if isinstance(block, UNetBlock):
                 x = block(x, emb)
             elif isinstance(block, temporal_blocks):
-                x = block(x, time_emb_2)
+                x = block(x, time_emb_2) if not skip_temporal_blocks else x
             else:
                 x = block(x)
 
@@ -1293,10 +1295,10 @@ class DhariwalUNetTemporal(DhariwalUNet):
         self.dec = new_dec
 
         #  Print the new enc and dec
-        print(f"enc = {' '.join([k for k in self.enc.keys()])}")  # print(f"{self.enc=}")
+        log.info(f"enc = {' '.join([k for k in self.enc.keys()])}")  # print(f"{self.enc=}")
         # enc = 256x256_conv 256x256_block0 256x256_block1 256x256_temporal_last_block 128x128_down 128x128_block0
         # 128x128_block1 128x128_temporal_last_block 64x64_down 64x64_block0 64x64_block1 64x64_temporal_last_block
-        print(f"dec = {' '.join([k for k in self.dec.keys()])}")  # print(f"{self.dec=}")
+        log.info(f"dec = {' '.join([k for k in self.dec.keys()])}")  # print(f"{self.dec=}")
         # dec = 64x64_in0 64x64_in1 64x64_temporal_in2 64x64_block0 64x64_block1 64x64_block2 64x64_temporal_last_block
         # 128x128_up 128x128_block0 128x128_block1 128x128_block2 128x128_temporal_last_block 256x256_up
         # 256x256_block0 256x256_block1 256x256_block2

@@ -15,10 +15,10 @@ class StandardNormalizer(torch.nn.Module):
         #     for k in means.keys():
         #         if means[k].ndim == 1:
         #             Add singleton dimensions for broadcasting over lat/lon dimensions
-                    # means[k] = torch.reshape(means[k], (-1, 1, 1))
-                    # stds[k] = torch.reshape(stds[k], (-1, 1, 1))
-                # elif means[k].ndim > 1:
-                #     raise ValueError(f"Means tensor {k} has more than one dimension!")
+        # means[k] = torch.reshape(means[k], (-1, 1, 1))
+        # stds[k] = torch.reshape(stds[k], (-1, 1, 1))
+        # elif means[k].ndim > 1:
+        #     raise ValueError(f"Means tensor {k} has more than one dimension!")
         # Make sure that means and stds move to the same device
         self.means = means
         self.stds = stds

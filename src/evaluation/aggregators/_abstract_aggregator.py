@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 import torch
 from tensordict import TensorDictBase
@@ -17,6 +17,7 @@ class AbstractAggregator(ABC):
         mask: Optional[torch.Tensor] = None,
         name: str | None = None,
         verbose: bool = True,
+        coords: Optional[Dict[str, Any]] = None,
     ):
         self.log_text = get_logger(name=self.__class__.__name__)
 
@@ -27,10 +28,13 @@ class AbstractAggregator(ABC):
                 area_weights = area_weights[mask]
 
         if area_weights is not None and verbose:
-            self.log_text.info(f"{name}: Using area weights for evaluation of shape {area_weights.shape}")
+            prefix = f"{name}: " if name is not None else ""
+            self.log_text.info(f"{prefix}Using area weights for evaluation of shape {area_weights.shape}")
         self._area_weights = area_weights
         self._is_ensemble = is_ensemble
+        assert name is None or isinstance(name, str), f"Name must be a string, got {name} ({type(name)=})"
         self.name = name
+        self.coords = coords
 
     @abstractmethod
     def _record_batch(self, **kwargs) -> None: ...
@@ -55,14 +59,31 @@ class AbstractAggregator(ABC):
         return self._record_batch(**kwargs)
 
     @torch.inference_mode()
-    def get_logs(self, prefix: str, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def get_logs(self, prefix: str = None, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         prefix = "" if prefix is None else prefix
+        if "label" in kwargs.keys():
+            prefix_prefix = kwargs.pop("label")
+            prefix = f"{prefix_prefix}/{prefix}" if prefix_prefix not in prefix else prefix
         if self.name is not None and self.name not in prefix:
-            prefix = f"{prefix}/{self.name}".replace("//", "/").rstrip("/").lstrip("/")
-        logs_values, logs_media = self._get_logs(**kwargs)
-        logs_values = {f"{prefix}/{key}": value for key, value in logs_values.items()}
-        logs_media = {f"{prefix}/{key}": value for key, value in logs_media.items()}
-        return logs_values, logs_media
+            prefix = f"{prefix}/{self.name}"
+        prefix = prefix.replace("//", "/").rstrip("/").lstrip("/")
+        logs_values, logs_media, logs_own_xaxis = self._get_logs(label=prefix, **kwargs)
+        return logs_values, logs_media, logs_own_xaxis
 
     @abstractmethod
-    def _get_logs(self, epoch: Optional[int] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]: ...
+    def _get_logs(
+        self, label: str = "", epoch: Optional[int] = None
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: ...
+
+
+class _Aggregator(Protocol):
+    def get_logs(self, label: str) -> Mapping[str, torch.Tensor]: ...
+
+    def record_batch(
+        self,
+        target_data: Mapping[str, torch.Tensor],
+        gen_data: Mapping[str, torch.Tensor],
+        target_data_norm: Mapping[str, torch.Tensor],
+        gen_data_norm: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, Any],
+    ) -> None: ...

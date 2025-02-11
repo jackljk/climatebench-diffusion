@@ -37,7 +37,7 @@ class KolmogorovDataModule(BaseDataModule):
         spatial_downsampling_factor: int = 1,
         num_val_trajectories: int = 2,
         num_test_trajectories: int = 5,
-        discard_first_n: int = 40,
+        discard_first_n: int = 50,
         shift_test_times_by: int = 0,
         subsample_valid: int = 5,
         subsample_predict: int = None,
@@ -58,8 +58,9 @@ class KolmogorovDataModule(BaseDataModule):
         log.info(f"Using data file: {self.filepath}. Test file: {test_filename}")
         self.test_filepath = join(data_dir, test_filename) if test_filename is not None else None
         if "inits" in filename:
-            # e.g. "kolmogorov-N256-n_inits32-T1000.nc"
-            _, dim_x, n_trajs, n_timesteps = filename.strip(".nc").split("-")
+            # e.g. "kolmogorov-N256-n_inits32-T1000.nc" or "kolmogorov-N256-n_inits16-T250_downsampled4.nc"
+            filename_with_info = filename.strip(".nc").rsplit('_', 1)[0]
+            _, dim_x, n_trajs, n_timesteps = filename_with_info.split("-")
             dim_x = dim_y = int(dim_x.strip("N"))
             n_trajs = int(n_trajs.strip("n_inits"))
             n_timesteps = int(n_timesteps.strip("T"))
@@ -178,10 +179,20 @@ class KolmogorovDataModule(BaseDataModule):
 
         # Set normalizer if needed
         if self.hparams.standardize:
-            if xr_train_dataset is None:
-                xr_train_dataset = self.open_postprocessed_dataset()
-            train_data = xr_train_dataset.isel(init=self.train_slice).to_array().values
-            mean, std = torch.tensor(train_data.mean()), torch.tensor(train_data.std())
+            if self.hparams.filename == "output-N256-n_inits32-T1000.nc":
+                assert len(self.hparams.channels) == 1, f"{len(self.hparams.channels)}="
+                if self.hparams.channels[0] == "streamfunction":
+                    mean, std = 0.0, 0.5153
+                elif self.hparams.channels[0] == "vorticity":
+                    mean, std = 0.0, 2.27
+                else:
+                    raise ValueError(f"Unknown channel: {self.hparams.channels[0]}")
+            else:
+                # Compute mean and std of the training data
+                if xr_train_dataset is None:
+                    xr_train_dataset = self.open_postprocessed_dataset()
+                train_data = xr_train_dataset.isel(init=self.train_slice).to_array().values
+                mean, std = torch.tensor(train_data.mean()), torch.tensor(train_data.std())
             self.normalizer = StandardNormalizer(means=mean, stds=std)
             self._sigma_data = 1.0  # Inside model, data is normalized with mean=0, std=1
         # Set the correct tensor datasets for the train, val, and test sets
@@ -208,7 +219,7 @@ class KolmogorovDataModule(BaseDataModule):
                         "val",
                         self.val_slice,
                         dataloader_idx=1,
-                        max_num_samples=3,
+                        max_num_samples=8,
                         subsample=self.hparams.subsample_valid,
                     )
                 ]
@@ -300,13 +311,14 @@ class KolmogorovDataModule(BaseDataModule):
         experiment_type: str = None,
         device: torch.device = None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, OneStepAggregator]:
         aggr_kwargs = dict(is_ensemble=is_ensemble)
         one_step_kwargs = {
             **aggr_kwargs,
             "record_rmse": True,
-            "use_snapshot_aggregator": False,
-            "record_normed": self.hparams.standardize,
+            "every_nth_epoch_snapshot": 10,
+            "record_normed": False, #self.hparams.standardize,
             "record_abs_values": True,  # will record mean and std of the absolute values of preds and targets
         }
         horizon = self.get_horizon(split, dataloader_idx)
@@ -315,8 +327,12 @@ class KolmogorovDataModule(BaseDataModule):
             horizon_range = range(1, horizon)
         else:
             horizon_range = range(1, horizon + 1)
+        snap_timesteps = [1, 4, horizon //2, horizon]
+        aggregators = dict()
+        for h in horizon_range:
+            one_step_kwargs["use_snapshot_aggregator"] = h in snap_timesteps
+            aggregators[f"t{h}"] = OneStepAggregator(**one_step_kwargs, name=f"t{h}")
 
-        aggregators = {f"t{h}": OneStepAggregator(**one_step_kwargs, name=f"t{h}") for h in horizon_range}
         return aggregators
 
 
@@ -351,9 +367,8 @@ class KolmogorowFlowDataset(torch.utils.data.Dataset):
         self.np_data = rearrange(self.np_data, "c traj time x y -> traj time c x y")
         if add_noise_level > 0.0:
             log.info(f"[ds.id={dataset_id}] Adding noise to the data with level={add_noise_level}")
-            noise = np.random.normal(
-                0, add_noise_level, self.np_data.shape
-            )  # same as np.random.randn(*self.np_data.shape) * add_noise_level
+            # same as np.random.randn(*self.np_data.shape) * add_noise_level
+            noise = np.random.normal( 0, add_noise_level, self.np_data.shape)
             self.np_data += noise
 
         # log.info(f"Length per traj: {length_per_traj}, n_trajs: {self.n_trajs},  window_size: {self.window_size}, subsample: {subsample}, len(time): {len(dataset.time)}, length: {self.length}")

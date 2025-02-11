@@ -10,7 +10,6 @@ defaults:
 
 trainer:
   max_epochs: 50
-  accumulate_grad_batches: 4
 
 datamodule:
   prediction_horizon: 240

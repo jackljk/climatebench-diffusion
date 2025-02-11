@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
+from src.losses.losses import crps_ensemble
+
 
 def evaluate_ensemble_prediction(
     predictions: np.ndarray,
@@ -103,10 +105,12 @@ def evaluate_ensemble_crps(
     member_dim: str = "member",
     mean_over_samples: bool = True,
 ) -> float | np.ndarray:
-    return losses.crps_ensemble(
-        predictions=torch.from_numpy(ensemble_predictions),
-        observations=torch.from_numpy(targets),
-    ).item()
+    # If mean_over_samples is False, the CRPS per sample (first/second targets/predictions dim) is returned
+    mean_dims = tuple(range(targets.ndim)) if mean_over_samples else tuple(range(1, targets.ndim))
+    crps = crps_ensemble(
+        predicted=torch.from_numpy(ensemble_predictions), truth=torch.from_numpy(targets), dim=mean_dims
+    )
+    return crps.item() if mean_over_samples else crps.numpy()
 
 
 def evaluate_ensemble_spread_skill_ratio(

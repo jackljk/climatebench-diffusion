@@ -328,11 +328,6 @@ def extras(
             # is_ipol_exp = "InterpolationExperiment" in config.module.get("_target_", "")
             # new_monitor = "val/" + ("ipol/avg/crps_normed" if is_ipol_exp else "avg/crps_normed")
             config.module.monitor = config.module.monitor.replace("rmse", "crps")
-            if config.datamodule.get("output_vars") != config.module.monitor.split("/")[-1]:
-                log.warning(
-                    f"Monitor var {config.module.monitor.split('/')[-1]} != output_vars {config.datamodule.output_vars}.\n Setting output_vars to monitor {config.datamodule.output_vars}." 
-                )
-                config.module.monitor = "/".join(config.module.monitor.split("/")[:-1] + [config.datamodule.output_vars])
             log.info(f"Setting {config.module.monitor=} since num_predictions > 1")
 
     # fix monitor for model_checkpoint and early_stopping callbacks

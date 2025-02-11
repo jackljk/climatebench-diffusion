@@ -1,0 +1,44 @@
+# this is used when doing standalone inference with beaker-inference.yaml
+experiment_dir: /data/climate-model/results/fme-inference-ema
+n_forward_steps: 14592
+forward_steps_in_memory: 96 # 114
+#n_forward_steps: 36
+#forward_steps_in_memory: 12
+log_video: false
+log_zonal_mean_images: false
+logging:
+  log_to_screen: true
+  log_to_wandb: true
+  log_to_file: true
+  project: "salva-test-fme-inference"
+  entity: ai2cm
+validation_loader:
+  start_indices:
+    first: 0
+    n_initial_conditions: 1
+  dataset:
+    data_path: /data/climate-model/fv3gfs/2023-09-07-vertically-resolved-1deg-fme-ensemble-dataset-netcdfs/validation/ic_0011
+    n_repeats: 1   # 10 --> 100 year rollout (10 x 10 years)
+  num_data_workers: 8
+#  n_samples: 1  # 1460, 2920
+data_writer:
+  save_prediction_files: false  #true  # Set to true to save predictions to xarray files (e.g. for further analysis)
+overrides:
+#  use_ema_at_inference: False
+#  enable_inference_dropout: False
+  diffusion_config:
+#    interpolator_local_checkpoint_path: "/data/results/checkpoints/-best-val_avg_16ens_mems_weighted_crps.ckpt"
+    interpolator_wandb_kwargs:
+      entity: "ai2cm"
+      project: "FME-v2-salva"
+    use_cold_sampling_for_last_step: False
+    use_cold_sampling_for_intermediate_steps: False
+    interpolator_use_ema: True
+    use_same_dropout_state_for_sampling: "random"  # "fixed_global" or "fixed_per_iter" or "random"
+#    use_cold_sampling_for_init_of_ar_step: True
+#    refine_intermediate_predictions: True
+#    enable_interpolator_dropout: False
+#checkpoint_path: "/data/results/checkpoints/33603249-best-val_avg_crps.ckpt"
+checkpoint_path: "/data/results/checkpoints/33603249-best-val_time_mean_rmse_PRESsfc.ckpt"
+#checkpoint_path: "/data/results/checkpoints/33603249-best-val_time_mean_rmse_air_temperature_7.ckpt"
+#checkpoint_path: "/data/results/checkpoints/33603249-last.ckpt"

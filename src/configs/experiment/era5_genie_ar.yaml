@@ -22,7 +22,3 @@ datamodule:
   # num_workers: 32
   # prefetch_factor: 12
   batch_size: 96
-
-trainer:
-  accumulate_grad_batches: 1
-  devices: 2

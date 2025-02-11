@@ -110,10 +110,13 @@ def get_detailed_name(config, add_unique_suffix: bool = True) -> str:
             s = s.replace("EMA", f"EMA{config.module.ema_decay}")
 
     is_diffusion = config.get("diffusion") is not None
-    diff_class = None if not is_diffusion else config.diffusion._target_
     if is_diffusion:
+        diff_class = config.diffusion.get("_target_")
+        assert diff_class is not None, f"Diffusion class not found in {config.diffusion=}"
         if config.diffusion.get("interpolator_run_id"):
             replace = {
+                "glkxjzy5": "i400ep",
+                #
                 "d5h1wl5c": "v2",
                 "d4n7nz9x": "25Dr",  # NavierStokes-IpolNext16h_0k-_SimpleUnet_EMA0.995_64d_34lr_25Dr_14wd__11seed
                 "keuriykh": "25DrNoEMA",  # NavierStokes-IpolNext16h_0k-_SimpleUnet_64d_34lr_25Dr_14wd__11seed

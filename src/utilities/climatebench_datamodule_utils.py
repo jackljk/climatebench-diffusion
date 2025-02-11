@@ -1,6 +1,7 @@
 # General imports/constants
 from typing import Dict, Optional, Sequence, Union
 
+import cftime
 import numpy as np
 import xarray as xr
 
@@ -13,7 +14,6 @@ log = get_logger(__name__)
 
 
 # imports/constants ds
-import cftime
 
 
 NO_DAYS_IN_YEAR = 365
@@ -73,7 +73,10 @@ def standardize_output_xr(
 
 
 def handle_ensemble(
-    output_xr: xr.Dataset, mean_over_ensemble: Optional[Union[str, bool]], simulation: str, num_ensemble: Union[int ,str]
+    output_xr: xr.Dataset,
+    mean_over_ensemble: Optional[Union[str, bool]],
+    simulation: str,
+    num_ensemble: Union[int, str],
 ) -> Union[xr.Dataset, dict]:
     """
     Handle ensemble data by either averaging over the ensemble, selecting the first ensemble member or stacking the
@@ -94,6 +97,8 @@ def handle_ensemble(
     elif mean_over_ensemble == "first":
         log.info(f"Selecting first ensemble member for {simulation}")
         output_xr = output_xr.isel(member_id=0)
+    elif mean_over_ensemble == "all":
+        log.info(f"Using all {output_xr.sizes['member_id']} ensemble members for {simulation}")
     elif mean_over_ensemble == "stack":
         log.info(f"Stacking ensembles for {simulation}")
         # make dict of {simulation_ensem: xr}

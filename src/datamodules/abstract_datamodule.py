@@ -180,6 +180,7 @@ class BaseDataModule(pl.LightningDataModule):
         experiment_type: str = None,
         device: torch.device = None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, AbstractAggregator]:
         """Return the epoch aggregators for the given split."""
         return {}

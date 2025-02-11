@@ -273,8 +273,9 @@ class ClimateBenchDataModule(BaseDataModule):
         is_ensemble: bool,
         dataloader_idx: int = 0,
         experiment_type: str = None,
-        device: torch.device = None,
+        device=None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, OneStepAggregator]:
         aggr_kwargs = dict(is_ensemble=is_ensemble)
         aggregator = OneStepAggregator(

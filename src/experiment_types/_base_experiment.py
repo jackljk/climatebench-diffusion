@@ -300,7 +300,9 @@ class BaseExperiment(LightningModule):
             for b_key in set(self.main_data_keys + self.main_data_keys_val + [""]):
                 normalizer_name = f"normalizer_{b_key}" if b_key else "normalizer"
                 if hasattr(self._datamodule, normalizer_name):
-                    self.log_text.info(f"Moving {normalizer_name} means and stds to same device={self.device} as model")
+                    self.log_text.info(
+                        f"Moving {normalizer_name} means and stds to same device={self.device} as model"
+                    )
                     getattr(self._datamodule, normalizer_name).to(self.device)
 
         return self._datamodule
@@ -321,7 +323,6 @@ class BaseExperiment(LightningModule):
         if self.datamodule_config.get("spatial_crop_during_training"):
             channel_dim += 1
         return channel_dim
-
 
     def instantiate_model(self, *args, **kwargs) -> BaseModel:
         r"""Instantiate the model, e.g. by calling the constructor of the class :class:`BaseModel` or a subclass thereof."""
@@ -446,6 +447,7 @@ class BaseExperiment(LightningModule):
             experiment_type=self.__class__.__name__,
             device=self.device,
             verbose=self.current_epoch == 0,
+            save_to_path=self.prediction_outputs_filepath,
         )
         return aggregators
 
@@ -536,8 +538,8 @@ class BaseExperiment(LightningModule):
 
     def get_normalizer(self, batch_key: str):
         possible_keys = [
-            f"normalizer_{batch_key}", # Allow for different normalizers for different batch keys
-            "normalizer"
+            f"normalizer_{batch_key}",  # Allow for different normalizers for different batch keys
+            "normalizer",
         ]
         for normalizer_name in possible_keys:
             if hasattr(self.datamodule, normalizer_name):
@@ -550,7 +552,7 @@ class BaseExperiment(LightningModule):
         if normalizer is not None:
             x = normalizer.normalize(x)
 
-        return to_tensordict(x)   #  to_tensordict(x) is no-op if x is a tensor
+        return to_tensordict(x)  #  to_tensordict(x) is no-op if x is a tensor
 
     def normalize_batch(
         self, batch: Dict[str, Dict[str, Tensor]] | Dict[str, Tensor] | Tensor, batch_key: str
@@ -559,7 +561,9 @@ class BaseExperiment(LightningModule):
         if torch.is_tensor(batch) or isinstance(next(iter(batch.values())), Tensor):
             return self.normalize_data(batch, batch_key)
         elif isinstance(batch, TensorDict):
-            return TensorDict({k: self.normalize_data(v, batch_key) for k, v in batch.items()}, batch_size=batch.batch_size)
+            return TensorDict(
+                {k: self.normalize_data(v, batch_key) for k, v in batch.items()}, batch_size=batch.batch_size
+            )
         else:
             return {k: self.normalize_data(v, batch_key) for k, v in batch.items()}
 
@@ -868,13 +872,12 @@ class BaseExperiment(LightningModule):
             return True
 
         if not isinstance(self.model.criterion, (dict, torch.nn.ModuleDict)):
-            boo = _set_criterion_weights(self.model.criterion)         # Handle single criterion case
+            boo = _set_criterion_weights(self.model.criterion)  # Handle single criterion case
             assert not boo or self.model.criterion.weights is not None, "Loss weights must be set."
         else:
             for key, criterion in self.model.criterion.items():
-                boo = _set_criterion_weights(criterion)                # Handle ModuleDict case
+                boo = _set_criterion_weights(criterion)  # Handle ModuleDict case
                 assert not boo or self.model.criterion[key].weights is not None, "Loss weights must be set."
-
 
     def on_train_epoch_start(self) -> None:
         self._start_epoch_time = time.time()
@@ -1239,8 +1242,9 @@ class BaseExperiment(LightningModule):
             for ckpt_callback in self.trainer.checkpoint_callbacks:
                 if hasattr(ckpt_callback, "monitor") and ckpt_callback.monitor is not None:
                     monitors.append(ckpt_callback.monitor)
+            val_stats_keys = list(val_stats.keys()) + ["val/loss"]
             for monitor in monitors:
-                assert monitor in val_stats, (
+                assert monitor in val_stats_keys, (
                     f"Monitor metric {monitor} not found in {val_stats.keys()}. "
                     f"\nTotal mean metrics: {total_mean_metrics_all}"
                 )
@@ -1266,21 +1270,71 @@ class BaseExperiment(LightningModule):
         val_media = {"epoch": self.current_epoch, "global_step": self.global_step}
         data_split_names = data_split_names or [split]
 
+        skip_temporal_metrics_after = 60
         total_mean_metrics_all = []
         for prefix, aggregators in zip(data_split_names, aggregators):
-            label = f"{prefix}/{logging_infix}".rstrip("/")  # e.g. "val/5ens_mems"
+            label = f"{prefix}/{logging_infix}".rstrip("/")  # e.g. "val/5ens_mems" or "val"
             per_variable_mean_metrics = defaultdict(list)
+            temporal_metrics_logged = 0
             for agg_name, agg in aggregators.items():
-                # if agg.name is None:  # does not work when using a listaggregator
-                #     label = f"{label}/{agg_name}"   # e.g. "val/5ens_mems/t3"
-                logs_metrics, logs_media = agg.get_logs(prefix=label, epoch=self.current_epoch)
-                val_stats.update(logs_metrics)
-                val_media.update(logs_media)
+                if agg_name == "save_to_disk":
+                    metadata = dict()
+                    if hasattr(self.logger, "experiment") and self.logger.experiment is not None:
+                        metadata["id"] = self.logger.experiment.id
+                        metadata["name"] = self.logger.experiment.name
+                        metadata["group"] = self.logger.experiment.group
 
-                if not (agg_name.startswith("t") and len(agg_name) <= 5):  # up to t9999
-                    self.log_text.info(f"Skipping aggregator ``{agg_name}`` for mean metrics.")
-                    # Don't use these aggregators for the mean metrics (not temporal)
+                    agg.get_logs(prefix=label, epoch=self.current_epoch, metadata=metadata)
                     continue
+                # agg.name takes precedence over agg_name as it may better specify the lead time
+                agg_name_substrings = agg.name.split("/") if agg.name is not None else []
+                agg_name_substrings += agg_name.split("/") if agg_name is not None else []
+                agg_name_part_with_t, lead_time = None, None
+                for agg_name_substring in agg_name_substrings:
+                    if agg_name_substring.startswith("t") and agg_name_substring[1:].isdigit():
+                        agg_name_part_with_t = agg_name_substring
+                        lead_time = int(agg_name_substring[1:])
+                        break
+
+                # if agg.name is None:  # does not work when using a listaggregator
+                #     label = f"{label}/{agg_name}"   # e.g. "val/5ens_mems/t3" or "val/t1"
+                logs_metrics, logs_media, logs_own_xaxis = agg.get_logs(prefix=label, epoch=self.current_epoch)
+                val_media.update(logs_media)
+                if temporal_metrics_logged <= skip_temporal_metrics_after:
+                    # Don't overload the logs with too many temporal metrics (they will be logged as lines below too)
+                    val_stats.update(logs_metrics)
+                # Log the custom x-axis metrics
+                for x_axis_name, values_list in logs_own_xaxis.items():
+                    # values_list is e.g. wavenumber -> {wv_1: {wv_1: 1, pow: 2}, wv_2: {wv_2: 2, pow: 3}, ...}
+                    x_axes = values_list.pop("x_axes")
+                    for x_axis in x_axes:
+                        # define our custom x axis metric
+                        wandb.define_metric(x_axis)
+                    for x_axis_value, values in values_list.items():
+                        for value_i_k, values_i in values.items():
+                            if value_i_k not in x_axes:
+                                for custom_x_axis in x_axes:
+                                    # define which metrics will be plotted against it
+                                    wandb.define_metric(value_i_k, step_metric=custom_x_axis)
+                        self.logger.experiment.log({"lead_time": lead_time, **values})
+
+                if lead_time is None:  # Don't use these aggregators for the mean metrics (not temporal)
+                    self.log_text.info(f"Skipping aggregator ``{agg_name}`` for mean metrics.")
+                    continue
+
+                # Log the temporal metrics with t<number> as the x-axis
+                logs_metrics_no_t = {
+                    k.replace(f"{agg_name_part_with_t}/", "").replace("//", "/"): v for k, v in logs_metrics.items()
+                }
+                if temporal_metrics_logged == 0:
+                    try:
+                        wandb.define_metric("lead_time")
+                        for k in logs_metrics_no_t.keys():
+                            wandb.define_metric(k, step_metric="lead_time")
+                    except Exception as e:
+                        self.log_text.warning(f"Could not define metric 'lead_time' in wandb: {e}.")
+                self.logger.experiment.log({"lead_time": lead_time, **logs_metrics_no_t})
+                temporal_metrics_logged += 1
 
                 # Compute average metrics over all aggregators I
                 for k, v in logs_metrics.items():
@@ -1392,7 +1446,8 @@ class BaseExperiment(LightningModule):
                 ending = "nc" if fname == "xarray" else "npz"
                 fname = self.name or ""
                 if self.logger is not None and hasattr(self.logger, "experiment"):
-                    fname += f"-{self.logger.experiment.name}"
+                    # fname += f"-{self.logger.experiment.name}"
+                    fname += f"-{self.logger.experiment.name.split('_')[-1]}"
                     run_id = self.logger.experiment.id
                     if run_id not in fname:
                         fname += f"-{run_id}"
@@ -1400,6 +1455,7 @@ class BaseExperiment(LightningModule):
                     fname += f"-hor{self.prediction_horizon}"
                 tags = self.logger.experiment.tags if hasattr(self.logger.experiment, "tags") else []
                 skip_tags = [
+                    "prediction_horizon",
                     "prediction_horizon_long",
                     "ckpt_path",
                     "lookback_window",
@@ -1413,6 +1469,9 @@ class BaseExperiment(LightningModule):
                     "num_predictions_in_memory",
                     "batch_size",
                     "regression_wandb_ckpt_filename",
+                    "force_pure_noise_last_frame",
+                    "val_slice",
+                    "max_val_samples",
                 ]
                 skip_tags_with_value = ["initialize_window=regression"]
                 tags = [
@@ -1433,6 +1492,7 @@ class BaseExperiment(LightningModule):
                     yield_denoised="yd",
                     sigma_max_inf="Smax",
                     sigma_min="Smin",
+                    possible_initial_times="IC",
                 )
                 tags_to_short["True"] = "T"
                 tags_to_short["False"] = "F"
@@ -1440,7 +1500,11 @@ class BaseExperiment(LightningModule):
                 tags_to_short["kolmogorov-N256-n_inits16-T1000.nc"] = "V2"
                 tags_clean = []
                 for t in tags:
-                    t = ".".join(t.split(".")[1:])
+                    t = ".".join(t.split(".")[1:]).replace("-", "").replace(",", "_")
+                    t = t.replace("[", "").replace("]", "").replace(" ", "")
+                    # Replace apostrophes with nothing
+                    t = t.replace("'", "").replace('"', "")
+
                     for k, v in tags_to_short.items():
                         t = t.replace(k, v)
                     tags_clean.append(t)
@@ -1449,6 +1513,9 @@ class BaseExperiment(LightningModule):
             work_dir = self.hparams.work_dir if self.hparams.work_dir is not None else "."
             fname = os.path.join(work_dir, "predictions", fname)
             os.makedirs(os.path.dirname(fname), exist_ok=True)
+            if hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "summary"):
+                self.logger.experiment.summary["predictions_outputs_filepath"] = str(fname)
+            # self.log_dict({"predictions_outputs_filepath": str(fname)}, prog_bar=False, logger=True)
         return fname
 
     # /lustre/fs2/portfolios/nvr/users/sruhlingcach/sdiff/predictions/Kolmogorov-H32-ERDM-exp_a_b-0.0001-80.0sigma_8x8-Vl_UNetR_EMA0.999_0.01a8b_64x1-2-2-3-4d_L1_54lr_10at15bDr_14wd_cos_LC10_11seed_19h25mAug02_2061387-hor32-TAGSfn=V1-shift=80-ENS=8-ch=0.6-step=1-heun=True-rID=2061332-subsample_predict=2TAGE-epoch51.nc

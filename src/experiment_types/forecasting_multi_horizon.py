@@ -300,6 +300,15 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                                 time=total_t,
                             )
                 preds_normed = results.pop(PREDS_NORMED_K)
+                if not no_aggregators and "save_to_disk" in aggregators.keys():
+                    aggregators["save_to_disk"].record_batch(
+                        target_data=targets_raw,
+                        gen_data=results[PREDS_RAW_K],
+                        target_data_norm=targets_normed,
+                        gen_data_norm=preds_normed,
+                        concat_dim_key=total_horizon,
+                        metadata=batch.get("metadata", None),
+                    )
                 if return_outputs in [True, "all"]:
                     return_dict[f"t{total_horizon}_targets_normed"] = torch_to_numpy(targets_normed)
                     return_dict[f"t{total_horizon}_preds_normed"] = torch_to_numpy(preds_normed)
@@ -376,11 +385,12 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
 
             log_as_step = True  # self.datamodule.hparams.physical_system == "navier-stokes"
             split_name = self.test_set_names[0 if dataloader_idx is None else dataloader_idx]
+            wandb_key_stem = f'{split_name}_instance/{batch_idx}/{self.ensemble_logging_infix("test")}'
             save_arrays_as_line_plot(
                 self,
                 np.array(timesteps),
                 metrics,
-                wandb_key_stem=f"{split_name}_instance/{batch_idx}/{self.ensemble_logging_infix('test')}",
+                wandb_key_stem=wandb_key_stem.replace("//", "/"),
                 x_label="time",
                 log_as_table=False,
                 log_as_step=log_as_step,
@@ -399,7 +409,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
             test_set_names = self.test_set_names
             assert len(test_set_names) == 1, "Only one test set supported for now"
             split_name = self.test_set_names[0]
-            wandb_key_stem = f'{split_name}/{self.ensemble_logging_infix("test")}'
+            wandb_key_stem = f'{split_name}/{self.ensemble_logging_infix("test")}'.replace("//", "/")
             metrics_agg = {k: np.mean(np.array(v), axis=0) for k, v in self._test_metrics_aggregate.items()}
             max_h = len(metrics_agg[list(metrics_agg.keys())[0]]) + 1
             xaxis = np.arange(1, max_h)
@@ -972,7 +982,6 @@ class PDERefinerModule(AbstractSimultaneousMultiHorizonForecastingModule):
 
 
 class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
-    _pretrained_is_conditional: False
 
     def __init__(
         self,
@@ -991,6 +1000,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         assert self.horizon >= 1, "horizon must be >= 1 for RollingDiffusion"
         assert init_truth_shift >= 0, "Oops"
         self.stack_window_to_channel_dim = False  # do internally in the model
+        self._pretrained_is_conditional = False
         if initialize_window == "regression":
             regression_overrides = list(regression_overrides) if regression_overrides is not None else []
             regression_overrides.append("model.verbose=False")
@@ -1277,7 +1287,9 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
             extra_kwargs = self.get_extra_model_kwargs(
                 batch, split=split, ensemble=ensemble, is_autoregressive=is_autoregressive
             )
-            self.sampler = self.model.sample(init_window, condition=dynamics_cond, **extra_kwargs)
+            # self.sampler = self.model.sample_maybe_guided(init_window, condition=dynamics_cond, **extra_kwargs)
+            with self.model.guidance_scope():
+                self.sampler = self.model.sample(init_window, condition=dynamics_cond, **extra_kwargs)
 
             if n_discard > 0:
                 self.log_text.info(f"Discarding first {n_discard} 'predictions'")

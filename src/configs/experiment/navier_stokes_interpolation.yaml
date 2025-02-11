@@ -9,6 +9,9 @@ defaults:
   - _self_
 
 name: "NavierStokes-Interpolation${datamodule.horizon}h"
+datamodule:
+  prediction_horizon: null
+
 module:
   enable_inference_dropout: True
   monitor: "val/avg/crps"

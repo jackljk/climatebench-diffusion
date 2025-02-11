@@ -14,8 +14,7 @@
 # limitations under the License.
 
 # pylint: skip-file
-"""Common layers for defining score networks.
-"""
+"""Common layers for defining score networks."""
 import math
 import string
 from functools import partial

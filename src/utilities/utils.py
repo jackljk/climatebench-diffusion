@@ -9,7 +9,6 @@ import functools
 import glob
 import logging
 import os
-import random
 import re
 import subprocess
 from difflib import SequenceMatcher
@@ -431,7 +430,11 @@ def rhasattr(obj, attr, *args):
 
 
 def to_tensordict(
-    x: Dict[str, torch.Tensor], find_batch_size_max: bool = False, force_same_device: bool = False, device=None
+    x: Dict[str, torch.Tensor],
+    batch_size: Sequence[int] = None,
+    find_batch_size_max: bool = False,
+    force_same_device: bool = False,
+    device=None,
 ) -> TensorDict:
     """Converts a dictionary of tensors to a TensorDict."""
     if torch.is_tensor(x):
@@ -440,8 +443,9 @@ def to_tensordict(
         return torch.from_numpy(x)
     any_batch_example = x[list(x.keys())[0]]
     device = any_batch_example.device if force_same_device else device
-    shared_batch_size = any_batch_example.shape
+    shared_batch_size = any_batch_example.shape if batch_size is None else batch_size
     if find_batch_size_max:
+        assert batch_size is None, "Cannot specify batch_size and find_batch_size_max at the same time."
         # Find maximum number of dimensions that are the same for all tensors
         for t in x.values():
             if t.shape[: len(shared_batch_size)] != shared_batch_size:
@@ -523,20 +527,6 @@ def get_files(datapath, match=None):
     if match:
         return [os.path.basename(file) for file in files if match in file]
     return [os.path.basename(file) for file in files]
-
-
-# Random seed (if not using pytorch-lightning)
-def set_seed(seed, device="cuda"):
-    """
-    Sets the random seed for the given device.
-    If using pytorch-lightning, preferably to use pl.seed_everything(seed) instead.
-    """
-    # setting seeds
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if device != "cpu":
-        torch.cuda.manual_seed(seed)
 
 
 def auto_gpu_selection(

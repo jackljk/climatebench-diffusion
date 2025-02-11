@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import xarray as xr
@@ -135,6 +135,7 @@ class MeanAggregator:
         gen_data: Mapping[str, torch.Tensor],
         target_data_norm: Mapping[str, torch.Tensor] = None,
         gen_data_norm: Mapping[str, torch.Tensor] = None,
+        metadata: Mapping[str, Any] = None,
     ):
         variable_metrics = self._get_variable_metrics(gen_data)
         is_tensor = torch.is_tensor(gen_data)
@@ -203,7 +204,7 @@ class MeanAggregator:
         # for key in sorted(logs.keys()):
         # logs[key] = float(logs[key].cpu())  # .numpy()
 
-        return logs
+        return logs, {}, {}
 
     @torch.inference_mode()
     def get_dataset(self, label: str) -> xr.Dataset:

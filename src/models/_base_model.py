@@ -326,14 +326,14 @@ class BaseModel(LightningModule):
 
         # Predict
         if torch.is_tensor(inputs):
-            predictions = self(inputs, condition=condition, **kwargs)
+            predictions_raw = self(inputs, condition=condition, **kwargs)
         else:
-            predictions = self(**inputs, condition=condition, **kwargs)
+            predictions_raw = self(**inputs, condition=condition, **kwargs)
 
-        if torch.is_tensor(predictions):
+        if torch.is_tensor(predictions_raw):
             if predictions_post_process is not None:
-                predictions = predictions_post_process(predictions)
-            predictions = mask_data(predictions)
+                predictions_raw = predictions_post_process(predictions_raw)
+            predictions = mask_data(predictions_raw)
             targets = mask_data(targets)
             assert (
                 predictions.shape == targets.shape
@@ -344,7 +344,7 @@ class BaseModel(LightningModule):
         else:
             if predictions_post_process is not None:
                 # Do post-processing of the predictions (but not other outputs of the model)
-                predictions["preds"] = predictions_post_process(predictions["preds"])
+                predictions_raw["preds"] = predictions_post_process(predictions_raw["preds"])
             loss = 0.0
             loss_dict = dict()
             # For example, base_keys = ["preds", "condition_non_spatial_preds"]
@@ -352,7 +352,7 @@ class BaseModel(LightningModule):
             for k in targets.keys():
                 base_key = k.replace("inputs", "preds")
                 loss_weight_k = self.loss_function_weights.get(base_key, 1.0)
-                predictions_k = mask_data(predictions[base_key])
+                predictions_k = mask_data(predictions_raw[base_key])
                 targets_k = mask_data(targets[k])
                 loss_k = self.criterion[base_key](predictions_k, targets_k)
                 loss += loss_weight_k * loss_k
@@ -360,7 +360,7 @@ class BaseModel(LightningModule):
             loss_dict["loss"] = loss  # total loss, used to backpropagate
 
         if return_predictions:
-            return loss_dict, predictions
+            return loss_dict, predictions_raw
         return loss_dict
 
     def predict_forward(self, *inputs: Tensor, metadata: Any = None, **kwargs):

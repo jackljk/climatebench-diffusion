@@ -334,7 +334,7 @@ def get_loss(name, reduction="mean", **kwargs):
     #     loss = CRPSGaussianLoss(reduction=reduction)
     elif name in ["crps"]:
         assert reduction == "mean", "CRPS loss only supports mean reduction"
-        loss = CRPSLoss(reduction=reduction, **kwargs)
+        loss = CRPSLoss(**kwargs)
     # elif name in ["nll", "negative_log_likelihood"]:
     #     loss = NLLLoss(reduction=reduction)
     else:

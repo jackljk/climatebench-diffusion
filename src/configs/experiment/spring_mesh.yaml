@@ -28,7 +28,6 @@ trainer:
   max_epochs: 300
   gradient_clip_val: 0.5
   deterministic: True
-  accumulate_grad_batches: 1
 
 callbacks:
   early_stopping: null

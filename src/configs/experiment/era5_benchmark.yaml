@@ -9,7 +9,6 @@ name: "ERA5-${datamodule.hourly_resolution}h-${datamodule.horizon}l"
 
 trainer:
   max_epochs: 200
-  accumulate_grad_batches: 2
 
 datamodule:
   batch_size: 6

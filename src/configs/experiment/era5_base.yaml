@@ -18,11 +18,10 @@ trainer:
   max_epochs: 200
   gradient_clip_val: 0.8
   deterministic: True
-  accumulate_grad_batches: 4
   precision: 16
 
 datamodule:
-  batch_size: 2
+  batch_size: 128
   eval_batch_size: 1
   horizon: 6
   window: 1

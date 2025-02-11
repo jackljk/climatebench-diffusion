@@ -217,6 +217,7 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         experiment_type: str = None,
         device: torch.device = None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, OneStepAggregator]:
         assert dataloader_idx in [0, 1], f"Invalid dataloader_idx: {dataloader_idx}"
         split_ds = getattr(self, f"_data_{split}")

@@ -14,7 +14,6 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
 import wandb
-from src.utilities.checkpointing import get_local_ckpt_path
 from src.utilities.utils import find_config_differences_return_as_joined_str, get_logger
 
 
@@ -94,10 +93,10 @@ def get_project_groups(
     return list(set([run.group for run in runs]))
 
 
-def get_runs_for_group(
-    group: str,
+def get_runs_for_filter(
     entity: str = None,
     project: str = None,
+    group: str = None,
     wandb_api: wandb.Api = None,
     filter_dict: Dict[str, Any] = None,
     filter_functions: Sequence[Callable] = None,
@@ -133,7 +132,7 @@ def get_runs_for_group(
 
 
 def get_runs_for_project(**kwargs):
-    return get_runs_for_group(group=None, **kwargs)
+    return get_runs_for_filter(group=None, **kwargs)
 
 
 def get_run_apis(
@@ -148,7 +147,7 @@ def get_run_apis(
     if run_id is not None:
         return [get_run_api(run_id=run_id, **kwargs)]
     else:
-        return get_runs_for_group(group=group, **kwargs)
+        return get_runs_for_filter(group=group, **kwargs)
 
 
 def get_wandb_id_for_run() -> str:
@@ -185,7 +184,7 @@ def get_runs_for_group_with_any_metric(
             wandb_kwargs2["filter_functions"] = wandb_kwargs["filter_functions"] + [filter_func]
         else:
             wandb_kwargs2["filter_functions"] = wandb_kwargs["filter_functions"]
-        group_runs = get_runs_for_group(wandb_group, wandb_api=wandb_api, verbose=False, **wandb_kwargs2)
+        group_runs = get_runs_for_filter(group=wandb_group, wandb_api=wandb_api, verbose=False, **wandb_kwargs2)
         if len(group_runs) > 0:
             break
     if len(group_runs) == 0:
@@ -349,7 +348,9 @@ def load_hydra_config_from_wandb(
             # Find hydra_config file in wandb directory or subdirectories using glob
             hydra_config_files = glob.glob(f"{possible_cfg_dir}/**/hydra_config*.yaml", recursive=True)
             if len(hydra_config_files) > 0:
-                log.info(f"[{rank=}] Found {len(hydra_config_files)} files in {possible_cfg_dir}: {hydra_config_files}")
+                log.info(
+                    f"[{rank=}] Found {len(hydra_config_files)} files in {possible_cfg_dir}: {hydra_config_files}"
+                )
                 is_local = True
                 break
             # torch.distributed.barrier()
@@ -379,9 +380,14 @@ def load_hydra_config_from_wandb(
     if is_local or (os.path.exists(hydra_config_file) and rank not in ["0", 0]):
         log.info(f"Loading local hydra config file: {hydra_config_file}")
     else:
-        log.info(f"Downloading hydra config file: {hydra_config_file}")
+        log.info(f"[rank: {rank}] Downloading hydra config file: {hydra_config_file}")
         wandb_restore_kwargs = dict(run_path=run_path, replace=True, root=os.getcwd())
-        wandb.restore(hydra_config_file, **wandb_restore_kwargs)
+        try:
+            wandb.restore(hydra_config_file, **wandb_restore_kwargs)
+        except Exception as e:
+            # Errors sometimes occur in distributed multi-node training
+            log.warning(f"[rank: {rank}] Error when restoring hydra config file: {e}")
+            hydra_config_file = wandb.restore(hydra_config_file, run_path=run_path, replace=True).name
 
     # remove overrides of the form k=v, where k has no dot in it. We don't support this.
     overrides = [o for o in overrides if "=" in o and "." in o.split("=")[0]]
@@ -396,7 +402,17 @@ def load_hydra_config_from_wandb(
         f"logger.wandb.tags={run.tags}",
         f"logger.wandb.group={run.group}",
     ]
-    config = OmegaConf.load(hydra_config_file)
+    # Set barrier for multi-node training
+    try:
+        import torch.distributed as dist
+
+        dist.barrier()
+    except Exception:
+        pass
+    try:
+        config = OmegaConf.load(hydra_config_file)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"[rank: {rank}] Could not find {hydra_config_file=}") from e
     overrides = OmegaConf.from_dotlist(overrides)
     config = OmegaConf.unsafe_merge(config, overrides)
 
@@ -409,8 +425,15 @@ def load_hydra_config_from_wandb(
         config = OmegaConf.unsafe_merge(config, override_config)  # unsafe_merge since override_config is not needed
 
     if not is_local:
-        os.remove(hydra_config_file) if os.path.exists(hydra_config_file) else None
-        os.remove(f"../../{hydra_config_file}") if os.path.exists(f"../../{hydra_config_file}") else None
+        # Remove hydra_config file from cloud. We use FileNotFound exception for multi-node training
+        try:
+            os.remove(hydra_config_file) if os.path.exists(hydra_config_file) else None
+        except FileNotFoundError:
+            pass
+        try:
+            os.remove(f"../../{hydra_config_file}") if os.path.exists(f"../../{hydra_config_file}") else None
+        except FileNotFoundError:
+            pass
 
     if run.id != config.logger.wandb.id and run.id in config.logger.wandb.name:
         config.logger.wandb.id = run.id
@@ -454,7 +477,7 @@ def get_existing_wandb_group_runs(
     if config.get("logger", None) is None or config.logger.get("wandb", None) is None:
         return []
     wandb_cfg = config.logger.wandb
-    runs_in_group = get_runs_for_group(wandb_cfg.group, entity=wandb_cfg.entity, project=wandb_cfg.project)
+    runs_in_group = get_runs_for_filter(entity=wandb_cfg.entity, project=wandb_cfg.project, group=wandb_cfg.group)
     try:
         _ = len(runs_in_group)
     except (ValueError, TypeError):  # happens if project does not exist or empty

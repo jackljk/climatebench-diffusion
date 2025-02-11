@@ -7,8 +7,10 @@ import numpy as np
 import pytorch_lightning
 import torch
 from omegaconf import DictConfig, ListConfig
+
 import src.utilities.wandb_api as wandb_api
 from src.utilities.utils import get_logger, rename_state_dict_keys_and_save
+
 
 log = get_logger(__name__)
 
@@ -110,6 +112,7 @@ def get_model_and_data(config: DictConfig):
         log.info("Compiling LightningModule with torch.compile()...")
         model = torch.compile(model)
     return model, data_module
+
 
 def reload_model_from_config_and_ckpt(
     config: DictConfig,
@@ -454,7 +457,9 @@ def load_state_dict_and_analyze_weight_changes(
         output_str.append("No layers were unchanged")
 
     if unloaded_keys:
-        output_str.append(f"\nUnloaded keys (layers in the state dict but not in the model; {len(unloaded_keys)} total):")
+        output_str.append(
+            f"\nUnloaded keys (layers in the state dict but not in the model; {len(unloaded_keys)} total):"
+        )
         output_str.extend(unloaded_keys[:num_examples])
         remaining = len(unloaded_keys) - 2 * num_examples
         if remaining > 0:

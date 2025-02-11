@@ -16,7 +16,7 @@ model:
   upsample_condition_by: 2   # Is this the right choice to fix issue of differing spatial resolutions of inputs vs targets?
 
 diffusion:
-  loss_function: "mse"   # todo: use latitude-weighted MSE when saving latitude area weights
+  loss_function: "wmse"
 
 logger:
   wandb:

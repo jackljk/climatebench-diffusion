@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import inspect
 from abc import abstractmethod
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Optional
 
+import torch
+
+from src.interface import NoTorchModuleWrapper
 from src.models._base_model import BaseModel
+from src.utilities.checkpointing import reload_checkpoint_from_wandb
+from src.utilities.utils import freeze_model
 
 
 class BaseDiffusion(BaseModel):
@@ -15,6 +21,9 @@ class BaseDiffusion(BaseModel):
         sigma_data: float = None,  # = 0.5,              # Expected standard deviation of the training data.
         sampling_timesteps: int = None,
         sampling_schedule=None,
+        guidance: float = 1,  # Guidance strength for the sampling loop. Default: 1 (no guidance).
+        guidance_run_id: str = None,  # Run ID for the guidance model.
+        guidance_ckpt_filename: str = "latest",  # Checkpoint filename for the guidance model.
         **kwargs,
     ):
         signature = inspect.signature(BaseModel.__init__).parameters
@@ -30,6 +39,7 @@ class BaseDiffusion(BaseModel):
         self.save_hyperparameters(ignore=["model"])
         # self.sampling_timesteps = default(sampling_timesteps, timesteps)
         self.model = model
+        self._guidance_model = None
 
         self.spatial_shape_in = model.spatial_shape_in
         self.spatial_shape_out = model.spatial_shape_out
@@ -41,6 +51,22 @@ class BaseDiffusion(BaseModel):
         # if hasattr(model, 'example_input_array'):
         #     self.example_input_array = model.example_input_array
         self.model.criterion = None
+
+        if guidance != 1:
+            assert guidance_run_id is not None, "Guidance model run ID must be provided."
+            if guidance_run_id == "self":
+                pass
+                # self._guidance_model = self
+            else:
+                guidance_model = reload_checkpoint_from_wandb(
+                    run_id=guidance_run_id,
+                    local_checkpoint_path=True,
+                    ckpt_filename=guidance_ckpt_filename,
+                    also_datamodule=False,
+                    print_name="Guidance model",
+                )["model"]
+                self._guidance_model = NoTorchModuleWrapper(guidance_model.cpu())
+                freeze_model(self.guidance_model)
 
     @property
     def short_description(self) -> str:
@@ -61,6 +87,12 @@ class BaseDiffusion(BaseModel):
             if hasattr(v, "sigma_data"):
                 v.sigma_data = value
 
+    @property
+    def guidance_model(self) -> Optional[torch.nn.Module]:
+        if self._guidance_model is None:
+            return None
+        return self._guidance_model.module  # unwrap the NoTorchModuleWrapper
+
     def sample(self, condition=None, num_samples=1, **kwargs):
         # sample from the model
         raise NotImplementedError()
@@ -76,7 +108,27 @@ class BaseDiffusion(BaseModel):
             inital_condition = inputs
 
         _ = kwargs.pop("lookback", None)  # remove the lookback argument
-        return self.sample(inital_condition, **kwargs)
+        return self.sample_maybe_guided(inital_condition, **kwargs)
+
+    def sample_maybe_guided(self, *args, **kwargs):
+        if self.guidance_model is not None:
+            self.guidance_model.to(self.device)
+            with self.guidance_model.ema_scope(condition=True):  # , context=f"Guidance EMA"):
+                y = self.sample(*args, **kwargs)
+            self.guidance_model.cpu()
+        else:
+            y = self.sample(*args, **kwargs)
+        return y
+
+    @contextmanager
+    def guidance_scope(self, ema_condition=True):
+        if self.guidance_model is not None:
+            self.guidance_model.to(self.device)
+            with self.guidance_model.ema_scope(condition=ema_condition):
+                yield
+            self.guidance_model.cpu()
+        else:
+            yield
 
     @abstractmethod
     def p_losses(self, *args, **kwargs):

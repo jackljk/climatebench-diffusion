@@ -1,4 +1,4 @@
-""" Slightly adapted from Zihao Zhou"""
+"""Slightly adapted from Zihao Zhou"""
 
 import fnmatch
 import glob
@@ -11,7 +11,6 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from src.utilities.utils import get_logger
-
 
 log = get_logger(__name__)
 
@@ -55,7 +54,7 @@ def get_local_files(s3_path, local_path):
         prefix = s3_path[:wildcard_index]
         if "/" in prefix:
             prefix = os.path.dirname(prefix)
-            pattern = s3_path[len(prefix) + 1 :]
+            pattern = s3_path[len(prefix) + 1:]
         else:
             prefix = "."
             pattern = s3_path
@@ -89,9 +88,9 @@ def get_s3_objects(s3_path):
         prefix = s3_path[:wildcard_index]
         if prefix.endswith("/"):
             prefix = prefix[:-1]
-            pattern = s3_path[len(prefix) + 1 :]
+            pattern = s3_path[len(prefix) + 1:]
         else:
-            pattern = s3_path[len(prefix) :]
+            pattern = s3_path[len(prefix):]
 
     paginator = s3_client.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=prefix)
@@ -101,7 +100,7 @@ def get_s3_objects(s3_path):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if pattern:  # only apply fnmatch if there's a pattern to match
-                if fnmatch.fnmatch(key[len(prefix) :], pattern):
+                if fnmatch.fnmatch(key[len(prefix):], pattern):
                     filtered_s3_objects.append(key)
             else:
                 filtered_s3_objects.append(key)
@@ -122,6 +121,14 @@ def download_s3_objects(s3_objects, local_path="./"):
             os.makedirs(local_file_dir)
 
         download_s3_object(s3_key, local_file_path)
+
+
+def exists_s3_object(s3_file_path):
+    try:
+        s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_file_path)
+        return True
+    except ClientError:
+        return False
 
 
 def download_s3_object(s3_file_path, local_file_path: str, throw_error: bool = True):
@@ -232,12 +239,14 @@ def remove_s3_path(s3_path):
     remove_s3_objects(s3_objects)
 
 
-def upload_s3_object(local_file_path, s3_file_path, retry=3, **kwargs):
+def upload_s3_object(local_file_path, s3_file_path, force_upload: bool = True, retry=3, **kwargs):
     """
     Upload a single local file to S3.
     Args:
         local_file_path: The path to the local file.
         s3_file_path: The path to the S3 file. If it ends with a "/", the local file will be uploaded with the same name to that directory.
+        force_upload: Whether to upload the file even if it already exists in S3.
+        retry: The number of times to retry the upload.
     """
     assert os.path.isfile(local_file_path), f"{local_file_path} is not a file"
     if s3_file_path.endswith("/"):
@@ -247,14 +256,17 @@ def upload_s3_object(local_file_path, s3_file_path, retry=3, **kwargs):
         local_file_ext = os.path.splitext(local_file_path)[1]
         s3_file_ext = os.path.splitext(s3_file_path)[1]
         assert (
-            local_file_ext == s3_file_ext
+                local_file_ext == s3_file_ext
         ), f"File extensions do not match: {local_file_ext} != {s3_file_ext}. If you intended s3_filepath to be a directory, append a '/' to the end of it."
 
+    if not force_upload and exists_s3_object(s3_file_path):
+        log.info(f"Skipping {local_file_path} as it already exists in S3")
+        return False
     for i in range(retry):
         try:
             s3_client.upload_file(local_file_path, S3_BUCKET_NAME, s3_file_path, **kwargs)
             log.info(f"Uploaded {local_file_path} to {s3_file_path}")
-            break
+            return True
         except Exception as e:
             log.warning(
                 f"Failed to upload {local_file_path} with S3_BUCKET_NAME={S3_BUCKET_NAME} and s3_file_path={s3_file_path}: {e}"
@@ -263,7 +275,7 @@ def upload_s3_object(local_file_path, s3_file_path, retry=3, **kwargs):
             time.sleep(5)
             if i == retry - 1:
                 raise e
-
+    return False
 
 def upload_s3_objects(local_files, local_path="./", s3_path=""):
     """

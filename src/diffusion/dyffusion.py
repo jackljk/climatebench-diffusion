@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from src.diffusion._base_diffusion import BaseDiffusion
 from src.experiment_types.interpolation import InterpolationExperiment
 from src.utilities.checkpointing import get_checkpoint_from_path_or_wandb
+from src.utilities.random_control import controlled_rng
 from src.utilities.utils import freeze_model, raise_error_if_invalid_value
 
 
@@ -40,7 +41,7 @@ class BaseDYffusion(BaseDiffusion):
         interpolator_use_ema: bool = False,
         enable_predict_last_dropout: bool = False,
         log_every_t: Union[str, int] = None,
-        use_same_dropout_state_for_sampling: bool = False,
+        use_same_dropout_state_for_sampling: str = "random",  # or "fixed_global" or "fixed_per_iter"
         reconstruction2_detach_x_last=None,
         hack_for_imprecise_interpolation: bool = False,
         *args,
@@ -202,7 +203,12 @@ class BaseDYffusion(BaseDiffusion):
 
         return i_n
 
-    def q_sample(
+    def q_sample(self, *args, random_mode: str = "random", iteration: int = 0, **kwargs):
+        random_mode = "random" if random_mode is False else random_mode  # legacy support
+        with controlled_rng(random_mode, iteration=iteration):
+            return self._q_sample(*args, **kwargs)
+
+    def _q_sample(
         self,
         x0,
         x_end,
@@ -210,7 +216,6 @@ class BaseDYffusion(BaseDiffusion):
         interpolation_time: Optional[Tensor] = None,
         batch_mask: Optional[Tensor] = None,
         is_artificial_step: bool = True,
-        rng_state=None,
         **kwargs,
     ) -> Tensor:
         # q_sample = using model in interpolation mode
@@ -254,12 +259,7 @@ class BaseDYffusion(BaseDiffusion):
                 if self.hparams.interpolator_use_ema:
                     stack.enter_context(ipol.ema_scope(condition=True))
 
-            if rng_state is not None:  # temporarily switch the rng state
-                old_rng_state = torch.get_rng_state()
-                torch.set_rng_state(rng_state)
             x_ti = self._interpolate(initial_condition=x_end, x_last=x0, t=t, **kwargs)
-            if rng_state is not None:
-                torch.set_rng_state(old_rng_state)
         return x_ti
 
     @abstractmethod
@@ -572,7 +572,7 @@ class BaseDYffusion(BaseDiffusion):
             )
             progress_bar = tqdm(s_and_snext, desc=desc, total=len(sampling_schedule), leave=False)
             x_s = initial_condition
-            for s, s_next, s_nnext in progress_bar:
+            for sampling_step, (s, s_next, s_nnext) in enumerate(progress_bar):
                 is_first_step = s == 0
                 is_last_step = s == self.num_timesteps - 1
 
@@ -596,7 +596,8 @@ class BaseDYffusion(BaseDiffusion):
                     x_end=initial_condition,
                     is_artificial_step=not is_dynamics_pred,
                     num_predictions=num_predictions if is_first_step else 1,
-                    rng_state=torch.get_rng_state() if self.hparams.use_same_dropout_state_for_sampling else None,
+                    random_mode=self.hparams.use_same_dropout_state_for_sampling,
+                    iteration=sampling_step,
                 )
                 if s_next <= self.num_timesteps - 1:
                     # D(x_s, s-1)
@@ -681,6 +682,8 @@ class BaseDYffusion(BaseDiffusion):
             # Use last prediction of x0 for final prediction of intermediate steps (not the last timestep!)
             q_sample_kwargs["x0"] = xhat_th
             q_sample_kwargs["is_artificial_step"] = False
+            q_sample_kwargs["random_mode"] = "fixed_global"  #  use the same dropout mask for all steps
+            _ = q_sample_kwargs.pop("iteration", None)
             dynamical_steps = self.hparams.prediction_timesteps or list(self.dynamical_steps.values())
             dynamical_steps = [i for i in dynamical_steps if i < self.num_timesteps]
             for i_n in dynamical_steps:
@@ -846,7 +849,7 @@ class DYffusion(BaseDYffusion):
         t_nonzero = t > 0
         if t_nonzero.any():
             # sample one interpolation prediction
-            x_interpolated = self.q_sample(
+            x_interpolated = self._q_sample(
                 x_end=input_dynamics,
                 x0=xt_last,
                 t=t,
@@ -871,7 +874,7 @@ class DYffusion(BaseDYffusion):
             # x_last_denoised2 = self.predict_x_last(condition=condition, x_t=condition, t=torch.zeros_like(t))
             # simulate the diffusion process for a single step, where the x_last=forward_pred(condition, t) prediction
             # is used to get the interpolated x_t+1 = interpolate(condition, x_last, t+1)
-            x_interpolated2 = self.q_sample(
+            x_interpolated2 = self._q_sample(
                 x_end=input_dynamics,
                 x0=xt_last_pred.detach() if self.hparams.reconstruction2_detach_x_last else xt_last_pred,
                 t=t2,

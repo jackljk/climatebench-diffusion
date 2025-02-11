@@ -334,6 +334,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         experiment_type: str = None,
         device: torch.device = None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, OneStepAggregator]:
         aggr_kwargs = dict(is_ensemble=is_ensemble)
         one_step_kwargs = {

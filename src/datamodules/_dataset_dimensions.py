@@ -56,17 +56,23 @@ def get_dims_of_dataset(datamodule_config: DictConfig):
 
     elif "kolmogorov" in target:
         # Get the dimensions from the filename
-        if "inits" in datamodule_config.filename:
-            # e.g. "kolmogorov-N256-n_inits32-T1000.nc"
-            _, dim_x, n_trajs, n_timesteps = datamodule_config.filename.strip(".nc").split("-")
+        filename = datamodule_config.filename
+        if "inits" in filename:
+            # e.g. "kolmogorov-N256-n_inits32-T1000.nc" or "kolmogorov-N256-n_inits32-T1000_downsampled4.nc"
+            filename_with_info = filename.strip(".nc").rsplit('_', 1)[0]
+            _, dim_x, n_trajs, n_timesteps = filename_with_info.split("-")
             dim_x = dim_y = int(dim_x.strip("N"))
             n_trajs = int(n_trajs.strip("n_inits"))
             n_timesteps = int(n_timesteps.strip("T"))
         else:
             # e.g. "kolmogorov-32-250-256-256.nc"
-            n_trajs, n_timesteps, dim_x, dim_y = datamodule_config.filename.strip(".nc").split("-")[1:]
+            n_trajs, n_timesteps, dim_x, dim_y = filename.strip(".nc").split("-")[1:]
 
-        down_factor = datamodule_config.get("spatial_downsampling_factor", 1)
+        if "downsampled" in filename:
+            assert datamodule_config.get("spatial_downsampling_factor", 1) == 1
+            down_factor = int(filename.split("downsampled")[-1][0])
+        else:
+            down_factor = datamodule_config.get("spatial_downsampling_factor", 1)
         spatial_dims = (int(dim_x) // down_factor, int(dim_y) // down_factor)
         n_channels = len(datamodule_config.channels)
         input_dim, output_dim = n_channels, n_channels

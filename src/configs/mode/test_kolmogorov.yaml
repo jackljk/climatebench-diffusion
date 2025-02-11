@@ -24,7 +24,7 @@ logger:
     save_last_ckpt: False
 
 # Checkpoint path to be loaded from wandb cloud (see files tab of run page) or locally (use absolute path)
-# ckpt_path: "best-val_16ens_mems_avg_crps.ckpt"
+# ckpt_path: "best-val_avg_crps.ckpt"
 # ckpt_path: "best.ckpt"
 ckpt_path: "last.ckpt"
 

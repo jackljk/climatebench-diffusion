@@ -51,7 +51,10 @@ def load_stepper(
         pass  # wandb is not being used
     elif "wandb" in checkpoint.keys():
         # wandb.run.group = checkpoint['wandb']['group']: NOT POSSIBLE
-        wandb.run._run_obj.run_group = checkpoint["wandb"]["group"]
+        try:
+            wandb.run._run_obj.run_group = checkpoint["wandb"]["group"]  # older version of wandb
+        except AttributeError:
+            pass
         wandb.run.name = checkpoint["wandb"]["name"] + f"-{epoch}epoch"
         run_current = wandb.Api().run(wandb.run.path)
         run_current.group = checkpoint["wandb"]["group"]

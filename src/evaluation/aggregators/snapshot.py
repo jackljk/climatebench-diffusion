@@ -52,11 +52,10 @@ class SnapshotAggregator:
         target_data_norm: Mapping[str, torch.Tensor],
         gen_data_norm: Mapping[str, torch.Tensor],
         metadata: Mapping[str, Any] = None,
-        loss=None,
         i_time_start: int = 0,
     ):
-        data_steps = target_data_norm[list(target_data_norm.keys())[0]].shape[1]
         if self.target_time is not None:
+            data_steps = target_data_norm[list(target_data_norm.keys())[0]].shape[1]
             diff = self.target_time - i_time_start
             # target time needs to be in the batch (between i_time_start and i_time_start + data_steps)
             if diff < 0 or diff >= data_steps:
@@ -87,15 +86,18 @@ class SnapshotAggregator:
             epoch: Current epoch number.
         """
         if self.every_nth_epoch > 1 and epoch >= 3 and epoch % self.every_nth_epoch != 0:
-            return {}
+            return None
         if self.target_time_in_batch is None and self.target_time is not None:
-            return {}  # skip this batch, since it doesn't contain the target time
+            return None  # skip this batch, since it doesn't contain the target time
+
         image_logs = {}
         max_snapshots = 2  # 3
-        names = self.var_names if self.var_names is not None else self._gen_data_norm.keys()
+        names = self.var_names
+        if names is None:
+            names = list(self._gen_data_norm.keys()) if isinstance(self._gen_data_norm, dict) else [None]
         for name in names:
-            name_label = name
-            if "normed" in name:
+            name_label = f"/{name}" if name is not None else ""
+            if name is not None and "normed" in name:
                 gen_data = self._gen_data_norm
                 target_data = self._target_data_norm
                 name = name.replace("_normed", "")
@@ -103,11 +105,14 @@ class SnapshotAggregator:
                 gen_data = self._gen_data
                 target_data = self._target_data
 
-            if self.is_ensemble:
-                snapshots_pred = gen_data[name][:max_snapshots, 0]
-            else:
-                snapshots_pred = gen_data[name][0].unsqueeze(0)
-            target_for_image = target_data[name][0]  # first sample in batch
+            # Take the first sample in batch
+            snapshots_pred = gen_data[name] if name is not None else gen_data
+            snapshots_pred = snapshots_pred[:max_snapshots, 0] if self.is_ensemble else snapshots_pred[0].unsqueeze(0)
+            target_for_image = target_data[name][0] if name is not None else target_data[0]
+            if name is None:
+                assert snapshots_pred.shape[1] == 1, f"{snapshots_pred.shape=} but expected 1 variable only."
+                snapshots_pred = snapshots_pred.squeeze(1)
+                target_for_image = target_for_image.squeeze(0)
             target_datetime = self._metadata["datetime"][0] if "datetime" in self._metadata else None
             input_for_image = None
             # Select target time
@@ -160,12 +165,9 @@ class SnapshotAggregator:
             fig_error.colorbar(pcm_err, ax=ax_error, **cbar_kwargs)
             # Add a main title to the figure which is the target time
             y = 0.8  # 0.9, 0.95 are way too high
-            fig_full_field.suptitle(f"Target time: {target_datetime}", y=y)
-            fig_error.suptitle(f"Target time: {target_datetime}", y=y)
-            # Set titles
-            # fig_full_field.suptitle(f"{name_label} full field; (left) generated and (right) target.", y=title_y)
-            # fig_error.suptitle(f"{name_label} error (generated - target).", y=title_y)
-            # fig_error.suptitle("generated - target", y=title_y)
+            if target_datetime is not None:
+                fig_full_field.suptitle(f"Target time: {target_datetime}", y=y)
+                fig_error.suptitle(f"Target time: {target_datetime}", y=y)
             # Disable ticks
             for ax in ax_full_field:
                 ax.axis("off")
@@ -174,8 +176,8 @@ class SnapshotAggregator:
 
             # fig_full_field.tight_layout()
             # fig_error.tight_layout()
-            image_logs[f"image-full-field/{name_label}"] = fig_full_field
-            image_logs[f"image-error/{name_label}"] = fig_error
+            image_logs[f"image-full-field{name_label}"] = fig_full_field
+            image_logs[f"image-error{name_label}"] = fig_error
 
             # small_gap = torch.zeros((target_for_image.shape[-2], 2)).to(snapshots_pred.device, dtype=torch.float)
             # gap = torch.zeros((target_for_image.shape[-2], 4)).to(
@@ -211,5 +213,5 @@ class SnapshotAggregator:
             #     image_logs[f"image-{key}/{name}"] = wandb_image
 
         label = label + "/" if label else ""
-        image_logs = {f"{label}{key}": image_logs[key] for key in image_logs}
-        return image_logs
+        image_logs = {f"{label}{key}": image_logs[key] for key in image_logs}  # todo: use datetime as key?
+        return {}, image_logs, {}

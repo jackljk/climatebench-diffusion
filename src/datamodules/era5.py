@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.evaluation.aggregators.main import ListAggregator, OneStepAggregator
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.normalization import get_normalizer
 from src.utilities.packer import Packer
@@ -105,8 +106,11 @@ class ERA5DataModuleBase(BaseDataModule):
         dask_cache_size: str = "10GB",
         lat_lon_format: str = "lon_lat",
         text_type: str = "tf-idf",  # can be tf-idf, bert, bow
+        log_metrics: bool = True,
         log_images: bool = True,
+        log_spectra: bool = False,
         every_nth_epoch_snapshot: int = 8,
+        max_val_samples: int = None,
         **kwargs,
     ):
         """
@@ -150,6 +154,9 @@ class ERA5DataModuleBase(BaseDataModule):
             lat_lon_format:
             num_dask_workers:
             text_type: Which type of text embeddings to use. Can be "tf-idf", "bert", or "bow"
+            log_metrics: Whether to log metrics (e.g. RMSE, CRPS, etc.)
+            log_images: Whether to log images (e.g. global predictions, targets, bias)
+            log_spectra: Whether to log power spectra. If "targets", logs the target spectra. If true, logs predictions spectra.
             **kwargs:
 
         Note:
@@ -187,6 +194,10 @@ class ERA5DataModuleBase(BaseDataModule):
             log.info(f"Registering Dask cache with size: {dask_cache_size}")
             cache = dask_Cache(dask_cache_size)  # dask_Cache(1e10)  # 10gb cache
             cache.register()
+
+        if self.hparams.log_spectra == "targets":
+            # Don't log metrics/images when only wanting to log target spectra
+            self.hparams.log_metrics = self.hparams.log_images = False
 
         # Set the temporal slices for the train, val, and test sets
         data_slices = dict(train=train_slice, val=val_slice, test=test_slice, predict=predict_slice)
@@ -502,7 +513,7 @@ class ERA5DataModuleBase(BaseDataModule):
         if stage in ["fit", "validate", None]:
             ds_splits["train"] = self.get_split_dataset("fit", self.train_slice)
             val_kwargs = dict(split="validate", time_slice=self.val_slice, subsample=self.hparams.subsample_valid)
-            ds_splits["val"] = [self.get_split_dataset(**val_kwargs)]
+            ds_splits["val"] = [self.get_split_dataset(**val_kwargs, max_num_samples=self.hparams.max_val_samples)]
             if self.get_horizon("val", dataloader_idx=1) is not None:
                 log.info(f"Using long inference horizon={self.get_horizon('val', dataloader_idx=1)} for validation")
                 ds_splits["val"] += [self.get_split_dataset(**val_kwargs, max_num_samples=8, dataloader_idx=1)]
@@ -534,6 +545,7 @@ class ERA5DataModuleBase(BaseDataModule):
         experiment_type: str = None,
         device: torch.device = None,
         verbose: bool = True,
+        save_to_path: str = None,
     ) -> Dict[str, OneStepAggregator]:
         assert dataloader_idx in [0, 1], f"Invalid dataloader_idx: {dataloader_idx}"
         split_ds = getattr(self, f"_data_{split}")
@@ -551,6 +563,7 @@ class ERA5DataModuleBase(BaseDataModule):
         aggregators_all = defaultdict(list)
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
+        aggr_kwargs["coords"] = {"latitude": self._latitude, "longitude": self._longitude}
         record_normed = True if split_horizon <= 80 else False  # save logging space for huge horizons
         record_abs_values = True if split_horizon <= 80 else False
         record_rmse = True
@@ -567,34 +580,39 @@ class ERA5DataModuleBase(BaseDataModule):
         for mask, mask_name in zip(masks, mask_names):
             aggr_kwargs["mask"] = mask
 
+            snapshot_horizons_hours = [1 * hourly_res, 24, 5 * 24, 10 * 24, split_horizon * hourly_res]
             if not self.hparams.log_images:
                 use_snapshot_aggregator = False
-                snapshot_horizons_hours = []
             elif split == "val" and dataloader_idx == 1:
                 assert len(self._data_val) > 1, "Full rollout is only supported for inference"
                 # Save some example snapshots from the full rollout
                 use_snapshot_aggregator = True if mask is None else False
-                if split_horizon <= 80:
-                    snapshot_horizons_hours = [1 * hourly_res, 24, 5 * 24, 10 * 24]
-                else:
-                    snapshot_horizons_hours = [(split_horizon // 2) * hourly_res, split_horizon * hourly_res]
-
             else:
                 use_snapshot_aggregator = mask is None
-                snapshot_horizons_hours = [1 * hourly_res, 24, hourly_res * split_horizon]
+            spectra_horizons_hours = snapshot_horizons_hours + [12, 3 * 24, 7 * 24, 14 * 24]
 
             # name=f"t{h * hourly_res}" is used for logging the appropriate lead time regardless of the hourly_res or
             # temporal resolution/subsampling of the dataset
             snapshot_var_names = ["temperature_850", "2m_temperature", "10m_u_component_of_wind"]
             # snapshot_var_names += ["10m_v_component_of_wind", "mean_sea_level_pressure"]
             snapshot_var_names = [f"{vr}_normed" for vr in snapshot_var_names] + ["geopotential_500"]
+            spectra_names = ["2m_temperature", "10m_u_component_of_wind", "mean_sea_level_pressure"]
+            spectra_levels = [100, 500, 700, 850, 1000]
+            spectra_names += [f"temperature_{lev}" for lev in spectra_levels]
+            spectra_names += [f"geopotential_{lev}" for lev in spectra_levels]
+            spectra_names += [f"u_component_of_wind_{lev}" for lev in spectra_levels]
+            spectra_names += [f"v_component_of_wind_{lev}" for lev in spectra_levels]
+            spectra_names += [f"specific_humidity_{lev}" for lev in spectra_levels]
+
             for h in horizon_range:
                 h_to_hours = h * hourly_res
+                record_spectra = self.hparams.log_spectra if h_to_hours in spectra_horizons_hours else False
                 aggregators_all[f"t{h}"].append(
                     OneStepAggregator(
                         use_snapshot_aggregator=use_snapshot_aggregator and h_to_hours in snapshot_horizons_hours,
                         name=f"{mask_name}t{h_to_hours}",
                         verbose=verbose and (h == 1),
+                        record_metrics=self.hparams.log_metrics,
                         record_normed=record_normed,
                         record_rmse=record_rmse,
                         record_abs_values=record_abs_values,
@@ -602,13 +620,26 @@ class ERA5DataModuleBase(BaseDataModule):
                         # Preprocess the snapshots to flip latitudes and bring lats before lons for proper plotting
                         snapshots_preprocess_fn=lambda x: np.moveaxis(np.flip(x, axis=-1), -1, -2),
                         every_nth_epoch_snapshot=self.hparams.every_nth_epoch_snapshot,
+                        record_spectra=record_spectra,
+                        spectra_var_names=spectra_names,
                         **aggr_kwargs,
                     )
                 )
 
         # Make it into list aggregators, so that it is easy to call the record_batch method
         for k, v in aggregators_all.items():
-            aggregators_all[k] = ListAggregator(v, verbose=False)
+            name = f"t{int(k[1:]) * hourly_res}" if k.startswith("t") else None
+            aggregators_all[k] = ListAggregator(v, verbose=False, name=name)
+
+        if save_to_path is not None:
+            # Specify ++module.save_predictions_filename="xarray" to save the predictions in xarray format
+            aggregators_all["save_to_disk"] = SaveToDiskAggregator(
+                is_ensemble=is_ensemble,
+                coords=aggr_kwargs["coords"],
+                concat_dim_name="lead_time",
+                batch_dim_name="datetime",
+                save_to_path=save_to_path,
+            )
 
         return aggregators_all
 
@@ -695,17 +726,19 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
     ):
         self.dataset = dataset
         self.max_num_samples = max_num_samples
-        self.possible_initial_times = [int(h) for h in possible_initial_times] if possible_initial_times is not None else None
+        self.possible_initial_times = (
+            [int(h) for h in possible_initial_times] if possible_initial_times is not None else None
+        )
         all_times = self.dataset.time.values[:-horizon]  # keep only times for which we can predict horizon hours ahead
         ds_idxs = np.arange(len(all_times), dtype=int)
         if self.possible_initial_times is not None:
-            all_hours = all_times.astype('datetime64[h]').astype(int) % 24
-            # Create a mask for hours we want to keep
+            all_hours = all_times.astype("datetime64[h]").astype(int) % 24
+            # Create a mask for hours we want to keep as possible initial times
             valid_hours = np.isin(all_hours, self.possible_initial_times)
             ds_idxs = ds_idxs[valid_hours]
 
         if max_num_samples is not None:
-            ds_idxs = ds_idxs[:max_num_samples * subsample:subsample]
+            ds_idxs = ds_idxs[: max_num_samples * subsample : subsample]
         else:
             ds_idxs = ds_idxs[::subsample]
 
@@ -926,7 +959,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
             if self.subsample > 1 and "val" in self.dataset_id:
                 # log.info(f"Subsampling the dataset by a factor of {self.subsample}")
                 # Print the 1,2,-2,-1 date indices to check if the subsampling is correct
-                dates = [self.__get_date__(i) for i in [0, 1, 2, 3, -3, -2, -1]]  # todo: Better printing and summmary
+                dates = [self.__get_date__(i) for i in [0, 1, 2, 3, -3, -2, -1] if i < self.__len__()]
                 # dates = [self.__get_date__(i) for i in range(self.__len__())]
                 # Dates are np.datetime64 objects, let's print only year, month, day, hour
                 dates = [str(d) for d in dates]  #
@@ -1108,7 +1141,11 @@ class ERA5Dataset2D(ERA5DatasetBase):
         return var_to_ds
 
     def __get_date__(self, idx):
-        batch = self.bgen[int(self.ds_idxs[idx])].load()
+        try:
+            bgen_idx = int(self.ds_idxs[idx])
+        except IndexError:
+            return None
+        batch = self.bgen[bgen_idx].load()
         batch_start_time = batch.coords["time"].values[0]
         return batch_start_time  # .astype("datetime64[D]")
 
@@ -1169,6 +1206,8 @@ class ERA5Dataset2D(ERA5DatasetBase):
                 )
 
             arrays["dynamics"] = dynamics
+            if self.dataset_id not in ["train", "fit"]:
+                arrays["metadata"] = dict(datetime=float(batch_start_time.astype("datetime64[s]").astype("int64")))
 
             if self.text_dataset is not None:
                 date = batch_start_time.astype("datetime64[D]")

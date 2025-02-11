@@ -9,11 +9,12 @@ defaults:
 name: "NavierStokes"
 
 datamodule:
-  batch_size: 32
+  batch_size: 64
   eval_batch_size: 8     # effectively eval_batch_size *= number of predictions ($module.num_predictions; default=20)
   horizon: 16
   prediction_horizon: 64
   window: 1
+  multi_horizon: True
 
 model:
   dropout: 0.15
@@ -27,12 +28,12 @@ trainer:
   max_epochs: 200
   gradient_clip_val: 0.5
   deterministic: False      # upsampling is used but not deterministic
-  accumulate_grad_batches: 2
 
 callbacks:
   early_stopping: null
 
 logger:
   wandb:
+    entity: "nrajadhyaksha-ucsd"
     project: "DYffusion-navier-stokes"
-    tags: ["navier-stokes", "fixed-bc"]
+    tags: ["navier-stokes"]

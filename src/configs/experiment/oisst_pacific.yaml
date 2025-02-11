@@ -8,7 +8,7 @@ defaults:
 name: "OISSTv2PacificSubset"
 
 datamodule:
-  batch_size: 64
+  batch_size: 128
   eval_batch_size: 6   # effectively eval_batch_size *= number of predictions ($module.num_predictions; default=20)
   horizon: 7
   prediction_horizon: 7
@@ -27,7 +27,6 @@ module:
 trainer:
   max_epochs: 50
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 4
 
 early_stopping:
   patience: 10

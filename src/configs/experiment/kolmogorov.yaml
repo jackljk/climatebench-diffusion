@@ -24,7 +24,7 @@ module:
     weight_decay: 1e-4
   scheduler:
     max_steps: ${trainer.max_epochs}
-    warmup_steps: 10
+    warmup_epochs: 10
     
 trainer:
   max_epochs: 5000
