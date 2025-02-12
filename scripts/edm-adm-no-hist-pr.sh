@@ -14,6 +14,7 @@ python run.py "$@" \
     datamodule.eval_batch_size=2 \
     datamodule.batch_size_per_gpu=4 \
     datamodule.num_workers=16 \
+    datamodule.output_vars='pr' \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-first-ens" \
     datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard" \
     datamodule.additional_vars=["rsdt"] trainer.num_sanity_val_steps=0 \
