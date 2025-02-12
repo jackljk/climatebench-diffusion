@@ -11,7 +11,7 @@ python run.py "$@" \
     datamodule.data_dir=/data \
     datamodule.window=1 \
     datamodule.batch_size=512 \
-    datamodule.eval_batch_size=3 \
+    datamodule.eval_batch_size=2 \
     datamodule.batch_size_per_gpu=4 \
     datamodule.num_workers=16 \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-first-ens" \
@@ -32,4 +32,4 @@ python run.py "$@" \
     suffix="raw_stdized+rsdt-edm-adm" \
     "$@"
 
-#     datamodule.batch_size=256 is too low
+# numworkers=16 uses about 10 cpus in cluster (upper bound) 
