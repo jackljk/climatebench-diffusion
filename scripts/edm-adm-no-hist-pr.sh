@@ -30,7 +30,7 @@ python run.py "$@" \
     diffusion.loss_function="wmse" diffusion.P_mean=-0.5 diffusion.P_std=1.2 \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="raw_stdized+rsdt-edm-adm" \
+    suffix="raw_stdized+rsdt-edm-adm_rerun" \
     "$@"
 
 # numworkers=16 uses about 10 cpus in cluster (upper bound) 
