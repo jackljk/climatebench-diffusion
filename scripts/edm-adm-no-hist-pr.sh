@@ -12,7 +12,7 @@ python run.py "$@" \
     datamodule.window=1 \
     datamodule.batch_size=512 \
     datamodule.eval_batch_size=2 \
-    datamodule.batch_size_per_gpu=4 \
+    datamodule.batch_size_per_gpu=3 \
     datamodule.num_workers=16 \
     datamodule.output_vars='pr' \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-first-ens" \
@@ -30,7 +30,7 @@ python run.py "$@" \
     diffusion.loss_function="wmse" diffusion.P_mean=-0.5 diffusion.P_std=1.2 \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="raw_stdized+rsdt-edm-adm_rerun" \
+    suffix="raw_stdized+rsdt-edm-adm" \
     "$@"
 
 # numworkers=16 uses about 10 cpus in cluster (upper bound) 
