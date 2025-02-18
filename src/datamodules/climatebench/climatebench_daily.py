@@ -363,7 +363,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
 
         aggregator = OneStepAggregator(
             record_rmse=True,
-            use_snapshot_aggregator=True,
+            use_snapshot_aggregator=False, # temo disable snapshot aggregator
             record_normed=self.hparams.normalization_type is not None,
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
             snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization

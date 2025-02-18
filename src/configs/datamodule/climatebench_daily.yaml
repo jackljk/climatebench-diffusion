@@ -19,7 +19,7 @@ num_ensemble_members: 2 # Number of ensemble members to use ('all' to use all av
 
 # Simulations Anormalization Parameters - raw datasets should be set as "ssp126_outputs_daily_raw.nc" etc
 simulations_raw: null # Set to null if all simulations are already normalized ie "ssp126_outputs_daily.nc"
-simulations_anom_type: 'piControl' # 'standard' or 'minmax' or 'piControl'
+simulations_anom_type: 'none' # 'standard' or 'minmax' or 'piControl'
 normalization_type: null   # How to preprocess the targets, e.g. 'standard'
 
 # Debugging parameters

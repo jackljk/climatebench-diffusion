@@ -5,7 +5,6 @@ defaults:
   - override /trainer: default.yaml
 
 
-
 # Override data dir for local runs here!
 # datamodule:
 #   data_dir: "C:/Users/USER_XYZ/data/"
