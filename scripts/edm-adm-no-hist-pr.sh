@@ -18,7 +18,7 @@ python run.py "$@" \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-first-ens" \
     datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard" \
     datamodule.additional_vars=["rsdt"] trainer.num_sanity_val_steps=0 \
-    module.num_predictions=5 module.prediction_inputs_noise=0.0 \
+    module.num_predictions=3 module.prediction_inputs_noise=0.0 \
     module.enable_inference_dropout=False callbacks.early_stopping=null \
     module.use_ema=True module.ema_decay=0.9999 \
     module.optimizer.lr=4e-4 module.optimizer.weight_decay=0 \
