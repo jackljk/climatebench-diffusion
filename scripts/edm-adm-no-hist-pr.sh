@@ -24,6 +24,7 @@ python run.py "$@" \
     module.optimizer.lr=4e-4 module.optimizer.weight_decay=0 \
     module.conv_padding_mode_global="circular_width_only" \
     scheduler@module.scheduler=linear_warmup_cosine module.scheduler.warmup_epochs=6 trainer.max_epochs=100 \
+    module.monitor='val/crps/pr' \
     trainer.devices=8 \
     model=adm model.loss_function="wmse" \
     model.model_channels=192 model.dropout=0.1 \
