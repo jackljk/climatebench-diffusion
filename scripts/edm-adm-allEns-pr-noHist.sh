@@ -13,7 +13,7 @@ python run.py "$@" \
     datamodule.batch_size=512 \
     datamodule.eval_batch_size=3 \
     datamodule.batch_size_per_gpu=4 \
-    datamodule.num_workers=16 \
+    datamodule.num_workers=32 \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-AllEns-pCW" \
     datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard" \
     datamodule.additional_vars=["rsdt"] trainer.num_sanity_val_steps=0 \
