@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
     get_mean_std_of_variables,
@@ -49,6 +50,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         num_ensemble_members: int | str = "all",
         scale_inputs: str = None,
         DEBUG_dataset_size: int = None,
+        comprehensive_validation=None,
         **kwargs,
     ):
         super().__init__(
@@ -170,8 +172,11 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             if self.hparams.normalization_type == "standard":
                 # Compute the mean and std of the output variables
                 if len(self.output_vars) == 1 and self.output_vars[0] == "tas":
-                    data_mean_act = {'tas': torch.tensor(279.7749)}
-                    data_std_act = {'tas': torch.tensor(29.7625)}
+                    data_mean_act = {"tas": torch.tensor(279.7749)}
+                    data_std_act = {"tas": torch.tensor(29.7625)}
+                elif self.output_vars == ["tas", "pr"]:
+                    data_mean_act = {"tas": torch.tensor(279.7749), "pr": torch.tensor(2.8494e-05)}
+                    data_std_act = {"tas": torch.tensor(29.7625), "pr": torch.tensor(5.3200e-05)}
                 else:
                     log.info("Computing mean and std of the output variables")
                     data_mean = Y_train[sim_val["Y"]].mean()
@@ -198,7 +203,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             set_train = set_val = None
 
         if stage in ["test", "predict", None]:
-            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM])
+            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM], self.hparams.mean_over_ensemble)
             set_test = self._setup_test(X_test, Y_test)
         else:
             set_test = None
@@ -292,6 +297,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
                 window=self.hparams.window,
                 mean_over_mems=self.hparams.mean_over_ensemble,
                 output_var=self.output_vars,
+                comprehensive_validation=self.hparams.comprehensive_validation,
                 additional_vars=ds_vars,
             )
             # Create the pytorch tensor dataset and set to self._data_{split}
@@ -357,19 +363,34 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         split_ds = getattr(self, f"_data_{split}")
         if split == "val" and isinstance(split_ds, list):
             split_ds = split_ds[0]  # just need it for the area weights
+            
 
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
+        aggregators = dict()
 
         aggregator = OneStepAggregator(
             record_rmse=True,
-            use_snapshot_aggregator=False, # temo disable snapshot aggregator
+            use_snapshot_aggregator=True,
             record_normed=self.hparams.normalization_type is not None,
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
             snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
+            temporal_kwargs=self.hparams.comprehensive_validation,
             **aggr_kwargs,
         )
-        aggregators = {"": aggregator}
+        aggregators[""] = aggregator
+        
+        if self.hparams.comprehensive_validation.run and self.hparams.comprehensive_validation.save_to_disk:
+            save_to_disk_aggregator = SaveToDiskAggregator(
+                is_ensemble=is_ensemble,
+                final_dims_of_data=["latitude", "longitude"],
+                save_to_path=save_to_path,
+                max_ensemble_members=None, # save all ensemble members
+            )
+            aggregators["save_to_disk"] = save_to_disk_aggregator
+    
+    
+        
         return aggregators
 
 
@@ -393,7 +414,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         dataset_id: str = "",
         interpolation_type: str = "middle",
         output_var: str = "tas",
-        subsample_val: int = 1,
+        comprehensive_validation: Dict = None,
         additional_vars: Dict[str, xr.DataArray] = None,
     ):
         self.output_var = output_var
@@ -431,7 +452,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         }
 
         # Getting the sizes of the datasets
-        if dataset_id == "val":
+        if dataset_id == "val" and not comprehensive_validation:
             # get only the validation size as the number of years
             self.ssp_sizes = {ssp: self.ds_inputs[ssp].sizes["time"] for ssp in ds_ssps["inputs"]}
             if mean_over_mems == "stack":
@@ -456,11 +477,13 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
 
         # assert the size of the total dataset is equal to the max idx
         assert (
-            self.dataset_size == max(self.ssp_cutoffs.values()) + self.ssp_sizes[ds_ssps["targets"][-1]] * ensemble_size
+            self.dataset_size
+            == max(self.ssp_cutoffs.values()) + self.ssp_sizes[ds_ssps["targets"][-1]] * ensemble_size
         ), "Size mismatch between datasets"
 
         # Class Variables
         self.dataset_id = dataset_id
+        self.comprehensive_validation = comprehensive_validation
         self.start_datetimes = {
             ssp: self.ds_outputs[ssp].time.values[0] for ssp in ds_ssps["targets"]
         }  # cftime.DatetimeNoLeap values
@@ -477,7 +500,8 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         ssp = [ssp for ssp, cutoff in self.ssp_cutoffs.items() if index >= cutoff][-1]
         inputs_ssp = self.ds_inputs[self.handle_ensemble(ssp)]  # handle ensemble naming for input
 
-        if self.dataset_id == "val":
+        if self.dataset_id == "val" and self.comprehensive_validation is None:
+            # Sample a random day from the validation set
             outputs, ssp_index_datetime = self._sample_validation(ssp, index)
         else:
             ssp_index = index - self.ssp_cutoffs[ssp]  #  Infer local SSP idx

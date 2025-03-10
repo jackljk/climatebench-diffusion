@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from contextlib import ExitStack
-from typing import List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import hydra
 import torch
@@ -14,6 +14,7 @@ from src.diffusion._base_diffusion import BaseDiffusion
 from src.experiment_types.interpolation import NextStepInterpolationExperiment
 from src.models._base_model import BaseModel
 from src.utilities.checkpointing import get_checkpoint_from_path_or_wandb
+from src.utilities.random_control import controlled_rng
 from src.utilities.utils import freeze_model, raise_error_if_invalid_value
 
 
@@ -31,6 +32,7 @@ class BaseDYffusion2(BaseDiffusion):
         use_cold_sampling_for_intermediate_steps: bool = False,
         use_cold_sampling_for_last_step: bool = True,
         use_cold_sampling_for_init_of_ar_step: Optional[bool] = None,
+        refine_intermediate_predictions: bool = False,
         time_encoding: str = "discrete",
         refine_predictions: str | bool = False,
         refinement_rounds: int = 0,
@@ -185,7 +187,6 @@ class BaseDYffusion2(BaseDiffusion):
         self,
         prediction_type: str,
         x_th: Optional[Tensor] = None,
-        static_condition: Optional[Tensor] = None,
         shape: Sequence[int] = None,
         concat_dim: int = 1,
     ) -> Tensor:
@@ -205,18 +206,21 @@ class BaseDYffusion2(BaseDiffusion):
         x_ti: Tensor,
         x_th: Tensor,
         time: Tensor,
-        static_condition: Optional[Tensor] = None,
-        num_predictions: int = 1,
+        **kwargs,
     ):
         raise NotImplementedError("_interpolate method must be implemented")
 
-    def q_sample(
+    def q_sample(self, *args, random_mode: str = "random", iteration: int = 0, **kwargs):
+        random_mode = "random" if random_mode is False else random_mode  # legacy support
+        with controlled_rng(random_mode, iteration=iteration):
+            return self._q_sample(*args, **kwargs)
+
+    def _q_sample(
         self,
         x_ti,
         x_th,
         time_of_input: Tensor,
-        rng_state=None,
-        mask: Optional[Tensor] = None,
+        batch_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tensor:
         # q_sample = using model in interpolation mode
@@ -225,13 +229,13 @@ class BaseDYffusion2(BaseDiffusion):
         if not torch.is_tensor(time_of_input):
             time_of_input = torch.full((x_ti.shape[0],), time_of_input, dtype=self.dtype, device=self.device)
         time = self.get_time_encoding_interpolation(time_of_input)
-        if mask is not None:
-            x_ti = x_ti[mask]
-            x_th = x_th[mask]
-            time = time[mask]
+        if batch_mask is not None:
+            x_ti = x_ti[batch_mask]
+            x_th = x_th[batch_mask]
+            time = time[batch_mask]
             for k, v in kwargs.items():
                 if torch.is_tensor(v):
-                    kwargs[k] = v[mask]
+                    kwargs[k] = v[batch_mask]
 
         do_enable = self.training or self.enable_interpolator_dropout in [True, "always"]
 
@@ -242,19 +246,14 @@ class BaseDYffusion2(BaseDiffusion):
             for ipol in ipol_handles:
                 stack.enter_context(ipol.inference_dropout_scope(condition=do_enable))
 
-            if rng_state is not None:  # temporarily switch the rng state
-                old_rng_state = torch.get_rng_state()
-                torch.set_rng_state(rng_state)
             x_ti = self._interpolate(x_ti=x_ti, x_th=x_th, time=time, **kwargs)
-            if rng_state is not None:
-                torch.set_rng_state(old_rng_state)
         return x_ti
 
     def predict_x_last(
         self,
         x_t: Tensor,
         time_of_input: Union[Tensor, float],
-        static_condition: Optional[Tensor] = None,
+        **kwargs,
     ):
         if not torch.is_tensor(time_of_input):
             time_of_input = torch.full((x_t.shape[0],), time_of_input, dtype=self.dtype, device=self.device)
@@ -265,7 +264,6 @@ class BaseDYffusion2(BaseDiffusion):
         # predict_x_last = using model in forward mode to predict for lead time = t \in (0, horizon]
         forward_cond = self.get_condition(
             prediction_type="forward",
-            static_condition=static_condition,
             shape=x_t.shape,
         )
         dropout_condition = self.training
@@ -278,7 +276,7 @@ class BaseDYffusion2(BaseDiffusion):
 
         # enable dropout for prediction of last dynamics
         with self.model.inference_dropout_scope(condition=dropout_condition):
-            x_last_pred = self._predict_last_dynamics(x_t=x_t, forward_condition=forward_cond, t=time_of_input)
+            x_last_pred = self._predict_last_dynamics(x_t=x_t, forward_condition=forward_cond, t=time_of_input, **kwargs)
         return x_last_pred
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
@@ -303,28 +301,28 @@ class BaseDYffusion2(BaseDiffusion):
         return loss.mean()
 
     @abstractmethod
-    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor) -> Tensor:
+    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor, **kwargs) -> Tensor:
         pass
 
     def sample_loop(
         self,
         initial_condition,
-        static_condition: Optional[Tensor] = None,
         log_every_t: Optional[Union[str, int]] = None,
         num_predictions: int = None,
         x0_ref=None,
         verbose=True,
+        **kwargs,
     ):
         # assert num_predictions is None or num_predictions == 1, "num_predictions must not be provided"
         sampling_schedule = self.sampling_schedule
-        sc_kw = dict(static_condition=static_condition)
+
         if len(initial_condition.shape) == 5 and initial_condition.shape[1] == 1:
             initial_condition = initial_condition.squeeze(1)
         else:
             assert len(initial_condition.shape) == 4, f"x_ti.shape: {initial_condition.shape} (should be 4D)"
         intermediates, xhat_th = dict(), None
         last_s_plus_one = sampling_schedule[-1] + 1
-        is_cold_sampling = self.hparams.sampling_type in ["cold"]
+        is_cold_sampling = self.hparams.sampling_type in ["cold", "heun1", "heun2", "heun3"]
         for sampling_round in range(0, self.hparams.refinement_rounds + 1):
             desc = f"Refinement round {sampling_round}" if sampling_round > 0 else "Sampling"
             s_and_snext = zip(
@@ -335,13 +333,13 @@ class BaseDYffusion2(BaseDiffusion):
             progress_bar = tqdm(s_and_snext, desc=desc, total=len(sampling_schedule), leave=False)
             x_s = initial_condition
             x_s_prev = None
-            for s, s_next, s_nnext in progress_bar:
+            for sampling_step, (s, s_next, s_nnext) in enumerate(progress_bar):
                 is_first_step = s == 0
                 is_last_step = s == self.num_timesteps - 1
 
                 if sampling_round == 0 or (self.hparams.refine_predictions == "all" and not is_first_step):
                     # Forecast x_{t+h} using x_{s} as input
-                    xhat_th = self.predict_x_last(x_t=x_s, time_of_input=s, **sc_kw)
+                    xhat_th = self.predict_x_last(x_t=x_s, time_of_input=s, **kwargs)
                 else:
                     xhat_th = intermediates[f"t{self.num_timesteps}_preds"]
 
@@ -349,8 +347,9 @@ class BaseDYffusion2(BaseDiffusion):
                 q_sample_kwargs = dict(
                     x_th=xhat_th,
                     num_predictions=num_predictions if is_first_step else 1,
-                    rng_state=torch.get_rng_state() if self.hparams.use_same_dropout_state_for_sampling else None,
-                    **sc_kw,
+                    random_mode=self.hparams.use_same_dropout_state_for_sampling,
+                    iteration=sampling_step,
+                    **kwargs,
                 )
                 if s_next <= self.num_timesteps - 1:
                     x_interpolated_s_next = self.q_sample(x_ti=x_s, time_of_input=s, **q_sample_kwargs)
@@ -371,7 +370,31 @@ class BaseDYffusion2(BaseDiffusion):
                     x_interpolated_s = self.q_sample(x_ti=x_s_prev, time_of_input=s - 1, **q_sample_kwargs)
                     # for s = 0, we have x_s_degraded = x_s, so we just directly return x_interpolated_s_next
                     x_s_prev = x_s
-                    x_s = x_s - x_interpolated_s + x_interpolated_s_next
+                    d_i1 = x_interpolated_s_next - x_interpolated_s  # x_s - x_interpolated_s
+                    if (
+                        self.hparams.sampling_type == "cold"
+                        or s_nnext > self.num_timesteps - 1
+                        or ("heun" in self.hparams.sampling_type and is_first_step)
+                    ):
+                        x_s = x_s + d_i1  # x_s += x_interpolated_s_next - x_interpolated_s
+                    else:
+                        assert "heun" in self.hparams.sampling_type
+                        # Heun's method
+                        xs_tmp = x_s + d_i1
+                        x0_hat2 = self.predict_x_last(x_t=xs_tmp, time_of_input=s_next, **kwargs)
+                        q_sample_kwargs["x_th"] = x0_hat2
+                        x_interpolated_s_nnext = self.q_sample(x_ti=xs_tmp, time_of_input=s_next, **q_sample_kwargs)
+                        if self.hparams.sampling_type == "heun1":
+                            d_i2 = x_interpolated_s_nnext - xs_tmp  # Seems like the best option
+                        elif self.hparams.sampling_type == "heun2":
+                            x_interpolated_s_next2 = self.q_sample(
+                                x_ti=xs_tmp, time_of_input=s_next, **q_sample_kwargs
+                            )
+                            d_i2 = x_interpolated_s_nnext - x_interpolated_s_next2
+                        elif self.hparams.sampling_type == "heun3":
+                            d_i2 = x_interpolated_s_nnext - x_interpolated_s_next
+                        x_s = x_s + 0.5 * (d_i1 + d_i2)
+
                 else:
                     raise ValueError(f"unknown sampling type {self.hparams.sampling_type}")
 
@@ -381,6 +404,15 @@ class BaseDYffusion2(BaseDiffusion):
                     assert not self.hparams.use_cold_sampling_for_intermediate_steps and not is_last_step
                     preds_t = x_interpolated_s_next
                 intermediates[f"t{s_next}_preds"] = preds_t
+        if self.hparams.refine_intermediate_predictions:
+            # Use last prediction of x0 for final prediction of intermediate steps (not the last timestep!)
+            q_sample_kwargs["x_th"] = xhat_th
+            q_sample_kwargs["random_mode"] = "fixed_global"  #  use the same dropout mask for all steps
+            _ = q_sample_kwargs.pop("iteration", None)
+            x_s_prev = initial_condition
+            for s in range(1, self.num_timesteps):
+                x_interpolated_s = self.q_sample(x_ti=x_s_prev, time_of_input=s - 1, **q_sample_kwargs)
+                intermediates[f"t{s}_preds"] = x_s_prev = x_interpolated_s
 
         if last_s_plus_one < self.num_timesteps:
             return x_s, intermediates
@@ -397,8 +429,11 @@ class DYffusionMarkov(BaseDYffusion2):
         self,
         interpolator: Optional[nn.Module] = None,
         interpolator_run_id: Optional[str] = None,
-        interpolator_local_checkpoint_path: Optional[str] = None,
+        interpolator_local_checkpoint_path: Optional[Union[str, bool]] = True,  # if true, search in local path
         interpolator_wandb_ckpt_filename: Optional[str] = None,
+        interpolator_overrides: Optional[List[str]] = None,  # a dot list, e.g. ["model.hidden_dims=128"]
+        interpolator_wandb_kwargs: Optional[Dict[str, Any]] = None,
+        interpolator_use_ema: bool = False,
         lambda_reconstruction: float = 1.0,
         lambda_reconstruction2: float = 0.0,
         reconstruction2_detach_x_last: bool = False,
@@ -407,11 +442,20 @@ class DYffusionMarkov(BaseDYffusion2):
     ):
         super().__init__(*args, **kwargs)
         self.save_hyperparameters(ignore=["model", "interpolator"])
+        # Load interpolator and its weights
+        interpolator_wandb_kwargs = interpolator_wandb_kwargs or {}
+        interpolator_wandb_kwargs["epoch"] = interpolator_wandb_kwargs.get("epoch", "best")
+        if interpolator_wandb_ckpt_filename is not None:
+            assert interpolator_wandb_kwargs.get("ckpt_filename") is None, "ckpt_filename already set"
+            interpolator_wandb_kwargs["ckpt_filename"] = interpolator_wandb_ckpt_filename
+        interpolator_overrides = list(interpolator_overrides) if interpolator_overrides is not None else []
+        interpolator_overrides.append("model.verbose=False")
         self.interpolator: NextStepInterpolationExperiment = get_checkpoint_from_path_or_wandb(
             interpolator,
-            interpolator_local_checkpoint_path,
+            model_checkpoint_path=interpolator_local_checkpoint_path,
             wandb_run_id=interpolator_run_id,
-            reload_kwargs=dict(epoch="best", ckpt_filename=interpolator_wandb_ckpt_filename),
+            reload_kwargs=interpolator_wandb_kwargs,
+            model_overrides=interpolator_overrides,
         )
         assert isinstance(
             self.interpolator, NextStepInterpolationExperiment
@@ -428,10 +472,10 @@ class DYffusionMarkov(BaseDYffusion2):
         self,
         prediction_type: str,
         x_th: Optional[Tensor] = None,
-        static_condition: Optional[Tensor] = None,
         shape: Sequence[int] = None,
         concat_dim: int = 1,
     ) -> Tensor:
+        cond = None
         if prediction_type == "interpolate":
             raise NotImplementedError("get_condition for interpolation not implemented")
         elif prediction_type == "forward":
@@ -439,12 +483,6 @@ class DYffusionMarkov(BaseDYffusion2):
             cond = None
         else:
             raise ValueError(f"Unknown prediction type {prediction_type}")
-
-        if static_condition is not None:
-            if cond is None:
-                cond = static_condition
-            else:
-                cond = torch.cat([cond, static_condition], dim=concat_dim)
         return cond
 
     def get_time_encoding_interpolation(self, time: Tensor) -> Tensor:
@@ -455,26 +493,27 @@ class DYffusionMarkov(BaseDYffusion2):
         x_ti: Tensor,
         x_th: Tensor,
         time: Tensor,
-        static_condition: Optional[Tensor] = None,
+        num_predictions: int = 1,
         **kwargs,
     ) -> Tensor:
         interpolator_inputs = torch.cat([x_ti, x_th], dim=1)
         with torch.inference_mode():
-            x_ipolated = self.interpolator.predict_packed(
-                interpolator_inputs, time=time, condition=static_condition, **kwargs
-            )
+            with self.interpolator.ema_scope(condition=self.hparams.interpolator_use_ema):
+                x_ipolated = self.interpolator.predict_packed(
+                    interpolator_inputs, time=time, **kwargs
+                )
         return x_ipolated["preds"]
 
-    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor):
+    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor, **kwargs) -> Tensor:
         assert (0 < t).all() and (t <= self.num_timesteps).all(), f"Invalid lead time timestep: {t}"
-        x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition)
+        x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition, **kwargs)
         return x_last_pred
 
     def p_losses(
         self,
         dynamics: Tensor,
-        static_condition: Tensor = None,
         verbose=False,
+        **kwargs
     ):
         B = dynamics.shape[0]
         assert (
@@ -496,11 +535,11 @@ class DYffusionMarkov(BaseDYffusion2):
         # since we do not need to interpolate xt_0, we can skip all batches where t=0
         if t_nonzero_mask.any():
             # Interpolate x_{t} from x_{t-1} and x_{h} for 1 <= t <= h-1
-            xhat_ti = self.q_sample(
+            xhat_ti = self._q_sample(
                 x_ti=dynamics[t_nonzero_mask, t_abs_nonzero - 1, ...],
                 x_th=x_th[t_nonzero_mask],
                 time_of_input=t_abs_nonzero - 1,
-                static_condition=None if static_condition is None else static_condition[t_nonzero_mask],
+                **{k: v[t_nonzero_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()},
             )
 
             # Now, simply concatenate the inital_conditions for t=0 with the interpolated data for t>0
@@ -508,7 +547,7 @@ class DYffusionMarkov(BaseDYffusion2):
             # assert torch.all(x_ti[t_i_next == 0] == x_ti[t_i_next == 0]), 'x_ti[t_i_next == 0] != x_ti[t_i_next == 0]'
 
         # Forecast x_{h} from \tilde{x}_{t} for 0 <= t <= h-1
-        xhat_th = self.predict_x_last(x_t=xtilde_t, time_of_input=t_abs, static_condition=static_condition)
+        xhat_th = self.predict_x_last(x_t=xtilde_t, time_of_input=t_abs, **kwargs)
         loss_forward = criterion(xhat_th, x_th, time_of_input=t_abs)
 
         if lam2 > 0 and t_not_last_mask.any():
@@ -516,17 +555,17 @@ class DYffusionMarkov(BaseDYffusion2):
             if self.hparams.reconstruction2_detach_x_last:
                 xhat_th = xhat_th.detach()
 
-            xhat_ti_next = self.q_sample(
+            xhat_ti_next = self._q_sample(
                 x_ti=xtilde_t,
                 x_th=xhat_th,
                 time_of_input=t_abs,
-                static_condition=static_condition,
-                mask=t_not_last_mask,
+                batch_mask=t_not_last_mask,
+                **kwargs
             )  # \hat{x}_{t+1}
             # simulate one more step of the reverse diffusion process, i.e.
             # forecast x_{h} from \hat{x}_{t'} for 1 <= t' <= h-1, where t' = t+1
-            sc2 = None if static_condition is None else static_condition[t_not_last_mask]
-            xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, static_condition=sc2)
+            kwargs = {k: v[t_not_last_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()}
+            xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, **kwargs)
             loss_forward2 = criterion(xhat_th2, x_th[t_not_last_mask], time_of_input=t_abs_not_last + 1)
         else:
             loss_forward2 = 0.0
@@ -601,23 +640,22 @@ class DYffusionEndToEndBase(BaseDYffusion2):
         x_ti: Tensor,
         x_th: Tensor,
         time: Tensor,
-        static_condition: Optional[Tensor] = None,
-        num_predictions: int = 1,
+        **kwargs
     ):
         """Draw the intermediate degraded data (given the start/target data and the diffused data)"""
-        interpolation_cond = self.get_condition("interpolate", x_th, static_condition=static_condition)
+        interpolation_cond = self.get_condition("interpolate", x_th)
         with torch.set_grad_enabled(not self.interpolator_is_frozen):
-            x_interpolated = self._predict_interpolated_snapshot(x_ti, x_th, time, interpolation_cond)
+            x_interpolated = self._predict_interpolated_snapshot(x_ti, x_th, time, interpolation_cond, **kwargs)
             x_interpolated = x_interpolated.detach() if self.interpolator_is_frozen else x_interpolated
         return x_interpolated
 
     @abstractmethod
     def _predict_interpolated_snapshot(
-        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor
+        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor, **kwargs
     ) -> Tensor:
         pass
 
-    def p_losses(self, dynamics, static_condition: Tensor = None, verbose=False):
+    def p_losses(self, dynamics, verbose=False, **kwargs):
         r"""
 
         Args:
@@ -660,11 +698,11 @@ class DYffusionEndToEndBase(BaseDYffusion2):
         compute_forecast_loss2 = self.trainer.global_step >= self.hparams.reconstruction_start_step and lam4 > 0
         if (compute_interpolation_loss1 or lam2 > 0) and t_nonzero_mask.any():
             # Interpolate x_{t} from x_{t-1} and x_{h} for 1 <= t <= h-1
-            xhat_ti = self.q_sample(
+            xhat_ti = self._q_sample(
                 x_ti=dynamics[t_nonzero_mask, t_abs_nonzero - 1, ...],
                 x_th=x_th[t_nonzero_mask],
                 time_of_input=t_abs_nonzero - 1,
-                static_condition=None if static_condition is None else static_condition[t_nonzero_mask],
+                **{k: v[t_nonzero_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()},
                 # , t_abs_nonzero],
             )  # \hat{x}_{t}
 
@@ -684,9 +722,7 @@ class DYffusionEndToEndBase(BaseDYffusion2):
             # assert torch.all(x_ti[t_i_next == 0] == x_ti[t_i_next == 0]), 'x_ti[t_i_next == 0] != x_ti[t_i_next == 0]'
 
             # Forecast x_{h} from \tilde{x}_{t} for 0 <= t <= h-1
-            xhat_th = self.predict_x_last(
-                x_t=xtilde_t, time_of_input=t_abs, static_condition=static_condition
-            )  # \hat{x}_{h}
+            xhat_th = self.predict_x_last(x_t=xtilde_t, time_of_input=t_abs, **kwargs)  # \hat{x}_{h}
 
         if compute_forecast_loss:
             loss_forward = loss_function_forecast(xhat_th, x_th, time_of_input=t_abs)
@@ -699,12 +735,12 @@ class DYffusionEndToEndBase(BaseDYffusion2):
                 xhat_th = xhat_th.detach()
             if self.hparams.detach_interpolated_data2:
                 xtilde_t = xtilde_t.detach()
-            xhat_ti_next = self.q_sample(
+            xhat_ti_next = self._q_sample(
                 x_ti=xtilde_t,
                 x_th=xhat_th,
                 time_of_input=t_abs,
-                static_condition=static_condition,
-                mask=t_not_last_mask,
+                batch_mask=t_not_last_mask,
+                **kwargs
             )  # \hat{x}_{t+1}
 
         if compute_interpolation_loss2 and t_not_last_mask.any():
@@ -717,8 +753,8 @@ class DYffusionEndToEndBase(BaseDYffusion2):
         if compute_forecast_loss2 and t_not_last_mask.any():
             # simulate one more step of the reverse diffusion process, i.e.
             # forecast x_{h} from \hat{x}_{t'} for 1 <= t' <= h-1, where t' = t+1
-            sc2 = None if static_condition is None else static_condition[t_not_last_mask]
-            xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, static_condition=sc2)
+            kwargs = {k: v[t_not_last_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()}
+            xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, **kwargs)
             loss_forward2 = loss_function_forecast(xhat_th2, x_th[t_not_last_mask], time_of_input=t_abs_not_last + 1)
         else:
             loss_forward2 = 0.0
@@ -778,7 +814,6 @@ class DYffusionEnd2End(DYffusionEndToEndBase):
         self,
         prediction_type: str,
         x_th: Optional[Tensor] = None,
-        static_condition: Optional[Tensor] = None,
         shape: Sequence[int] = None,
         concat_dim: int = 1,
     ) -> Tensor:
@@ -820,12 +855,6 @@ class DYffusionEnd2End(DYffusionEndToEndBase):
             cond = cond1
         else:
             cond = None
-
-        if static_condition is not None:
-            if cond is None:
-                cond = static_condition
-            else:
-                cond = torch.cat([cond, static_condition], dim=concat_dim)
         return cond
 
     def get_time_encoding_interpolation(self, time_of_input: Tensor) -> Tensor:
@@ -834,17 +863,17 @@ class DYffusionEnd2End(DYffusionEndToEndBase):
         return t
 
     def _predict_interpolated_snapshot(
-        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor
+        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor, **kwargs
     ) -> Tensor:
         assert (1 == time).all(), f"interpolate time must be == 1, got {time}"
-        x_ipolated, t = self.model(x_ti, time=time, condition=interpolation_condition, return_time_emb=True)
+        x_ipolated, t = self.model(x_ti, time=time, condition=interpolation_condition, return_time_emb=True, **kwargs)
 
         if hasattr(self, "head_interpolate_block"):
             x_ipolated = self.head_interpolate_block(x_ipolated, time_emb=t)
         x_ipolated = self.head_interpolate(x_ipolated)
         return x_ipolated
 
-    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor):
+    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor, **kwargs) -> Tensor:
         assert (0 < t).all() and (t <= self.num_timesteps).all(), f"Invalid timestep: {t}"
         if self.hparams.time_encoding == "discrete":
             time = t
@@ -854,7 +883,7 @@ class DYffusionEnd2End(DYffusionEndToEndBase):
         else:
             raise ValueError(f"Invalid time_encoding: {self.hparams.time_encoding}")
 
-        x_last_pred = self.model.predict_forward(x_t, time=time, condition=forward_condition)
+        x_last_pred = self.model.predict_forward(x_t, time=time, condition=forward_condition, **kwargs)
         x_last_pred = self.head_forward(x_last_pred)
         return x_last_pred
 
@@ -889,7 +918,6 @@ class DYffusionEnd2EndSeparateModels(DYffusionEndToEndBase):
         self,
         prediction_type: str,
         x_th: Optional[Tensor] = None,
-        static_condition: Optional[Tensor] = None,
         shape: Sequence[int] = None,
         concat_dim: int = 1,
     ) -> Tensor:
@@ -905,28 +933,22 @@ class DYffusionEnd2EndSeparateModels(DYffusionEndToEndBase):
             cond = None
         else:
             raise ValueError(f"Unknown prediction type {prediction_type}")
-
-        if static_condition is not None:
-            if cond is None:
-                cond = static_condition
-            else:
-                cond = torch.cat([cond, static_condition], dim=concat_dim)
         return cond
 
     def get_time_encoding_interpolation(self, time: Tensor) -> Tensor:
         return time
 
     def _predict_interpolated_snapshot(
-        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor
+        self, x_ti: Tensor, x_th: Tensor, time: Tensor, interpolation_condition: Tensor, **kwargs
     ) -> Tensor:
         assert (0 <= time).all() and (
             time <= self._max_ipol_time
         ).all(), f"interpolate time must be in [0, {self._max_ipol_time}], got {time}"
         with self.interpolator.inference_dropout_scope(condition=self.hparams.enable_interpolator_inference_dropout):
-            x_ipolated = self.interpolator(x_ti, time=time, condition=interpolation_condition)
+            x_ipolated = self.interpolator(x_ti, time=time, condition=interpolation_condition, **kwargs)
         return x_ipolated
 
-    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor):
+    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor,  **kwargs) -> Tensor:
         assert (0 < t).all() and (t <= self.num_timesteps).all(), f"Invalid lead time timestep: {t}"
-        x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition)
+        x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition, **kwargs)
         return x_last_pred

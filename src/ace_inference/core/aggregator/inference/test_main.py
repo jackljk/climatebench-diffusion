@@ -29,8 +29,8 @@ def test_logs_labels_exist():
     gen_data = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     target_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     gen_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
-    agg.record_batch(loss, target_data, gen_data, target_data_norm, gen_data_norm)
-    logs = agg.get_logs(label="test")
+    agg.update(loss, target_data, gen_data, target_data_norm, gen_data_norm)
+    logs = agg.compute(label="test")
     assert "test/mean/series" in logs
     assert "test/mean_norm/series" in logs
     assert "test/mean_step_20/l1/a" in logs
@@ -74,7 +74,7 @@ def test_inference_logs_labels_exist():
     gen_data = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     target_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     gen_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
-    agg.record_batch(loss, target_data, gen_data, target_data_norm, gen_data_norm)
+    agg.update(loss, target_data, gen_data, target_data_norm, gen_data_norm)
     logs = agg.get_inference_logs(label="test")
     assert isinstance(logs, list)
     assert len(logs) == n_time
@@ -118,7 +118,7 @@ def test_i_time_start_gets_correct_time_longer_windows(window_len: int, n_window
         sample_data = {"a": torch.zeros([2, window_len, 4, 4], device=get_device())}
         for i in range(window_len):
             sample_data["a"][..., i, :, :] = float(i_start + i)
-        agg.record_batch(
+        agg.update(
             1.0,
             target_data=target_data,
             gen_data=sample_data,
@@ -127,7 +127,7 @@ def test_i_time_start_gets_correct_time_longer_windows(window_len: int, n_window
             i_time_start=i_start,
         )
         i_start += window_len - overlap  # subtract 1 for overlapping windows
-    logs = agg.get_logs(label="metrics")
+    logs = agg.compute(label="metrics")
     table = logs["metrics/mean/series"]
     # get the weighted_bias column
     bias = table.get_column("weighted_bias/a")
@@ -163,7 +163,7 @@ def test_inference_logs_length(window_len: int, n_windows: int, overlap: int):
         sample_data = {"a": torch.zeros([2, window_len, 4, 4], device=get_device())}
         for i in range(window_len):
             sample_data["a"][..., i, :, :] = float(i_start + i)
-        agg.record_batch(
+        agg.update(
             1.0,
             target_data=target_data,
             gen_data=sample_data,

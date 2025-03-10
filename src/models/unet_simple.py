@@ -190,24 +190,17 @@ class UNet(BaseModel):
         return x
 
     def forward(
-        self, inputs, time=None, condition=None, static_condition=None, return_time_emb: bool = False, **kwargs
+        self,
+        inputs,
+        time=None,
+        condition=None,
+        dynamical_condition=None,
+        static_condition=None,
+        return_time_emb: bool = False,
+        metadata=None,
+        # **kwargs
     ):
-        # Preprocess inputs for shape
-        if self.num_conditional_channels > 0:
-            # exactly one of condition or static_condition should be not None
-            if condition is None:
-                assert static_condition is not None, "condition and static_condition are both None"
-                condition = static_condition
-            else:
-                assert static_condition is None, "condition and static_condition are both not None"
-
-            try:
-                x = torch.cat([inputs, condition], dim=1)
-            except RuntimeError as e:
-                raise RuntimeError(f"inputs.shape: {inputs.shape}, condition.shape: {condition.shape}") from e
-        else:
-            x = inputs
-            assert condition is None, "condition is not None but num_conditional_channels is 0"
+        x = self.concat_condition_if_needed(inputs, condition, dynamical_condition, static_condition)
         # print(x.shape, inputs.shape, condition.shape if exists(condition) else None)
 
         t = self.time_emb_mlp(time) if exists(self.time_emb_mlp) else None

@@ -462,7 +462,7 @@ def run_on_batch_multistep(
 
     data = to_tensordict(data, device=eval_device)  # Not needed on GPU
     full_data_norm = to_tensordict(full_data_norm, device=eval_device)
-    aggregator.record_batch(
+    aggregator.update(
         float(loss),
         target_data=data,
         gen_data=gen_data,

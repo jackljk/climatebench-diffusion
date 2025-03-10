@@ -33,6 +33,7 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         in_names: List[str],
         out_names: List[str],
         forcing_names: List[str],
+        loss_latitude_weighting: bool = False,
         auxiliary_names: List[str] = None,
         window: int = 1,
         horizon: int = 1,
@@ -153,6 +154,7 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
             forcing_names=self.hparams.forcing_names,
             forcing_packer=self.forcing_packer,
             forcing_normalizer=self.forcing_normalizer,
+            loss_latitude_weighting=self.hparams.loss_latitude_weighting,
         )
         ds = get_dataset(params, requirements, dataset_class=XarrayDatasetSalva, **kwargs, **kwargs_final)
         return ds
@@ -261,8 +263,9 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         else:
             snapshot_horizons = []
         snaps_vars = [
-            "air_temperature_7_normed",
+            "air_temperature_7",
             "specific_total_water_7",
+            "specific_total_water_0",
             "specific_total_water_7_normed",
             "air_temperature_0",
         ]
@@ -277,5 +280,6 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
                 name=f"t{h}",
                 **aggr_kwargs,
             )
-        aggregators["time_mean"] = TimeMeanAggregator(**aggr_kwargs, name="time_mean")
+        if use_full_rollout:
+            aggregators["time_mean"] = TimeMeanAggregator(**aggr_kwargs, name="time_mean")
         return aggregators

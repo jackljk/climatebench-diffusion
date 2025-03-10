@@ -59,7 +59,7 @@ def get_dims_of_dataset(datamodule_config: DictConfig):
         filename = datamodule_config.filename
         if "inits" in filename:
             # e.g. "kolmogorov-N256-n_inits32-T1000.nc" or "kolmogorov-N256-n_inits32-T1000_downsampled4.nc"
-            filename_with_info = filename.strip(".nc").rsplit('_', 1)[0]
+            filename_with_info = filename.strip(".nc").rsplit("_", 1)[0]
             _, dim_x, n_trajs, n_timesteps = filename_with_info.split("-")
             dim_x = dim_y = int(dim_x.strip("N"))
             n_trajs = int(n_trajs.strip("n_inits"))
@@ -100,6 +100,7 @@ def get_dims_of_dataset(datamodule_config: DictConfig):
     elif "debug_datamodule" in target:
         input_dim = output_dim = datamodule_config.channels
         spatial_dims = (datamodule_config.height, datamodule_config.width)
+        conditional_dim = 5
 
     else:
         raise ValueError(f"Unknown dataset: {target}")

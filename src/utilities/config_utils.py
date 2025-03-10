@@ -632,16 +632,6 @@ def check_config_values(config: DictConfig):
             # log.warning("Model checkpoints will not be saved because you are not using wandb!")
             config.save_config_to_wandb = False
 
-        if config.module.get("num_predictions", 1) > 1:
-            # adapt the evaluation batch size to the number of predictions
-            bs, ebs = config.datamodule.batch_size, config.datamodule.eval_batch_size
-            if ebs >= bs:
-                effective_ebs = ebs * config.module.num_predictions
-                log.info(
-                    f"Note that the effective evaluation batch size will be multiplied by the number of "
-                    f"predictions={config.module.num_predictions} for a total of {effective_ebs}!"
-                )
-
         # Adjust global batch size, batch size per GPU, and accumulate_grad_batches based on the number of GPUs and nodes
         n_gpus = config.trainer.get("devices", 1)
         n_nodes = int(config.trainer.get("num_nodes", 1))
@@ -652,6 +642,38 @@ def check_config_values(config: DictConfig):
         elif isinstance(n_gpus, Sequence):
             n_gpus = len(n_gpus)
         world_size = int(n_gpus * n_nodes) if n_gpus > 0 else 1
+
+        bs, ebs = config.datamodule.batch_size, config.datamodule.eval_batch_size
+        max_val_samples = config.datamodule.get("max_val_samples")
+        if max_val_samples is not None and config.eval_mode in [None, "validate"]:
+            # Check that max_val_samples is a multiple of the eval batch size * world_size
+            if max_val_samples % (ebs * world_size) != 0:
+                # try to set eval batch size so that max_val_samples is a multiple of it and ebs is not too large
+                max_ebs = max_val_samples // world_size
+                # Find the largest factor of max_ebs that is <= ebs
+                ebs_new = None
+                for i in range(max_ebs, 0, -1):
+                    if max_ebs % i == 0 and i <= ebs:
+                        ebs_new = i
+                        break
+                if ebs_new is not None:
+                    config.datamodule.eval_batch_size = ebs_new
+                    log.info(
+                        f"Scaled eval_batch_size from {ebs} to {ebs_new} so that {max_val_samples=} "
+                        f"are evenly distributed over {world_size=} devices ({ebs_new*world_size=})!"
+                    )
+                else:
+                    raise ValueError(
+                        f"max_val_samples={max_val_samples} must be a multiple of eval_batch_size={ebs} * "
+                        f"{world_size=} (={ebs*world_size})!"
+                    )
+
+        if config.module.get("num_predictions", 1) > 1 and ebs >= bs:
+            effective_ebs = ebs * config.module.num_predictions
+            log.info(
+                f"Note that the effective evaluation batch size will be multiplied by the number of "
+                f"predictions={config.module.num_predictions} for a total of {effective_ebs}!"
+            )
 
         if config.datamodule.get("num_workers") == "auto":
             if world_size >= 2:

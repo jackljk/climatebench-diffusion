@@ -8,7 +8,6 @@ defaults:
 
 module:
   _target_: src.experiment_types.interpolation.InterpolationExperiment
-  monitor: "val/${datamodule.horizon}h_avg/mse"
   stack_window_to_channel_dim: True
 
 datamodule:

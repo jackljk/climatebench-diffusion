@@ -280,7 +280,7 @@ class Trainer:
                 wandb.log(metrics, step=self.num_batches_seen)
         self._model_epoch += 1
 
-        return aggregator.get_logs(label="train")
+        return aggregator.compute(label="train")
 
     @contextlib.contextmanager
     def _validation_context(self):
@@ -324,14 +324,14 @@ class Trainer:
                     aggregator=NullAggregator(),
                 )
                 stepped = compute_stepped_derived_quantities(stepped, self.valid_data.sigma_coordinates)
-                aggregator.record_batch(
+                aggregator.update(
                     loss=stepped.metrics["loss"],
                     target_data=stepped.target_data,
                     gen_data=stepped.gen_data,
                     target_data_norm=stepped.target_data_norm,
                     gen_data_norm=stepped.gen_data_norm,
                 )
-        return aggregator.get_logs(label="val")
+        return aggregator.compute(label="val")
 
     def inference_one_epoch(self):
         record_step_20 = self.config.inference.n_forward_steps >= 20
@@ -353,7 +353,7 @@ class Trainer:
                 n_forward_steps=self.config.inference.n_forward_steps,
                 forward_steps_in_memory=self.config.inference.forward_steps_in_memory,
             )
-        logs = aggregator.get_logs(label="inference")
+        logs = aggregator.compute(label="inference")
         return logs
 
     def save_checkpoint(self, checkpoint_path):

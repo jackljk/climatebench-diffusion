@@ -81,6 +81,7 @@ def _get_ensemble_dataset(
     ensemble = torch.utils.data.ConcatDataset(datasets)
     ensemble.metadata = metadatas[0]  # type: ignore
     ensemble.area_weights = datasets[0].area_weights  # type: ignore
+    ensemble.loss_weights_tensor = datasets[0].loss_weights_tensor  # type: ignore
     ensemble.sigma_coordinates = datasets[0].sigma_coordinates  # type: ignore
     ensemble.horizontal_coordinates = datasets[0].horizontal_coordinates  # type: ignore
     return ensemble

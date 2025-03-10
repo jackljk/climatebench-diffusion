@@ -59,6 +59,10 @@ class BaseModel(LightningModule):
         loss_function_weights: Optional[Dict[str, float]] = None,
         predict_non_spatial_condition: bool = False,
         learned_channel_variance_loss: bool = False,  # Please use module.learned_channel_variance_loss to set this
+        learned_spatial_variance_loss: bool = False,  # Please use module.learned_spatial_variance_loss to set this
+        log_vars_reduce_op: str = "add",  # "add" or "mul"
+        log_vars_learn_per_dim: bool = True,
+        upsample_condition_by: int = 1,
         datamodule_config: Optional[DictConfig] = None,
         channel_dim: int = 1,
         debug_mode: bool = False,
@@ -87,6 +91,9 @@ class BaseModel(LightningModule):
         self.spatial_shape_out = spatial_shape_out
         self.datamodule_config = datamodule_config
         self.predict_non_spatial_condition = predict_non_spatial_condition
+
+        if upsample_condition_by > 1:
+            self.upsample_condition = nn.Upsample(scale_factor=upsample_condition_by)
 
         if loss_function is not None:
             # Get the loss function
@@ -143,10 +150,18 @@ class BaseModel(LightningModule):
         """Return the loss function"""
         loss_function = self.hparams.loss_function
         if self.hparams.learned_channel_variance_loss:
-            # todo: make this more general (e.g. let each model specify the channel dim).
             lvdn_to_i_n = kwargs.get("learned_var_dim_name_to_idx_and_n_dims", {})
             lvdn_to_i_n["channels"] = (self.channel_dim, self.num_output_channels_raw)  # Tuple: (idx, n_dims)
             kwargs["learned_var_dim_name_to_idx_and_n_dims"] = lvdn_to_i_n
+        if self.hparams.learned_spatial_variance_loss:
+            lvdn_to_i_n = kwargs.get("learned_var_dim_name_to_idx_and_n_dims", {})
+            n_spatial_dims = len(self.spatial_shape_out)
+            for i, dim in enumerate(self.spatial_shape_out):
+                lvdn_to_i_n[f"spatial_{i}"] = (-n_spatial_dims + i, dim)  # if n_spatial_dims=2 start from -2, -1
+            kwargs["learned_var_dim_name_to_idx_and_n_dims"] = lvdn_to_i_n
+        if "learned_var_dim_name_to_idx_and_n_dims" in kwargs.keys():
+            kwargs["reduce_op"] = self.hparams.log_vars_reduce_op
+            kwargs["learn_per_dim"] = self.hparams.log_vars_learn_per_dim
 
         loss = self._get_loss_callable_from_name_or_config(loss_function, reduction=reduction, **kwargs)
 
@@ -232,7 +247,7 @@ class BaseModel(LightningModule):
                     self.register_buffer("_non_spatial_cond_null_emb", torch.zeros(self.non_spatial_cond_hdim))
                 else:
                     self._non_spatial_cond_null_emb = None
-                    assert null_embedding_for_non_spatial_cond == "noop"
+                    assert null_embedding_for_non_spatial_cond is None
 
     def preprocess_non_spatial_conditioning(self, condition_non_spatial: Tensor):
         if self.non_spatial_conditioning_mode == "adaLN" and self._non_spatial_cond_null_emb is not None:
@@ -304,6 +319,7 @@ class BaseModel(LightningModule):
         return_predictions: bool = False,
         predictions_post_process: Optional[Callable] = None,
         targets_pre_process: Optional[Callable] = None,
+        criterion_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Get the loss for the given inputs and targets.
@@ -330,6 +346,7 @@ class BaseModel(LightningModule):
         else:
             predictions_raw = self(**inputs, condition=condition, **kwargs)
 
+        criterion_kwargs = criterion_kwargs if criterion_kwargs is not None else {}
         if torch.is_tensor(predictions_raw):
             if predictions_post_process is not None:
                 predictions_raw = predictions_post_process(predictions_raw)
@@ -338,9 +355,9 @@ class BaseModel(LightningModule):
             assert (
                 predictions.shape == targets.shape
             ), f"Be careful: Predictions shape {predictions.shape} != targets shape {targets.shape}. Missing singleton dimensions after batch dim. can be fatal."
-            loss = self.criterion["preds"](predictions, targets)
+            loss = self.criterion["preds"](predictions, targets, **criterion_kwargs)
             assert len(self.loss_function_weights) == 0, "Loss function weights are not supported for this case"
-            loss_dict = dict(loss=loss)
+            loss_dict = dict(loss=loss) if torch.is_tensor(loss) else loss
         else:
             if predictions_post_process is not None:
                 # Do post-processing of the predictions (but not other outputs of the model)
@@ -354,9 +371,12 @@ class BaseModel(LightningModule):
                 loss_weight_k = self.loss_function_weights.get(base_key, 1.0)
                 predictions_k = mask_data(predictions_raw[base_key])
                 targets_k = mask_data(targets[k])
-                loss_k = self.criterion[base_key](predictions_k, targets_k)
-                loss += loss_weight_k * loss_k
-                loss_dict[f"loss/{base_key}"] = loss_k.item()
+                loss_k = self.criterion[base_key](predictions_k, targets_k, **criterion_kwargs)
+                loss_k = {"loss": loss_k} if torch.is_tensor(loss_k) else loss_k
+                loss += loss_weight_k * loss_k["loss"]
+                for key, value in loss_k.items():
+                    loss_dict[f"{key}/{base_key}"] = value.item()
+
             loss_dict["loss"] = loss  # total loss, used to backpropagate
 
         if return_predictions:

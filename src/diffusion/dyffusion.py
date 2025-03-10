@@ -563,6 +563,7 @@ class BaseDYffusion(BaseDiffusion):
         intermediates, xhat_th, dynamics_pred_step = dict(), None, 0
         last_i_n_plus_one = sampling_schedule[-1] + 1
         dynamics_pred_step_last = None
+        is_cold_sampling = self.hparams.sampling_type in ["cold", "heun1", "heun2", "heun3"]
         for sampling_round in range(0, self.hparams.refinement_rounds + 1):
             desc = f"Refinement round {sampling_round}" if sampling_round > 0 else "Sampling"
             s_and_snext = zip(
@@ -608,7 +609,7 @@ class BaseDYffusion(BaseDiffusion):
                     if self.hparams.hack_for_imprecise_interpolation:
                         x_interpolated_s_next = torch.cat([initial_condition[:, :1], x_interpolated_s_next], dim=1)
 
-                if self.hparams.sampling_type in ["cold", "heun1", "heun2", "heun3"]:
+                if is_cold_sampling:
                     if not self.hparams.use_cold_sampling_for_last_step and is_last_step:
                         if self.hparams.use_cold_sampling_for_init_of_ar_step:
                             x_interpolated_s = self.q_sample(**q_sample_kwargs, t=s, **kwargs)
@@ -620,7 +621,7 @@ class BaseDYffusion(BaseDiffusion):
                     else:
                         # D(x_s, s)
                         x_interpolated_s = self.q_sample(**q_sample_kwargs, t=s, **kwargs) if s > 0 else x_s
-                        # for s = 0, we have x_s_degraded = x_s, so we just directly return x_s_degraded_next
+                        # for s = 0, we have x_interpolated_s = x_s, so we just directly return x_s_degraded_next
                         d_i1 = x_interpolated_s_next - x_interpolated_s
                         if (
                             self.hparams.sampling_type == "cold"
@@ -830,7 +831,6 @@ class DYffusion(BaseDYffusion):
             input_dynamics: the initial condition data  (time = 0)
             xt_last: the start/target data  (time = horizon)
             t: the time step of the diffusion process
-            static_condition: the static condition data (if any)
         """
         batch_size = input_dynamics.shape[0]
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device, dtype=torch.long)

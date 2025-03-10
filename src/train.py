@@ -122,9 +122,14 @@ def run_model(config: DictConfig) -> float:
     )
     if config.get("eval_mode"):
         if config.get("model") is not None:
-            assert ckpt_path is not None, "ckpt_path must be provided in eval_mode"
-            # Log epoch and step of the model checkpoint to be tested
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            if config.get("force_no_ckpt"):
+                ckpt_path = ckpt_path_orig = None
+                ckpt = {}
+                log.warning("Forcing ignoring the checkpoint path. This will use random init. weights!")
+            else:
+                assert ckpt_path is not None, "ckpt_path must be provided in eval_mode"
+                # Log epoch and step of the model checkpoint to be tested
+                ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu")
             epoch, global_step = ckpt.get("epoch", -1), ckpt.get("global_step", -1)
             model._default_global_step = global_step
             model._default_epoch = epoch
@@ -142,12 +147,9 @@ def run_model(config: DictConfig) -> float:
             signal.signal(signal.SIGUSR1, melk(trainer, config.ckpt_dir))
             signal.signal(signal.SIGUSR2, divein(trainer))
 
-        def fit(ckpt_filepath=None):
-            trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_filepath)
-
         try:
             # Train the model
-            fit(ckpt_filepath=ckpt_path)
+            trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
             log.info(" ---------------- Training finished successfully ----------------")
         except Exception as e:
             melk(trainer, config.ckpt_dir)()

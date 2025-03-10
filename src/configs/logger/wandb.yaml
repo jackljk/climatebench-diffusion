@@ -20,6 +20,8 @@ wandb:
   prefix: ""
   save_to_wandb: False
   save_to_s3_bucket: True
+  save_last_ckpt: True
+  save_best_ckpt: True
   s3_endpoint_url: "https://rosedata.ucsd.edu"
   s3_bucket_name: "salva-data-and-results"
   log_code: True   # Whether to log the code (all .py files in src/*) to wandb

@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import Dict
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from src.utilities.utils import get_logger
 
 
 log = get_logger(__name__)
+
 
 # ----------------------------------------------------------------------------
 # Preconditioning corresponding to the variance preserving (VP) formulation
@@ -141,8 +143,11 @@ class EDMPrecond(BaseDiffusion):
         sigma_min=0,  # Minimum supported noise level.
         sigma_max=None,  # Maximum supported noise level.
         sigma_max_inf=80,  # Maximum supported noise level.
+        sigma_min_train=None,
         P_mean=-1.2,  # Mean of the noise level distribution.
         P_std=1.2,  # Standard deviation of the noise level distribution.
+        noise_distribution: str = "lognormal",  # Distribution of the noise level.
+        use_noise_logvar: bool = False,
         force_unconditional=False,  # Ignore conditioning information?
         # Sampling parameters.
         num_steps=18,  # Number of steps in the sampling loop.
@@ -152,6 +157,7 @@ class EDMPrecond(BaseDiffusion):
         S_max=float("inf"),  # Maximum noise level for increased noise.
         S_noise=1,  # Noise level for increased noise.
         heun: bool = True,  # Use Heun's method for the sampling loop.
+        compute_loss_per_sigma: bool = False,  # Compute loss for each sigma in the range.
         dtype="double",  # double or float
         **kwargs,  # Keyword arguments for the underlying model.
     ):
@@ -159,8 +165,8 @@ class EDMPrecond(BaseDiffusion):
         super().__init__(**kwargs)
         self._USE_SIGMA_DATA = True
         self.use_fp16 = use_fp16
+        self.sigma_min_train = sigma_min_train or sigma_min
         self.sigma_min = sigma_min
-        assert sigma_max is None, "Use sigma_max_inf instead of sigma_max for inference. "
         self.sigma_max = sigma_max or float("inf")
         self.sigma_max_inf = sigma_max_inf or self.sigma_max
         assert self.sigma_min < self.sigma_max_inf <= self.sigma_max
@@ -174,7 +180,18 @@ class EDMPrecond(BaseDiffusion):
         """Return the loss function used for training.
         Function will be called when needed by the BaseModel class.
         Better to do it here in case self.* parameters are changed."""
-        loss_kwargs = dict(P_mean=self.hparams.P_mean, P_std=self.hparams.P_std, sigma_data=self.sigma_data, **kwargs)
+        loss_kwargs = dict(
+            sigma_data=self.sigma_data,
+            use_logvar=self.hparams.use_noise_logvar,
+            **kwargs,
+        )
+        if self.hparams.noise_distribution == "lognormal":
+            loss_kwargs.update({"P_mean": self.hparams.P_mean, "P_std": self.hparams.P_std})
+        elif self.hparams.noise_distribution == "uniform":
+            loss_kwargs.update({"P_mean": None, "P_std": None})
+        else:
+            raise ValueError(f"Unknown noise distribution: {self.hparams.noise_distribution}")
+
         log.info(f"Using EDM loss function: {loss_function}")
         if loss_function == "mse":
             loss_kwargs.pop("reduction", None)
@@ -188,7 +205,7 @@ class EDMPrecond(BaseDiffusion):
         else:
             raise ValueError(f"Unknown loss type: {loss_function}")
 
-    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+    def forward(self, x, sigma, force_fp32=False, **model_kwargs):
         if self.hparams.force_unconditional:
             if isinstance(self.hparams.force_unconditional, float):
                 # Implement unconditional sampling by setting the condition to 0 with probability force_unconditional
@@ -202,20 +219,14 @@ class EDMPrecond(BaseDiffusion):
                 _ = model_kwargs.pop("condition", None)
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-        if self.label_dim == 0:
-            class_labels = None
-        elif class_labels is None:
-            class_labels = torch.zeros([1, self.label_dim], device=x.device)
-        else:
-            class_labels = class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == "cuda") else torch.float32
 
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2).sqrt()
         c_in = 1 / (self.sigma_data**2 + sigma**2).sqrt()
-        c_noise = sigma.log() / 4
+        c_noise = sigma.flatten().log() / 4
 
-        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        F_x = self.model((c_in * x).to(dtype), c_noise, **model_kwargs)
         # assert F_x.dtype == dtype, f"{F_x.dtype} != {dtype}"
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x
@@ -224,17 +235,49 @@ class EDMPrecond(BaseDiffusion):
         # Shouldn't be needed anymore after using predictions_post_process inside the losses:
         # if len(targets.shape) == 5:  # (B, T, C, H, W)
         #     targets = targets.squeeze(1)  # (B, C, H, W)
+        if self.hparams.noise_distribution == "uniform":
+            # Sample noise levels uniformly from a discretization of the noise level range into 2000 steps.
+            sigmas = self.edm_discretization(steps=2000, sigma_min=self.sigma_min_train, sigma_max=self.sigma_max)
+            # Randomly sample noise levels from the discretization.
+            sigmas = sigmas[torch.randint(0, 2000, (inputs.shape[0],), device=inputs.device)]
+            kwargs["sigma"] = sigmas
+
         loss = self.criterion["preds"](self, images=targets, condition=inputs, **kwargs)
         # condition will be fed back to .forward() above as part of model_kwargs
+        if self.hparams.compute_loss_per_sigma:
+            loss = {"loss": loss} if torch.is_tensor(loss) else loss
+            _ = kwargs.pop("sigma", None)
+            loss.update(self.get_loss_vs_sigmas(inputs, targets, **kwargs))
         if return_predictions:
             return loss, None
         return loss
 
+    def get_loss_vs_sigmas(self, inputs, targets, **kwargs) -> Dict[str, float]:
+        sigmas = self.edm_discretization(steps=200)
+        losses = dict()  # defaultdict(list)
+        for sigma in sigmas:
+            loss_sigma = self.criterion["preds"](self, images=targets, condition=inputs, sigma=sigma, **kwargs)
+            loss_sigma = {"loss": loss_sigma} if torch.is_tensor(loss_sigma) else loss_sigma
+            if "raw_loss" not in loss_sigma:
+                loss_sigma["raw_loss"] = loss_sigma["loss"]
+            for k, v in loss_sigma.items():
+                # losses[f"{k}_per_noise_level"].append(float(v))
+                losses[f"{k}_per_noise_level/sigma{sigma:.3f}"] = float(v)
+
+        # return_dict = {"x_axes": {"sigma": list(sigmas.cpu())}}
+        losses["x_axes"] = {"sigma": list(sigmas.cpu())}
+        return losses
+
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
-    @staticmethod
-    def edm_discretization(steps, sigma_min: float, sigma_max: float, rho: float):
+    def edm_discretization(self, steps, sigma_min: float = None, sigma_max: float = None, rho: float = None):
+        sigma_min = sigma_min or self.sigma_min  # max(sigma_min, self.sigma_min)
+        sigma_max = sigma_max or self.sigma_max_inf  # min(sigma_max, self.sigma_max)
+        rho = rho or self.hparams.rho
+        if isinstance(steps, int):
+            step_indices = torch.arange(steps, dtype=self.dtype, device=self.device)
+            steps = step_indices / (steps - 1)
         return (sigma_max ** (1 / rho) + steps * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
 
     def edm_sampler(
@@ -260,18 +303,13 @@ class EDMPrecond(BaseDiffusion):
             return denoised
 
         # Adjust noise levels based on what's supported by the network.
-        sigma_min = self.sigma_min  # max(sigma_min, self.sigma_min)
-        sigma_max = self.sigma_max_inf  # min(sigma_max, self.sigma_max)
-        rho = self.hparams.rho
         S_churn = self.hparams.S_churn
         S_min = self.hparams.S_min
         S_max = self.hparams.S_max
         S_noise = self.hparams.S_noise
         num_steps = self.hparams.num_steps
         # Time step discretization.
-        step_indices = torch.arange(num_steps, dtype=dtype, device=noise.device)
-        step_indices_normed = step_indices / (num_steps - 1)
-        t_steps = self.edm_discretization(step_indices_normed, sigma_min, sigma_max, rho)
+        t_steps = self.edm_discretization(num_steps)
         t_steps = torch.cat([self.round_sigma(t_steps), torch.zeros_like(t_steps[:1])])
         # t_N = 0, but never actually given to network.
         # if self.hparams.dtype == "double":
@@ -334,6 +372,7 @@ class EDMPrecond(BaseDiffusion):
 """Loss functions used in the paper
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
+
 # ----------------------------------------------------------------------------
 # Loss function corresponding to the variance preserving (VP) formulation
 # from the paper "Score-Based Generative Modeling through Stochastic
@@ -386,24 +425,83 @@ class VELoss:
 
 
 # ----------------------------------------------------------------------------
+# Normalize given tensor to unit magnitude with respect to the given
+# dimensions. Default = all dimensions except the first.
+
+
+def normalize(x, dim=None, eps=1e-4):
+    if dim is None:
+        dim = list(range(1, x.ndim))
+    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+    norm = torch.add(eps, norm, alpha=np.sqrt(norm.numel() / x.numel()))
+    return x / norm.to(x.dtype)
+
+
+class MPFourier(torch.nn.Module):
+    def __init__(self, num_channels, bandwidth=1):
+        super().__init__()
+        self.register_buffer("freqs", 2 * np.pi * torch.randn(num_channels) * bandwidth)
+        self.register_buffer("phases", 2 * np.pi * torch.rand(num_channels))
+
+    def forward(self, x):
+        y = x.to(torch.float32)
+        y = y.ger(self.freqs.to(torch.float32))
+        y = y + self.phases.to(torch.float32)
+        y = y.cos() * np.sqrt(2)
+        return y.to(x.dtype)
+
+
+class MPConv(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel):
+        super().__init__()
+        self.out_channels = out_channels
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
+
+    def forward(self, x, gain=1):
+        w = self.weight.to(torch.float32)
+        if self.training:
+            with torch.no_grad():
+                self.weight.copy_(normalize(w))  # forced weight normalization
+        w = normalize(w)  # traditional weight normalization
+        w = w * (gain / np.sqrt(w[0].numel()))  # magnitude-preserving scaling
+        w = w.to(x.dtype)
+        if w.ndim == 2:
+            return x @ w.t()
+        assert w.ndim == 4
+        return torch.nn.functional.conv2d(x, w, padding=(w.shape[-1] // 2,))
+
+
+# ----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
 
 
 # @persistence.persistent_class
-class EDMLossAbstract:
-    def __init__(self, P_mean, P_std, sigma_data):
+class EDMLossAbstract:  # For some reason this cannot inherit (torch.nn.Module) when using wmse/wmae loss - why?
+    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False):
+        super().__init__()
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
+        self.use_logvar = use_logvar
+        if use_logvar:
+            logvar_channels = 128  # Intermediate dimensionality for uncertainty estimation.
+            log.info(f"Using log-variance with {logvar_channels} intermediate channels for noise weighting.")
+            self.logvar_fourier = MPFourier(logvar_channels)
+            self.logvar_linear = MPConv(logvar_channels, 1, kernel=[])
 
     @abstractmethod
-    def loss(self, preds, targets, sigma_weights):
+    def loss(self, preds, targets, sigma_weights, **kwargs):
         pass
 
-    def __call__(self, net, images, predictions_post_process=None, targets_pre_process=None, **kwargs):
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+    def __call__(self, net, images, predictions_post_process=None, targets_pre_process=None, sigma=None, **kwargs):
+        if sigma is None:
+            # Sample noise level from the prior distribution. Only specify sigma for analysis of loss vs. sigma.
+            rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+            sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        else:
+            sigma = sigma.reshape(-1, 1, 1, 1)
+
         weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
         y = images
         if targets_pre_process is not None:
@@ -420,19 +518,24 @@ class EDMLossAbstract:
                 assert diff_shape == 1, f"Shape mismatch: {D_yn.shape=} and {weight.shape=}"
                 weight = weight.unsqueeze(1)  # add missing dimension (e.g. time)
 
-        return {"loss": self.loss(D_yn, images, weight)}
+        loss_kwargs = {}
+        if self.use_logvar:
+            loss_kwargs["batch_logvars"] = self.logvar_linear(self.logvar_fourier(sigma.flatten().log() / 4))
+        loss = self.loss(D_yn, images, weight, **loss_kwargs)
+        return {"loss": loss} if torch.is_tensor(loss) else loss
 
 
 class EDMLoss(EDMLossAbstract):
-    def loss(self, preds, targets, sigma_weights):
+    def loss(self, preds, targets, sigma_weights, **kwargs):
+        assert len(kwargs) == 0, f"Unknown kwargs: {kwargs}. Consider using a weighted loss like 'wmse' instead?"
         # loss y, , n, and D_yn have the same shape (B, C, H, W). weight has shape (B, 1, 1, 1)
         return (sigma_weights * ((preds - targets) ** 2)).mean()
 
 
 class WeightedEDMLossAbstract(AbstractWeightedLoss, EDMLossAbstract):
-    def __init__(self, P_mean, P_std, sigma_data, **kwargs):
+    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, **kwargs):
         AbstractWeightedLoss.__init__(self, **kwargs)
-        EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data)
+        EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data, use_logvar=use_logvar)
 
     @property
     def weights(self):
@@ -462,8 +565,8 @@ class WeightedEDMLoss(WeightedEDMLossAbstract):
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
 
-    def loss(self, preds, targets, sigma_weights):
-        return self.weigh_loss(self.loss_func(preds - targets), multiply_weight=sigma_weights)
+    def loss(self, preds, targets, sigma_weights, **kwargs):
+        return self.weigh_loss(self.loss_func(preds - targets), multiply_weight=sigma_weights, **kwargs)
 
 
 class WeightedEDMLossCRPS(WeightedEDMLossAbstract):

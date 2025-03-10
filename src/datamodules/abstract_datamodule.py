@@ -14,7 +14,7 @@ from tensordict import TensorDict
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from src.evaluation.aggregators._abstract_aggregator import AbstractAggregator
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.utilities.utils import get_logger, raise_error_if_invalid_value
 
 
@@ -181,7 +181,7 @@ class BaseDataModule(pl.LightningDataModule):
         device: torch.device = None,
         verbose: bool = True,
         save_to_path: str = None,
-    ) -> Dict[str, AbstractAggregator]:
+    ) -> Dict[str, _Aggregator]:
         """Return the epoch aggregators for the given split."""
         return {}
 
@@ -220,48 +220,49 @@ class BaseDataModule(pl.LightningDataModule):
     def _shared_eval_dataloader_kwargs(self) -> dict:
         return dict(**self._shared_dataloader_kwargs(), shuffle=False)
 
+    def adjust_eval_batch_size_for_dataset(self, dataset: Dataset, default_batch_size: int, name: str) -> int:
+        """Adjust the eval batch size based on the dataset size when using DDP."""
+        if self.trainer is None:
+            return default_batch_size
+        world_size = self.trainer.world_size
+        data_points_per_gpu = len(dataset) // world_size
+        batch_size = min(default_batch_size, data_points_per_gpu)
+        if batch_size != default_batch_size:
+            log.info(
+                f"Dataset `{name}`: Adjusting eval batch size to {batch_size} based on"
+                f" dataset size ({len(dataset)}) and world size ({world_size})."
+            )
+        return batch_size
+
+
     def val_dataloader(self):
         if self._data_val is None:
             return None
-        elif isinstance(self._data_val, List):
-            return [
-                DataLoader(
-                    dataset=ds_val,
-                    batch_size=self.hparams.eval_batch_size,
-                    **self._shared_eval_dataloader_kwargs(),
-                )
-                for ds_val in self._data_val
-            ]
-        else:
-            return [
-                DataLoader(
-                    dataset=self._data_val,
-                    batch_size=self.hparams.eval_batch_size,
-                    **self._shared_eval_dataloader_kwargs(),
-                )
-            ]
+        ds_val = [self._data_val] if isinstance(self._data_val, Dataset) else self._data_val
+        dataloaders = []
+        for i, ds in enumerate(ds_val):
+            bs_here = self.adjust_eval_batch_size_for_dataset(ds, self.hparams.eval_batch_size, f"val_{i}")
+            dataloaders.append(DataLoader(dataset=ds,batch_size=bs_here, **self._shared_eval_dataloader_kwargs()))
+        return dataloaders
 
     def test_dataloader(self) -> DataLoader:
-        return (
-            DataLoader(
+        if self._data_test is None:
+            return None
+        return DataLoader(
                 dataset=self._data_test,
-                batch_size=self.test_batch_size,
+                batch_size=self.adjust_eval_batch_size_for_dataset(self._data_test, self.test_batch_size, "test"),
                 **self._shared_eval_dataloader_kwargs(),
             )
-            if self._data_test is not None
-            else None
-        )
 
-    def predict_dataloader(self) -> EVAL_DATALOADERS:
-        return (
-            DataLoader(
+    def predict_dataloader(self) -> DataLoader:
+        if self._data_predict is None:
+            return None
+        ebs_here = self.adjust_eval_batch_size_for_dataset(self._data_predict, self.hparams.eval_batch_size, "predict")
+        return DataLoader(
                 dataset=self._data_predict,
-                batch_size=self.hparams.eval_batch_size,
+                batch_size=ebs_here,
                 **self._shared_eval_dataloader_kwargs(),
             )
-            if self._data_predict is not None
-            else None
-        )
 
     def boundary_conditions(
         self,

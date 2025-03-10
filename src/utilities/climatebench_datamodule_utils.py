@@ -48,7 +48,7 @@ def standardize_output_xr(
             if "y" or "x" in output_xr[key].dims:
                 output_xr[key] = output_xr[key].rename({"y": "latitude", "x": "longitude"})
             # Convert pr to mm/day and rename lon and lat to longitude and latitude
-            if "pr" in output_vars:
+            if False:  # "pr" in output_vars:
                 log.info(f"Converting pr and pr90 to mm/day for {simulation}")
                 output_xr[key]["pr"] *= 86400
                 log.info(f"Finished converting pr and pr90 to mm/day for {simulation}")
@@ -63,7 +63,7 @@ def standardize_output_xr(
         if "y" or "x" in output_xr.dims:
             output_xr = output_xr.rename({"y": "latitude", "x": "longitude"})
 
-        if "pr" in output_vars:
+        if False:  # "pr" in output_vars:
             # Convert pr to mm/day and rename lon and lat to longitude and latitude
             log.info(f"Converting pr and pr90 to mm/day for {simulation}")
             output_xr["pr"] *= 86400  # less efficient: output_xr.assign({"pr": output_xr.pr * 86400})  # no pr90
@@ -144,7 +144,9 @@ def get_rsdt(
         rsdt["historical"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 
     # For now don't load piControl
-    rsdt_path = [path for path in rsdt_paths if "ssp126" in path][0]
+    rsdt_path = [path for path in rsdt_paths if "ssp126" in path]
+    assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
+    rsdt_path = rsdt_path[0]
     log.info(f"Loading rsdt data from {rsdt_path}")
     rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 

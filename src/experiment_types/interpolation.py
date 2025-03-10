@@ -13,7 +13,13 @@ from src.utilities.utils import (
 class InterpolationExperiment(BaseExperiment):
     r"""Base class for all interpolation experiments."""
 
-    def __init__(self, stack_window_to_channel_dim: bool = True, inference_val_every_n_epochs=None, **kwargs):
+    def __init__(
+        self,
+        stack_window_to_channel_dim: bool = True,
+        learned_time_variance_loss: bool = False,
+        inference_val_every_n_epochs=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         if inference_val_every_n_epochs is not None:
             self.log_text.warning("``inference_val_every_n_epochs`` will be ignored for interpolation experiments.")
@@ -23,6 +29,8 @@ class InterpolationExperiment(BaseExperiment):
         assert self.horizon >= 2, "horizon must be >=2 for interpolation experiments"
         if hasattr(self.model, "set_min_max_time"):
             self.model.set_min_max_time(min_time=self.horizon_range[0], max_time=self.horizon_range[-1])
+        if learned_time_variance_loss:
+            self.time_logvars = torch.nn.Parameter(torch.zeros(len(self.horizon_range), requires_grad=True))
 
     @property
     def horizon_range(self) -> List[int]:
@@ -59,7 +67,7 @@ class InterpolationExperiment(BaseExperiment):
 
     def actual_num_input_channels(self, num_input_channels: int) -> int:
         if self.hparams.stack_window_to_channel_dim:
-            return num_input_channels * self.window + num_input_channels
+            return num_input_channels * (self.window + 1)
         return 2 * num_input_channels  # inputs and targets are concatenated
 
     def postprocess_inputs(self, inputs):
@@ -121,7 +129,7 @@ class InterpolationExperiment(BaseExperiment):
             PREDS_RAW_K = f"t{t_step}_preds"
             targets_normed = targets["targets_normed"] if targets is not None else None
             targets_raw = targets["targets"] if targets is not None else None
-            aggregators[f"t{t_step}"].record_batch(
+            aggregators[f"t{t_step}"].update(
                 target_data=targets_raw,
                 gen_data=results[PREDS_RAW_K],
                 target_data_norm=targets_normed,
@@ -134,7 +142,7 @@ class InterpolationExperiment(BaseExperiment):
         self, dynamical_condition: Optional[Tensor], target_time: Union[int, Tensor]
     ) -> Tensor:
         if dynamical_condition is not None:
-            if isinstance(target_time, int):
+            if isinstance(target_time, (int, np.integer)):
                 return dynamical_condition[:, target_time, ...]
             else:
                 return dynamical_condition[torch.arange(dynamical_condition.shape[0]), target_time.long(), ...]
@@ -172,6 +180,9 @@ class InterpolationExperiment(BaseExperiment):
         targets = self.pack_data(targets, input_or_output="output")
         # We use timesteps  w-l+1, ..., w-1, w+h to predict timesteps w, ..., w+h-1
         # so t=0 corresponds to interpolating w, t=1 to w+1, ..., t=h-1 to w+h-1
+        if self.hparams.learned_time_variance_loss:
+            # Apply learned logvar for the corresponding time step for each batch element
+            batch["criterion_kwargs"] = {"batch_logvars": self.time_logvars[t - 1]}  # (b,)
 
         loss = self.model.get_loss(
             inputs=inputs,
@@ -182,6 +193,17 @@ class InterpolationExperiment(BaseExperiment):
         )  # function of BaseModel or BaseDiffusion classes
         return loss
 
+    def on_train_batch_end(self, outputs=None, batch=None, batch_idx: int = None):
+        super().on_train_batch_end(outputs=outputs, batch=batch, batch_idx=batch_idx)
+        if not (batch_idx == 0 or batch_idx % (self.trainer.log_every_n_steps * 2) == 0):
+            return  # Do not log the next things at every step
+
+        # Log logvar of the channels
+        if self.hparams.learned_time_variance_loss:
+            time_vars = self.time_logvars.exp().detach()
+            time_vars = {f"train/learned_var/t{t}": float(v) for t, v in zip(self.horizon_range, time_vars)}
+            self.log_dict(time_vars, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+
 
 class NextStepInterpolationExperiment(InterpolationExperiment):
     r"""Very similar to above, but instead of conditioning on x_0 and x_h to interpolate x_i,
@@ -191,18 +213,23 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
         self, n_autoregressive_train_steps: int = 0, autoregressive_loss_weights: List[float] = None, **kwargs
     ):
         super().__init__(**kwargs)
-        if autoregressive_loss_weights is None:
-            autoregressive_loss_weights = [1.0] * n_autoregressive_train_steps
-        else:
-            assert len(autoregressive_loss_weights) == n_autoregressive_train_steps
+        self.hparams.stack_window_to_channel_dim = False
         self.autoregressive_loss_weights = autoregressive_loss_weights
+        if autoregressive_loss_weights == "logvar":
+            self._ar_logvars = torch.nn.Parameter(torch.randn(len(self.horizon_range), requires_grad=True) * 0.01)
+        else:
+            assert autoregressive_loss_weights is None, "Only 'logvar' is supported for autoregressive_loss_weights"
 
     def get_epoch_aggregators(self, split: str, dataloader_idx: int = None) -> dict:
         aggs = super().get_epoch_aggregators(split, dataloader_idx)
         # Add autoregressive aggregators
         aggs2 = super().get_epoch_aggregators(split, dataloader_idx)
-        aggs2.pop("t1")  # remove the first timestep since it does not make sense to have autoregressive predictions
-        aggs.update({f"{k}_ar": v for k, v in aggs2.items()})
+        for k in aggs2.keys():
+            # remove the first timestep since it does not make sense to have autoregressive predictions
+            if k.startswith("t") and k != "t1":
+                aggs2[k].name = aggs2[k].prefix_name = f"{k}/ar"
+                aggs[f"{k}/ar"] = aggs2[k]
+
         return aggs
 
     @torch.inference_mode()
@@ -216,7 +243,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
         return_only_preds_and_targets: bool = False,
     ):
         no_aggregators = aggregators is None or len(aggregators.keys()) == 0
-        main_data_raw = batch.pop("raw")
+        main_data_raw = batch.pop("raw_dynamics")
         dynamics = batch["dynamics"]  # dynamics is a (b, t, c, h, w) tensor
         return_dict = dict()
 
@@ -247,7 +274,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
                 results["ar_preds"] = results_ar["preds"]
                 results["ar_targets"] = targets
 
-                aggregators[f"t{t_step}_ar"].record_batch(
+                aggregators[f"t{t_step}/ar"].update(
                     target_data=targets["targets"],
                     gen_data=results_ar["preds"],
                     target_data_norm=targets["targets_normed"],
@@ -274,7 +301,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
             PREDS_RAW_K = f"t{t_step}_preds"
             targets_normed = targets["targets_normed"] if targets is not None else None
             targets_raw = targets["targets"] if targets is not None else None
-            aggregators[f"t{t_step}"].record_batch(
+            aggregators[f"t{t_step}"].update(
                 target_data=targets_raw,
                 gen_data=results[PREDS_RAW_K],
                 target_data_norm=targets_normed,
@@ -311,7 +338,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
         return inputs
 
     # --------------------------------- Training
-    def get_loss(self, batch: Any, optimizer_idx: int = 0) -> Tensor:
+    def get_loss(self, batch: Any, optimizer_idx: int = 0) -> Dict[str, Tensor]:
         r"""Compute the loss for the given batch."""
         dynamics = batch["dynamics"]  # dynamics is a (b, t, c, h, w) tensor
         b = dynamics.shape[0]
@@ -329,12 +356,20 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
             **{k: v for k, v in batch.items() if k != "dynamics"},
             return_predictions=True,
         )  # function of BaseModel or BaseDiffusion classes
+        loss_dict = {"loss": loss} if torch.is_tensor(loss) else loss
+        if "raw_loss" not in loss_dict:
+            loss_dict["raw_loss"] = float(loss_dict["loss"])
+
+        if self.autoregressive_loss_weights == "logvar":
+            loss_dict["loss"] = loss_dict["loss"] / self._ar_logvars[0].exp() + self._ar_logvars[0]
+
         if self.hparams.n_autoregressive_train_steps > 0:
+            loss_dict["loss_ar0"] = float(loss_dict["loss"])
             for ar_step in range(1, self.hparams.n_autoregressive_train_steps + 1):
                 ar_time = t + ar_step
                 ar_time_valid = (ar_time <= self.horizon - 1).long()
                 ar_inputs = self.concat_future_conditioning(preds, dynamics)[ar_time_valid, ...]
-                ar_targets = dynamics[ar_time_valid, self.window + ar_time - 1, ...]
+                ar_targets = dynamics[ar_time_valid, self.window + ar_time - 1, ...]  # todo: fix when k>1
                 ar_loss, preds = self.model.get_loss(
                     inputs=ar_inputs,
                     targets=ar_targets,
@@ -342,5 +377,12 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
                     return_predictions=True,
                     **{k: v for k, v in batch.items() if k != "dynamics"},
                 )
-                loss += self.autoregressive_loss_weights[ar_step - 1] * ar_loss
-        return loss
+                ar_loss_dict = {"loss": ar_loss} if torch.is_tensor(ar_loss) else ar_loss
+                ar_loss = ar_loss_dict["loss"]
+                loss_dict["raw_loss"] += float(ar_loss_dict.get("raw_loss", ar_loss))
+                if self.autoregressive_loss_weights == "logvar":
+                    ar_loss = ar_loss / self._ar_logvars[ar_step].exp() + self._ar_logvars[ar_step]
+                loss_dict["loss"] += ar_loss
+                loss_dict[f"loss_ar{ar_step}"] = float(ar_loss)
+
+        return loss_dict

@@ -8,7 +8,10 @@ defaults:
   - override /module: interpolation_next_step.yaml
   - _self_
 
-name: "NavierStokes-IpolNext${datamodule.horizon}h_${module.n_autoregressive_train_steps}k-"
+name: "NavierStokes-IpolNext${datamodule.horizon}h_${module.n_autoregressive_train_steps}k"
+datamodule:
+  prediction_horizon: null
+
 module:
   enable_inference_dropout: True
   monitor: "val/avg/crps"

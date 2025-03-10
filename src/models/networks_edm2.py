@@ -227,7 +227,6 @@ class UNet(BaseModel):
         outer_sample_mode: str = None,  # bilinear or nearest
         upsample_dims: tuple = None,  # (256, 256) or (128, 120) etc.
         upsample_outputs_by: int = 1,
-        upsample_condition_by: int = 1,
         label_balance=0.5,  # Balance between noise embedding (0) and class embedding (1).
         concat_balance=0.5,  # Balance between skip connections (0) and main path (1).
         resample_filter=[1, 1],  # Resampling filter.
@@ -289,10 +288,6 @@ class UNet(BaseModel):
             self.upsampler = torch.nn.Upsample(size=tuple(upsample_dims), mode=outer_sample_mode)
         else:
             self.upsampler = None
-
-        self.upsample_condition = (
-            torch.nn.Upsample(scale_factor=upsample_condition_by) if upsample_condition_by > 1 else torch.nn.Identity()
-        )
 
         block_kwargs = dict(
             emb_channels=emb_channels,

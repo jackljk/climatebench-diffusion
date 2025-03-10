@@ -16,8 +16,8 @@ def test_labels_exist():
     gen_data = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     target_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     gen_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
-    agg.record_batch(loss, target_data, gen_data, target_data_norm, gen_data_norm)
-    logs = agg.get_logs(label="test")
+    agg.update(loss, target_data, gen_data, target_data_norm, gen_data_norm)
+    logs = agg.compute(label="test")
     assert "test/mean/loss" in logs
     assert "test/mean/l1/a" in logs
     assert "test/mean/weighted_rmse/a" in logs
@@ -38,30 +38,30 @@ def test_loss():
         "a": torch.randn(1, 2, 5, 5, device=get_device()),
     }
     aggregator = OneStepAggregator()
-    aggregator.record_batch(
+    aggregator.update(
         loss=1.0,
         target_data=example_data,
         gen_data=example_data,
         target_data_norm=example_data,
         gen_data_norm=example_data,
     )
-    aggregator.record_batch(
+    aggregator.update(
         loss=2.0,
         target_data=example_data,
         gen_data=example_data,
         target_data_norm=example_data,
         gen_data_norm=example_data,
     )
-    logs = aggregator.get_logs(label="metrics")
+    logs = aggregator.compute(label="metrics")
     assert logs["metrics/mean/loss"] == 1.5
-    aggregator.record_batch(
+    aggregator.update(
         loss=3.0,
         target_data=example_data,
         gen_data=example_data,
         target_data_norm=example_data,
         gen_data_norm=example_data,
     )
-    logs = aggregator.get_logs(label="metrics")
+    logs = aggregator.compute(label="metrics")
     assert logs["metrics/mean/loss"] == 2.0
 
 
@@ -72,6 +72,6 @@ def test_aggregator_raises_on_no_data():
     """
     aggregator = OneStepAggregator()
     with pytest.raises(ValueError) as excinfo:
-        aggregator.record_batch(loss=1.0, target_data={}, gen_data={}, target_data_norm={}, gen_data_norm={})
+        aggregator.update(loss=1.0, target_data={}, gen_data={}, target_data_norm={}, gen_data_norm={})
         # check that the raised exception contains the right substring
         assert "No data" in str(excinfo.value)

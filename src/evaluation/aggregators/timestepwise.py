@@ -3,28 +3,21 @@ from typing import Any, Dict, Mapping, Optional
 
 import torch
 import xarray as xr
-from torch import nn
 
-from src.evaluation import metrics
-from src.evaluation.reduced_metrics import AreaWeightedReducedMetric, ReducedMetric
-from src.losses import losses
-
-
-class AbstractMeanMetric:
-    def __init__(self, device: torch.device):
-        self._total = torch.tensor(0.0, device=device)
-
-    def get(self) -> torch.Tensor:
-        return self._total
-
-
-class L1Loss(AbstractMeanMetric):
-    # Note: NOT area weighted
-    def record(self, targets: torch.Tensor, preds: torch.Tensor):
-        self._total += nn.functional.l1_loss(preds, targets)
+from src.evaluation.torchmetrics import (
+    ContinuousRankedProbabilityScore,
+    GradientMagnitudePercentDifference,
+    MeanAbsoluteError,
+    MeanError,
+    MeanSquaredError,
+    Metric,
+    SpreadSkillRatio,
+)
+from src.evaluation.torchmetrics.regression import Average
+from src.evaluation.torchmetrics.regression.variance import StdDeviation
 
 
-class MeanAggregator:
+class MetricAggregator(Metric):
     """
     Aggregator for mean-reduced metrics.
 
@@ -41,95 +34,77 @@ class MeanAggregator:
         record_normed: bool = False,
         record_rmse: bool = True,
         record_abs_values: bool = False,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         self._area_weights = area_weights
-        self._n_batches = 0
-        self._variable_metrics: Optional[Dict[str, Dict[str, ReducedMetric]]] = None
+        self._variable_metrics: Optional[Dict[str, Dict[str, Metric]]] = None
         self.is_ensemble = is_ensemble
         self.record_normed = record_normed
         self.record_rmse = record_rmse
         self.record_abs_values = record_abs_values
-        if area_weights is None:
-            self._area_weights_dims = (-3, -2, -1)  # None  # ( -3, -2, -1))
-        elif len(area_weights.shape) == 2:
-            self._area_weights_dims = (-2, -1)
-        elif len(area_weights.shape) == 1:
-            self._area_weights_dims = (-1,)
-        else:
-            raise ValueError(f"Area weights must be 1D or 2D tensor, got {area_weights.shape}")
 
     def _get_variable_metrics(self, gen_data: Mapping[str, torch.Tensor]):
         if self._variable_metrics is None:
             self._variable_metrics = defaultdict(dict)
             if torch.is_tensor(gen_data):
-                self.device = gen_data.device
+                device = gen_data.device
                 gen_data_keys = [""]
             else:
-                self.device = gen_data[list(gen_data.keys())[0]].device  # any key will do
+                device = gen_data[list(gen_data.keys())[0]].device  # any key will do
                 gen_data_keys = list(gen_data.keys())
-            if self._area_weights is not None:
-                area_weights = self._area_weights.to(self.device)
-            else:
-                area_weights = None
+            assert self.device == device, f"Device mismatch: {self.device=} vs {device=}"
 
-            metric_names = ["l1", "rmse", "bias", "grad_mag_percent_diff"]
-            if self.is_ensemble:
-                metric_names += ["ssr", "crps"]
-            if self.record_normed:
-                metric_names += [f"{metric}_normed" for metric in metric_names if metric != "l1"]
-            for i, var_name in enumerate(gen_data_keys):
-                try:
-                    self._variable_metrics["l1"][var_name] = L1Loss(device=self.device)
-                except KeyError as e:
-                    if i > 0:
-                        raise e
-                    self._variable_metrics = dict()
-                    for metric in metric_names:
-                        self._variable_metrics[metric] = dict()
-                    self._variable_metrics["l1"][var_name] = L1Loss(device=self.device)
+            area_weights = None if self._area_weights is None else self._area_weights.to(self.device)
 
-                if self.record_rmse:
-                    mse_metric = ("rmse", metrics.root_mean_squared_error)
-                else:
-                    mse_metric = ("mse", metrics.mean_squared_error)
-                metrics_zipped = [
-                    mse_metric,
-                    ("bias", metrics.weighted_mean_bias),
-                    ("grad_mag_percent_diff", metrics.gradient_magnitude_percent_diff),
-                ]
-                if self.record_abs_values:
-                    metrics_zipped += [
-                        ("mean_gen", metrics.compute_metric_on(source="gen", metric=metrics.weighted_mean)),
-                        ("mean_target", metrics.compute_metric_on(source="target", metric=metrics.weighted_mean)),
-                        ("std_gen", metrics.compute_metric_on(source="gen", metric=metrics.weighted_std)),
-                        ("std_target", metrics.compute_metric_on(source="target", metric=metrics.weighted_std)),
-                    ]
-                if self.is_ensemble:
-                    metrics_zipped += [("crps", losses.crps_ensemble)]
-                    metrics_zipped += [("ssr", metrics.spread_skill_ratio)]
-
-                for i, (metric_name, metric) in enumerate(metrics_zipped):
-                    self._variable_metrics[metric_name][var_name] = AreaWeightedReducedMetric(
-                        area_weights=area_weights,
-                        device=self.device,
-                        compute_metric=metric,
-                        dim=self._area_weights_dims,
+            mse_name = "rmse" if self.record_rmse else "mse"
+            mse_squared = not self.record_rmse
+            suffixes = ["", "_normed"] if self.record_normed else [""]
+            for suffix in suffixes:
+                for i, var_name in enumerate(gen_data_keys):
+                    self._variable_metrics[f"l1{suffix}"][var_name] = MeanAbsoluteError(weights=area_weights)
+                    self._variable_metrics[f"{mse_name}{suffix}"][var_name] = MeanSquaredError(
+                        weights=area_weights, squared=mse_squared
                     )
-
-            if self.record_normed:
-                for var_name in gen_data_keys:
-                    for i, (metric_name, metric) in enumerate(metrics_zipped):
-                        self._variable_metrics[f"{metric_name}_normed"][var_name] = AreaWeightedReducedMetric(
-                            area_weights=area_weights,
-                            device=self.device,
-                            compute_metric=metric,
-                            dim=self._area_weights_dims,
+                    self._variable_metrics[f"bias{suffix}"][var_name] = MeanError(weights=area_weights)
+                    self._variable_metrics[f"grad_mag_percent_diff{suffix}"][var_name] = (
+                        GradientMagnitudePercentDifference(
+                            weights=area_weights, ensemble_dim=0 if self.is_ensemble else None
+                        )
+                    )
+                    pred_batch_dim = 1 if self.is_ensemble else 0
+                    if self.is_ensemble:
+                        self._variable_metrics[f"ssr{suffix}"][var_name] = SpreadSkillRatio(
+                            weights=area_weights, ensemble_dim=0
+                        )
+                        self._variable_metrics[f"crps{suffix}"][var_name] = ContinuousRankedProbabilityScore(
+                            weights=area_weights
                         )
 
+                    if self.record_abs_values:
+                        # todo: Implement weighted std
+                        self._variable_metrics[f"mean_gen{suffix}"][var_name] = Average(
+                            weights=area_weights, source="pred", batch_dim=pred_batch_dim
+                        )
+                        self._variable_metrics[f"std_gen{suffix}"][var_name] = StdDeviation(
+                            # weights=area_weights,
+                            source="pred", dim="except_1"
+                        )
+                        self._variable_metrics[f"mean_target{suffix}"][var_name] = Average(
+                            weights=area_weights, source="target", batch_dim=0
+                        )
+                        self._variable_metrics[f"std_target{suffix}"][var_name] = StdDeviation(
+                            # weights=area_weights,
+                            source="target", dim=None
+                        )
+            # Move to device
+            for metric in self._variable_metrics.values():
+                for v in metric.values():
+                    v.to(self.device)
         return self._variable_metrics
 
     @torch.inference_mode()
-    def record_batch(
+    def update(
         self,
         target_data: Mapping[str, torch.Tensor],
         gen_data: Mapping[str, torch.Tensor],
@@ -137,6 +112,11 @@ class MeanAggregator:
         gen_data_norm: Mapping[str, torch.Tensor] = None,
         metadata: Mapping[str, Any] = None,
     ):
+        # Get rank of process
+        # import os
+        # rank = os.environ.get("RANK", None) or os.environ.get("LOCAL_RANK", None)
+        # print(f"Rank: {rank}, {target_data.mean()=}")
+        # Be cautious when DDP and eval dataset size not divisible by world size!! (some items will be duplicated)
         variable_metrics = self._get_variable_metrics(gen_data)
         is_tensor = torch.is_tensor(gen_data)
         if is_tensor:  # add dummy key
@@ -148,6 +128,7 @@ class MeanAggregator:
         record_normed_list = [True, False] if self.record_normed else [False]
         for is_normed in record_normed_list:
             if is_normed:
+                # Use normalized data to compute metrics
                 preds_data = gen_data_norm
                 truth_data = target_data_norm
                 var_metrics_here = {metric: v for metric, v in variable_metrics.items() if "normed" in metric}
@@ -156,30 +137,23 @@ class MeanAggregator:
                 truth_data = target_data
                 var_metrics_here = {metric: v for metric, v in variable_metrics.items() if "normed" not in metric}
 
-            for metric in var_metrics_here.keys():  # e.g. l1, weighted_rmse, etc
-                if "grad_mag" in metric:
-                    kwargs = {"is_ensemble_prediction": self.is_ensemble}
-                else:
-                    kwargs = {}
-
+            for metric in var_metrics_here.keys():
                 for var_name, var_preds in preds_data.items():  # e.g. temperature, precipitation, etc
-                    if "ssr" in metric or "crps" in metric or "grad_mag" in metric:
+                    if "ssr" in metric or "crps" in metric or "grad_mag" in metric or not self.is_ensemble:
                         preds = var_preds
                     else:
-                        preds = var_preds.mean(dim=0) if self.is_ensemble else var_preds
+                        preds = var_preds.mean(dim=0)
 
                     # time_s = time.time()
                     try:
-                        variable_metrics[metric][var_name].record(targets=truth_data[var_name], preds=preds, **kwargs)
+                        variable_metrics[metric][var_name].update(preds, truth_data[var_name])
                     except AssertionError as e:
                         raise AssertionError(f"Error with {metric=}. {var_name=}, {self.is_ensemble=}") from e
                     # time.time() - time_s
                     # print(f"Time taken for {metric} {name} in s: {time_taken:.5f}")
 
-        self._n_batches += 1
-
     @torch.inference_mode()
-    def get_logs(self, label: str = "", epoch: Optional[int] = None) -> Dict[str, float]:
+    def compute(self, label: str = "", epoch: Optional[int] = None) -> Dict[str, float]:
         """
         Returns logs as can be reported to WandB.
 
@@ -187,19 +161,19 @@ class MeanAggregator:
             label: Label to prepend to all log keys.
             epoch: Current epoch number.
         """
-        if self._variable_metrics is None or self._n_batches == 0:
-            raise ValueError(f"No batches have been recorded. n_batches={self._n_batches}")
+        if self._variable_metrics is None:
+            raise ValueError(f"No batches have been recorded.")
         logs = {}
         label = label + "/" if label else ""
         for i, metric in enumerate(self._variable_metrics):
             for variable, metric_value in self._variable_metrics[metric].items():
-                metric_value = metric_value.get()
+                metric_value = metric_value.compute()
                 if metric_value is None:
                     raise ValueError(
-                        f"{metric=} hasn't been computed for {variable=}. ({label=}, {self._n_batches=}, {i=})"
+                        f"{metric=} hasn't been computed for {variable=}. ({label=},  {i=})"
                     )
                 log_key = f"{label}{metric}/{variable}".rstrip("/")
-                logs[log_key] = float((metric_value / self._n_batches).detach().item())
+                logs[log_key] = float(metric_value.detach().item())
 
         # for key in sorted(logs.keys()):
         # logs[key] = float(logs[key].cpu())  # .numpy()
@@ -208,7 +182,7 @@ class MeanAggregator:
 
     @torch.inference_mode()
     def get_dataset(self, label: str) -> xr.Dataset:
-        logs = self.get_logs(label=label)
+        logs = self.compute(label=label)
         logs = {key.replace("/", "-"): logs[key] for key in logs}
         data_vars = {}
         for key, value in logs.items():

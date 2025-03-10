@@ -238,10 +238,9 @@ def weighted_crps(
 def gradient_magnitude(tensor: Tensor, dim: Dimension = ()) -> Tensor:
     """Compute the magnitude of gradient across the specified dimensions."""
     no_singleton_dims = tuple(d for d in dim if tensor.shape[d] > 1)
-    gradients = torch.gradient(
-        tensor.squeeze(), dim=no_singleton_dims
-    )  # squeeze to remove singleton dimensions, which cause errors (edge_order)
-    grad_magnitude = torch.sqrt(sum([g**2 for g in gradients]))
+    # squeeze to remove singleton dimensions, which cause errors (edge_order)
+    gradients = torch.gradient(tensor.squeeze(), dim=no_singleton_dims)
+    grad_magnitude = sum([g**2 for g in gradients]) ** 0.5
     grad_magnitude = grad_magnitude.reshape(tensor.shape)  # restore original shape
     return grad_magnitude
 

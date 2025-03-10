@@ -1,4 +1,5 @@
-from functools import partial
+import operator
+from functools import partial, reduce
 from typing import Dict, Iterable, Optional, Union
 
 import torch
@@ -128,6 +129,7 @@ class AbstractWeightedLoss(torch.nn.Module):
         reduction: str = "mean",
         learned_var_dim_name_to_idx_and_n_dims: Dict[int, int] = None,
         learn_per_dim: bool = True,
+        reduce_op: str = "add",  # "add" or "mul"
         verbose: bool = True,
         **kwargs,
     ):
@@ -144,6 +146,7 @@ class AbstractWeightedLoss(torch.nn.Module):
         # log.info(f">>>> {learned_var_dim_name_to_idx_and_n_dims=}")
         self.learned_var_dim_name_to_idx_and_n_dims = learned_var_dim_name_to_idx_and_n_dims
         self.n_logvar_dims = len(learned_var_dim_name_to_idx_and_n_dims)
+        self._spatial_logvar_dim_names = [k for k in learned_var_dim_name_to_idx_and_n_dims if k.startswith("spatial")]
         # Assert all dim idxs are unique
         dim_idxs = [idx for idx, _ in self.learned_var_dim_name_to_idx_and_n_dims.values()]
         dim_sizes = [n_dims for _, n_dims in self.learned_var_dim_name_to_idx_and_n_dims.values()]
@@ -159,19 +162,52 @@ class AbstractWeightedLoss(torch.nn.Module):
             self._dim_idxs_from = tuple(dim_idxs)
             self._dim_idxs_to = tuple(range(self.n_logvar_dims))
 
-        for dim_name, (dim_idx, n_dims) in self.learned_var_dim_name_to_idx_and_n_dims.items():
-            assert n_dims > 0, f"Number of dimensions must be positive. {n_dims=}"
-            # assert dim_idx >= 0, f"Dimension index must be non-negative. {dim_idx=}"
-            # Register in __init__ to make it part of the model's parameters
-            # We implement the variance-weighted loss by simply learning a list of scalars, one per frame
-            if learn_per_dim:
-                setattr(self, f"{dim_name}_logvar", nn.Parameter(torch.randn(n_dims, requires_grad=True) * 0.01))
+        if learn_per_dim in [True, "except_spatial"]:
+            log_var_names = []
+            self.reduce_op = getattr(operator, reduce_op)  # add or mul
+            if verbose and self.n_logvar_dims > 1:
+                log.info(f"Using loss with learned variance for {self.n_logvar_dims} dimensions with {reduce_op=}.")
+            for dim_name, (dim_idx, n_dims) in self.learned_var_dim_name_to_idx_and_n_dims.items():
+                assert n_dims > 0, f"Number of dimensions must be positive. {n_dims=}"
+                # assert dim_idx >= 0, f"Dimension index must be non-negative. {dim_idx=}"
+                # Register in __init__ to make it part of the model's parameters
+                # We implement the variance-weighted loss by simply learning a list of scalars, one per frame
+                if learn_per_dim == "except_spatial" and dim_name in self._spatial_logvar_dim_names:
+                    # Skip spatial dimensions
+                    continue
+                if self.n_logvar_dims > 1:
+                    shape = [1] * self.n_logvar_dims
+                    shape[dim_idx] = n_dims
+                else:
+                    shape = (n_dims,)
+                dim_lv_weight = torch.randn(*shape, requires_grad=True) * 0.01
+                logvar_param_name = f"{dim_name}_logvar"
+                setattr(self, logvar_param_name, nn.Parameter(dim_lv_weight, requires_grad=True))
+                log_var_names.append(logvar_param_name)
                 # Double check it's just as good as:
                 # setattr(self, f"{dim_name}_logvar", nn.Parameter(torch.zeros(n_dims, requires_grad=True)))
                 if verbose:
                     log.info(f"Using loss with learned ``{dim_name}`` logvar with {n_dims=}, {dim_idx=}.")
-
-        if not learn_per_dim:
+            if learn_per_dim == "except_spatial":
+                # Learn a scalar for each spatial_i x spatial_j x ... x spatial_n dimension
+                assert (
+                    len(self._spatial_logvar_dim_names) > 0
+                ), f"Number of spatial dimensions must be positive. {self._spatial_logvar_dim_names=}"
+                spatial_lv_dims = []
+                for dim_name, (dim_idx, n_dims) in self.learned_var_dim_name_to_idx_and_n_dims.items():
+                    if dim_name in self._spatial_logvar_dim_names:
+                        spatial_lv_dims.append(n_dims)
+                    else:
+                        spatial_lv_dims.append(1)
+                self._spatial_logvar = nn.Parameter(torch.zeros(*spatial_lv_dims, requires_grad=True))
+                log_var_names.append("_spatial_logvar")
+                if verbose:
+                    log.info(f"Using loss with learned spatial logvar with dimensions {spatial_lv_dims}.")
+            else:
+                assert len(log_var_names) == self.n_logvar_dims, f"{log_var_names=}, {self.n_logvar_dims=}"
+            self.log_var_names = log_var_names
+        else:
+            assert learn_per_dim is False, f"Unknown {learn_per_dim=}"
             # Learn a scalar for each entry in dim_0 x dim_1 x ... x dim_n
             assert len(dim_sizes) > 0, f"Number of dimensions must be positive. {dim_sizes=}"
             self.logvars = nn.Parameter(torch.zeros(*dim_sizes, requires_grad=True))
@@ -193,21 +229,34 @@ class AbstractWeightedLoss(torch.nn.Module):
     def channels_logvar_vector(self):
         return self.logvar_vector("channels")
 
+    @property
+    def spatial_logvar(self):
+        if hasattr(self, "_spatial_logvar"):
+            return self._spatial_logvar.squeeze()
+        return self.logvar_vector(self._spatial_logvar_dim_names)
+
     def logvar_vector(self, dim_name):
         # Generally, the lower the variance, the higher the weight
-        if dim_name not in self.learned_var_dim_name_to_idx_and_n_dims:
+        if isinstance(dim_name, str) and dim_name not in self.learned_var_dim_name_to_idx_and_n_dims:
             raise AttributeError(f"{dim_name=} not found in {self.learned_var_dim_name_to_idx_and_n_dims=}.")
         if self.learn_per_dim:
-            return getattr(self, f"{dim_name}_logvar")
-        # Take mean over non-dim_name dimensions
-        dim_idx = self._dim_to_logvar_dim[dim_name]
-        return self.logvars.mean(dim=tuple([idx for idx in range(self.logvars.ndim) if idx != dim_idx]))
+            if isinstance(dim_name, str):
+                return getattr(self, f"{dim_name}_logvar").squeeze()
+            else:
+                return reduce(self.reduce_op, [getattr(self, f"{dim_name}_logvar") for dim_name in dim_name]).squeeze()
+        else:
+            dim_names = [dim_name] if isinstance(dim_name, str) else dim_name
+            dim_idxs = [self._dim_to_logvar_dim[dim_n] for dim_n in dim_names]
+            # Take mean over non-dim_name dimensions
+            return self.logvars.mean(dim=tuple([idx for idx in range(self.logvars.ndim) if idx not in dim_idxs]))
 
-    def weigh_loss(self, loss, add_weight=None, multiply_weight=None):
+    def weigh_loss(self, loss, add_weight=None, multiply_weight=None, batch_logvars=None) -> Dict[str, Tensor]:
         if self.weights is not None:
             weights = self.weights
         else:
-            assert add_weight is not None or multiply_weight is not None, "No weights provided. Please set or provide."
+            assert (
+                add_weight is not None or multiply_weight is not None or batch_logvars is not None
+            ), "No weights provided. Please set or provide."
             weights = torch.ones_like(loss)
 
         # Shapes are e.g.: inputs: (B, C, H, W), targets: (B, C, H, W), weights: (H, W) or (C, H, W)
@@ -249,9 +298,13 @@ class AbstractWeightedLoss(torch.nn.Module):
         except RuntimeError as e:
             raise RuntimeError(f"Failed to multiply {weights.shape=} by {loss.shape=}.") from e
 
+        losses = dict(raw_loss=float(loss.mean().detach()))
         if self.n_logvar_dims == 0:
-            pass
+            if batch_logvars is not None:
+                loss = loss.mean(dim=tuple(range(1, loss.ndim)))  # Take mean over non-batch dimensions
+                loss = loss / torch.exp(batch_logvars) + batch_logvars
         else:
+            assert batch_logvars is None, "todo: implement batch logvars here too"
             # Bring logvar dimensions to the front. note that the dims are sorted by index (increasing)
             loss = torch.movedim(loss, self._dim_idxs_from, self._dim_idxs_to)
             # Take mean over non-logvar dimensions
@@ -259,14 +312,11 @@ class AbstractWeightedLoss(torch.nn.Module):
 
             if self.n_logvar_dims == 1:
                 # Only one learned variance dimension
-                log_var_name = next(iter(self.learned_var_dim_name_to_idx_and_n_dims.keys()))
-                log_vars = getattr(self, f"{log_var_name}_logvar")
+                log_vars = getattr(self, self.log_var_names[0])
             elif self.learn_per_dim:
-                log_vars = [
-                    getattr(self, f"{log_var_name}_logvar")
-                    for log_var_name in self.learned_var_dim_name_to_idx_and_n_dims
-                ]
-                log_vars = torch.outer(*log_vars)
+                log_vars = [getattr(self, log_var_name) for log_var_name in self.log_var_names]
+                log_vars = reduce(self.reduce_op, log_vars)  # Will properly broadcast (69, 1, 1) * (1, 240, 1) * etc.
+                # log_vars = torch.outer(*log_vars)
             else:
                 log_vars = self.logvars  # Learned variance for all dimensions (>=2)
 
@@ -279,11 +329,13 @@ class AbstractWeightedLoss(torch.nn.Module):
             loss = loss / torch.exp(log_vars) + log_vars
 
         if self.reduction == "mean":
-            return loss.mean()
+            loss = loss.mean()
         elif self.reduction == "sum":
-            return loss.sum()
+            loss = loss.sum()
         else:
             raise ValueError(f"Unknown reduction {self.reduction}")
+        losses["loss"] = loss
+        return losses
 
     def forward(self, preds, targets):
         raise NotImplementedError("Subclasses must implement this method.")

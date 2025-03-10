@@ -45,7 +45,7 @@ class SnapshotAggregator:
         self.preprocess_fn = preprocess_fn if preprocess_fn is not None else lambda x: x
 
     @torch.inference_mode()
-    def record_batch(
+    def update(
         self,
         target_data: Mapping[str, torch.Tensor],
         gen_data: Mapping[str, torch.Tensor],
@@ -77,7 +77,7 @@ class SnapshotAggregator:
             ), f"target_time={self.target_time}, time_in_batch={self.target_time_in_batch} is larger than the number of timesteps in the data={data_steps}!"
 
     @torch.inference_mode()
-    def get_logs(self, label: str = "", epoch: int = None):
+    def compute(self, label: str = "", epoch: int = None):
         """
         Returns logs as can be reported to WandB.
 
@@ -94,7 +94,7 @@ class SnapshotAggregator:
         max_snapshots = 2  # 3
         names = self.var_names
         if names is None:
-            names = list(self._gen_data_norm.keys()) if isinstance(self._gen_data_norm, dict) else [None]
+            names = list(self._gen_data_norm.keys()) if hasattr(self._gen_data_norm, "keys") else [None]
         for name in names:
             name_label = f"/{name}" if name is not None else ""
             if name is not None and "normed" in name:
@@ -110,7 +110,7 @@ class SnapshotAggregator:
             snapshots_pred = snapshots_pred[:max_snapshots, 0] if self.is_ensemble else snapshots_pred[0].unsqueeze(0)
             target_for_image = target_data[name][0] if name is not None else target_data[0]
             if name is None:
-                assert snapshots_pred.shape[1] == 1, f"{snapshots_pred.shape=} but expected 1 variable only."
+                assert snapshots_pred.shape[1] == 1, f"{snapshots_pred.shape=} but expected 1 variable only ({name=})."
                 snapshots_pred = snapshots_pred.squeeze(1)
                 target_for_image = target_for_image.squeeze(0)
             target_datetime = self._metadata["datetime"][0] if "datetime" in self._metadata else None

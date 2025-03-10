@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import einsum, nn
-from xformers.ops import memory_efficient_attention, unbind
 
+# from xformers.ops import memory_efficient_attention, unbind
 from src.models.modules.misc import checkpoint
 from src.utilities.utils import default, exists
 
@@ -82,6 +82,7 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(nn.Module):
+
     def __init__(
         self,
         dim: int,
@@ -102,6 +103,8 @@ class MemEffAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, attn_bias=None):
+        from xformers.ops import unbind
+
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
@@ -116,6 +119,8 @@ class MemEffAttention(nn.Module):
 
     @torch.compiler.disable()
     def attention_forward(self, q, k, v, attn_bias=None):
+        from xformers.ops import memory_efficient_attention
+
         return memory_efficient_attention(q, k, v, attn_bias=attn_bias)
 
 
@@ -177,12 +182,11 @@ class CrossAttention(nn.Module):
         q = self.to_q(x)
         # print(f"Using context? {context is not None}. x shape: {x.shape}")
         if context is not None and context.ndim == 2:
-            context = repeat(context, "b n -> b () n", b=x.shape[0])  #
+            context = repeat(context, "b hd -> b () hd", b=x.shape[0])  # [B, 1, hd]
             # print(f"Context shape: {context.shape}")
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
-
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
 
         sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
@@ -197,6 +201,7 @@ class CrossAttention(nn.Module):
         attn = sim.softmax(dim=-1)
 
         out = einsum("b i j, b j d -> b i d", attn, v)
+        # print(f"cross attn {x.shape=}, {context.shape=}, {q.shape=}, {k.shape=}, {v.shape=}, {sim.shape=}, {attn.shape=}, {out.shape=}")
         out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
         return self.to_out(out)
 

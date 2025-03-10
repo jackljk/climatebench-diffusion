@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch.nn import SiLU
 from torch.nn.functional import silu
 
 from src.models._base_model import BaseModel
@@ -247,6 +248,9 @@ class UNetBlock(torch.nn.Module):
         attention=False,
         num_heads=None,
         channels_per_head=64,
+        cross_attention=False,
+        context_channels: int = False,
+        create_context_length: Optional[int] = None,
         dropout=0,
         skip_scale=1,
         eps=1e-5,
@@ -307,20 +311,39 @@ class UNetBlock(torch.nn.Module):
                 **init,
             )
 
+        init_attn = init_attn if init_attn is not None else init
+        attn_kwargs = dict(kernel=1, dimension=dimension)
         if self.num_heads:
             self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
-            self.qkv = Conv2d(
-                in_channels=out_channels,
-                out_channels=out_channels * 3,
-                kernel=1,
-                **(init_attn if init_attn is not None else init),
-                dimension=dimension,
-            )
-            self.proj = Conv2d(
-                in_channels=out_channels, out_channels=out_channels, kernel=1, dimension=dimension, **init_zero
-            )
+            self.qkv = Conv2d(**attn_kwargs, in_channels=out_channels, out_channels=out_channels * 3, **init_attn)
+            self.proj = Conv2d(**attn_kwargs, in_channels=out_channels, out_channels=out_channels, **init_zero)
+        if cross_attention:
+            attn_kwargs_c = dict(kernel=1, dimension=1)
+            self.norm3 = GroupNorm(num_channels=out_channels, eps=eps)
+            self.to_q = Conv2d(**attn_kwargs, in_channels=out_channels, out_channels=out_channels, **init_attn)
+            if create_context_length is not None:
+                if isinstance(create_context_length, int):
+                    self.preprocess_cond = Linear(context_channels, out_channels * create_context_length, **init)
+                else:
+                    create_context_length = int(create_context_length.replace("non_linear", ""))
+                    self.preprocess_cond = torch.nn.Sequential(
+                        Linear(context_channels, out_channels * create_context_length, **init),
+                        SiLU(),
+                        Linear(out_channels * create_context_length, out_channels * create_context_length, **init),
+                    )
+                context_channels = out_channels
+                self.reshape_cond = lambda c: rearrange(c, "b (c l) -> b c l", c=out_channels, l=create_context_length)
+                self.cond_pos_embed = torch.nn.Parameter(torch.randn(1, out_channels, create_context_length) * 0.02)
+            else:
+                self.preprocess_cond = torch.nn.Identity()
+                self.reshape_cond = lambda c: c.unsqueeze(-1)
+                self.cond_pos_embed = None
 
-    def forward(self, x, emb, shift=None, scale=None):
+            self.to_k = Conv2d(**attn_kwargs_c, in_channels=context_channels, out_channels=out_channels, **init_attn)
+            self.to_v = Conv2d(**attn_kwargs_c, in_channels=context_channels, out_channels=out_channels, **init_attn)
+            self.proj_cattn = Conv2d(**attn_kwargs, in_channels=out_channels, out_channels=out_channels, **init_zero)
+
+    def forward(self, x, emb, shift=None, scale=None, context=None):
         orig = x
         # print(f"UNetBlock: {x.shape=}, {self.in_channels=}, {self.out_channels=}, {self.emb_channels=}")
         x = self.conv0(silu(self.norm0(x)))
@@ -344,7 +367,7 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             # x.shape = (B, C, H, W) and let B' = B * num_heads and C' = C // num_heads
-            B2, C2 = x.shape[0] * self.num_heads, x.shape[1] // self.num_heads  # B2 = B * num_heads * H * W
+            B2, C2 = x.shape[0] * self.num_heads, x.shape[1] // self.num_heads  # B2 = B * num_heads,  H * W
             q, k, v = self.qkv(self.norm2(x)).reshape(B2, C2, 3, -1).unbind(2)
             # q = k = v.shape = (B', C', H * W)
             # print(f"{q.shape=}, {k.shape=}, {v.shape=}, {x.shape=}")
@@ -353,8 +376,20 @@ class UNetBlock(torch.nn.Module):
             else:
                 w = AttentionOp.apply(q, k)  # w.shape = (B', H * W, H * W)
             a = torch.einsum("nqk,nck->ncq", w, v)  # a.shape = (B', C', H * W)
-            x = self.proj(a.reshape(*x.shape)).add_(x)
-            x = x * self.skip_scale
+            x = self.proj(a.reshape(*x.shape)).add_(x) * self.skip_scale
+        if hasattr(self, "norm3"):
+            q = self.to_q(self.norm3(x)).reshape(B2, C2, -1)  # to_k(x).shape = x = (B, C, H, W), q = (B2, C2, H * W)
+            context = self.reshape_cond(self.preprocess_cond(context))
+            if self.cond_pos_embed is not None:
+                context = context + self.cond_pos_embed
+            # print(f"{x.shape=}, {self.to_q(self.norm3(x)).shape=}, {q.shape=}, {self.to_k(context).shape=}")
+            k, v = self.to_k(context).reshape(B2, C2, -1), self.to_v(context).reshape(B2, C2, -1)
+
+            w = AttentionOp.apply(q, k)  # w.shape = (B', H * W, seq_len_context)
+            a = torch.einsum("nqk,nck->ncq", w, v)  # a.shape = (B', C3, H * W)
+            x = self.proj_cattn(a.reshape(*x.shape)).add_(x) * self.skip_scale
+            # print(f"c attn {x.shape=}, {q.shape=}, {context.shape=}, {k.shape=}, {v.shape=}, {w.shape=}, {a.shape=}")
+
         return x
 
 
@@ -883,12 +918,13 @@ class DhariwalUNet(BaseModel):
         with_time_emb: bool = True,  # Include time embedding in the output.
         emb_init_identity: bool = False,  # Initialize the timestep adaptive LN so that it has no effect.
         outer_sample_mode: str = None,  # bilinear or nearest
-        upsample_dims: tuple = None,  # (256, 256) or (128, 120) etc.
+        upsample_dims: tuple = None,  # (256, 256) or (128, 120) etc. This is used for the input image size.
+        upsample_hidden_spatial_dims_auto: bool = False,  # Automatically upsample hidden spatial dims when uneven.
         upsample_outputs_by: int = 1,
-        upsample_condition_by: int = 1,
         in_channel_cross_attn: bool = False,
         non_spatial_conditioning_mode: str = None,
         non_spatial_cond_hdim: int = None,
+        create_context_length: int = None,
         null_embedding_for_non_spatial_cond: str = "zeros",  # zeros, noop, learn
         **kwargs,
     ):
@@ -934,6 +970,7 @@ class DhariwalUNet(BaseModel):
             self.map_noise = None
             emb_channels = self.emb_channels = None
 
+        use_cross_attn = self.non_spatial_conditioning_mode == "cross_attn"
         block_kwargs = dict(
             emb_channels=emb_channels,
             channels_per_head=channels_per_head,  # caution: if dim < channels_per_head, no attention will be applied
@@ -941,6 +978,8 @@ class DhariwalUNet(BaseModel):
             init=init,
             init_zero=init_zero,
             emb_init_identity=emb_init_identity,
+            context_channels=self.non_spatial_cond_hdim,
+            create_context_length=create_context_length,
         )
 
         if augment_dim:
@@ -959,15 +998,14 @@ class DhariwalUNet(BaseModel):
         else:
             self.map_label = None
 
-        if outer_sample_mode is not None:
+        if upsample_dims is not None:
+            assert outer_sample_mode is not None, "Need to provide outer_sample_mode when upsample_dims is provided."
             # Upsample (45, 90) -> (48, 96) to be easier to divide by 2 multiple times
             self.upsampler = torch.nn.Upsample(size=tuple(upsample_dims), mode=outer_sample_mode)
         else:
+            if upsample_hidden_spatial_dims_auto and outer_sample_mode is None:
+                self.hparams.outer_sample_mode = "bilinear"
             self.upsampler = None
-
-        self.upsample_condition = (
-            torch.nn.Upsample(scale_factor=upsample_condition_by) if upsample_condition_by > 1 else torch.nn.Identity()
-        )
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
@@ -1004,7 +1042,11 @@ class DhariwalUNet(BaseModel):
                 cin = cout
                 cout = model_channels * mult
                 self.enc[f"{res}x{res}_block{idx}"] = UNetBlock(
-                    in_channels=cin, out_channels=cout, attention=use_attn, **block_kwargs
+                    in_channels=cin,
+                    out_channels=cout,
+                    attention=use_attn,
+                    cross_attention=use_attn and use_cross_attn,
+                    **block_kwargs,
                 )
 
         skips += [block.out_channels for block in self.enc.values()]
@@ -1033,7 +1075,7 @@ class DhariwalUNet(BaseModel):
                 )
             if level == len(channel_mult) - 1:
                 self.dec[f"{res}x{res}_in0"] = UNetBlock(
-                    in_channels=cout, out_channels=cout, attention=True, **block_kwargs
+                    in_channels=cout, out_channels=cout, attention=True, cross_attention=use_cross_attn, **block_kwargs
                 )
                 self.dec[f"{res}x{res}_in1"] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
@@ -1046,6 +1088,7 @@ class DhariwalUNet(BaseModel):
                     in_channels=cin,
                     out_channels=cout,
                     attention=use_attn,
+                    cross_attention=use_attn and use_cross_attn,
                     up=super_res,
                     **block_kwargs,
                 )
@@ -1068,6 +1111,8 @@ class DhariwalUNet(BaseModel):
         metadata=None,
     ):
         x = self.concat_condition_if_needed(inputs, condition, dynamical_condition, static_condition)
+        if condition_non_spatial is not None:
+            condition_non_spatial = self.preprocess_non_spatial_conditioning(condition_non_spatial)
         orig_x_shape = x.shape[-2:]
         x = self.upsampler(x) if self.upsampler is not None else x
 
@@ -1077,7 +1122,7 @@ class DhariwalUNet(BaseModel):
             # Text emb is null if all features are zero. Check for each batch element and replace with null embedding.
             # Calculate L2 norm along embedding dimension
             assert len(condition_non_spatial.shape) == 2, f"{condition_non_spatial.shape=}"
-            ada_ln_input = self.preprocess_non_spatial_conditioning(condition_non_spatial)
+            ada_ln_input = condition_non_spatial
         elif time is not None:
             ada_ln_input = time
         else:
@@ -1100,13 +1145,15 @@ class DhariwalUNet(BaseModel):
         if time_emb_2 is None:
             time_emb_2 = emb
 
+        for_cross_attn = condition_non_spatial if self.non_spatial_conditioning_mode == "cross_attn" else None
+
         # blocks_with_emb = (UNetBlock, TemporalAttentionBlock, TemporalAttentionBlock2)
         temporal_blocks = (TemporalAttentionBlock, TemporalAttentionBlock2, TemporalAttentionBlock3)
         # Encoder.
         skips = []
         for block in self.enc.values():
             if isinstance(block, UNetBlock):
-                x = block(x, emb)
+                x = block(x, emb, context=for_cross_attn)
             elif isinstance(block, temporal_blocks):
                 x = block(x, time_emb_2) if not skip_temporal_blocks else x
             else:
@@ -1136,9 +1183,13 @@ class DhariwalUNet(BaseModel):
             # log.info(f"block: {block_name}, {x.shape=}, {skips[-1].shape=}, {x.shape[1] != block.in_channels}")
             # print(f"dec block: {block_name}, {x.shape=}, {skips[-1].shape=}, {emb is None}")
             if not isinstance(block, temporal_blocks) and x.shape[1] != block.in_channels:
-                x = torch.cat([x, skips.pop()], dim=1)
+                skip = skips.pop()
+                if self.hparams.upsample_hidden_spatial_dims_auto and skip.shape[-2] != x.shape[-2]:
+                    # self.log_text.info(f"Upsampling skip connection from {x.shape[-2:]} to {skip.shape[-2:]}")
+                    x = F.interpolate(x, size=skip.shape[-2:], mode=self.hparams.outer_sample_mode)
+                x = torch.cat([x, skip], dim=1)
             if isinstance(block, UNetBlock):
-                x = block(x, emb)
+                x = block(x, emb, context=for_cross_attn)
             elif isinstance(block, temporal_blocks):
                 x = block(x, time_emb_2) if not skip_temporal_blocks else x
             else:
@@ -1342,3 +1393,27 @@ class DhariwalUNetTemporal(DhariwalUNet):
         x = super().forward(x, time=time, time_emb_2=emb_t, **kwargs)
         x = rearrange(x, "(b t) c h w -> b c t h w", b=b)
         return x
+
+
+if __name__ == "__main__":
+    n_non_spatial_c = 396
+    unet = DhariwalUNet(
+        model_channels=64,
+        num_input_channels=3,
+        num_output_channels=6,
+        spatial_shape_in=(45, 90),
+        spatial_shape_out=(45, 90),
+        upsample_dims=(48, 96),
+        outer_sample_mode="bilinear",
+        non_spatial_conditioning_mode="cross_attn",
+        num_conditional_channels_non_spatial=n_non_spatial_c,
+        non_spatial_cond_hdim=None,
+        with_time_emb=False,
+        attn_levels=range(3),
+        create_context_length=32,
+    )
+    B = 10
+    x = torch.rand(B, 3, 45, 90)
+    cond = torch.randn(B, n_non_spatial_c)
+    y = unet(x, condition_non_spatial=cond)
+    # print(unet.print_intermediate_shapes(x, n_non_spatial_c))

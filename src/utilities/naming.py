@@ -83,11 +83,7 @@ def get_detailed_name(config, add_unique_suffix: bool = True) -> str:
         and f"{hor}h" not in s.lower()
         and f"{hor}l" not in s.lower()
     ):
-        print(
-            f"WARNING: horizon {hor} not in name, but should be!",
-            s,
-            config.get("name_suffix"),
-        )
+        # print(f"WARNING: horizon {hor} not in name, but should be ({s=})")
         s = s[:-1] + f"-MH{hor}_"
 
     s += str(config.get("name_suffix")) + "_" if config.get("name_suffix") is not None else ""

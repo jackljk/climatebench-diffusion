@@ -59,7 +59,7 @@ class KolmogorovDataModule(BaseDataModule):
         self.test_filepath = join(data_dir, test_filename) if test_filename is not None else None
         if "inits" in filename:
             # e.g. "kolmogorov-N256-n_inits32-T1000.nc" or "kolmogorov-N256-n_inits16-T250_downsampled4.nc"
-            filename_with_info = filename.strip(".nc").rsplit('_', 1)[0]
+            filename_with_info = filename.strip(".nc").rsplit("_", 1)[0]
             _, dim_x, n_trajs, n_timesteps = filename_with_info.split("-")
             dim_x = dim_y = int(dim_x.strip("N"))
             n_trajs = int(n_trajs.strip("n_inits"))
@@ -318,7 +318,7 @@ class KolmogorovDataModule(BaseDataModule):
             **aggr_kwargs,
             "record_rmse": True,
             "every_nth_epoch_snapshot": 10,
-            "record_normed": False, #self.hparams.standardize,
+            "record_normed": False,  # self.hparams.standardize,
             "record_abs_values": True,  # will record mean and std of the absolute values of preds and targets
         }
         horizon = self.get_horizon(split, dataloader_idx)
@@ -327,7 +327,7 @@ class KolmogorovDataModule(BaseDataModule):
             horizon_range = range(1, horizon)
         else:
             horizon_range = range(1, horizon + 1)
-        snap_timesteps = [1, 4, horizon //2, horizon]
+        snap_timesteps = [1, 4, horizon // 2, horizon]
         aggregators = dict()
         for h in horizon_range:
             one_step_kwargs["use_snapshot_aggregator"] = h in snap_timesteps
@@ -368,7 +368,7 @@ class KolmogorowFlowDataset(torch.utils.data.Dataset):
         if add_noise_level > 0.0:
             log.info(f"[ds.id={dataset_id}] Adding noise to the data with level={add_noise_level}")
             # same as np.random.randn(*self.np_data.shape) * add_noise_level
-            noise = np.random.normal( 0, add_noise_level, self.np_data.shape)
+            noise = np.random.normal(0, add_noise_level, self.np_data.shape)
             self.np_data += noise
 
         # log.info(f"Length per traj: {length_per_traj}, n_trajs: {self.n_trajs},  window_size: {self.window_size}, subsample: {subsample}, len(time): {len(dataset.time)}, length: {self.length}")

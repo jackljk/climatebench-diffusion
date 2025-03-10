@@ -312,13 +312,13 @@ class VideoAggregator:
             i_time_start=i_time_start,
         )
         if self._error_data is not None:
-            self._error_data.record_batch(
+            self._error_data.update(
                 target_data=target_data,
                 gen_data=gen_data,
                 i_time_start=i_time_start,
             )
         if self._variance_data is not None:
-            self._variance_data.record_batch(
+            self._variance_data.update(
                 target_data=target_data,
                 gen_data=gen_data,
                 i_time_start=i_time_start,

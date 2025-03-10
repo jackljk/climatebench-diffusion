@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List
 
 import torch
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from torch import Tensor
 
-from src.diffusion._base_diffusion import BaseDiffusion
 from src.experiment_types._base_experiment import BaseExperiment
 from src.utilities.utils import (
     rrearrange,
@@ -55,7 +55,7 @@ class EmulationExperiment(BaseExperiment):
         split: str,
         dataloader_idx: int = None,
         return_outputs: bool | str = None,
-        aggregators: Dict[str, Callable] = None,
+        aggregators: Dict[str, _Aggregator] = None,
     ):
         return_dict = dict()
         return_outputs = return_outputs or self.hparams.return_outputs_at_evaluation
@@ -63,15 +63,10 @@ class EmulationExperiment(BaseExperiment):
         # pop metadata from batch since not needed for evaluation
         metadata = batch.pop("metadata", None)
         raw_targets = batch.pop("raw_targets", None)  # Unnormalized (raw scale) data, used to compute targets
-        if isinstance(self.model, BaseDiffusion) and split == "val":
+        if self.is_diffusion_model and split == "val":
             # log validation loss
             loss = self.get_loss(batch)
-            if isinstance(loss, dict):
-                # add split/ prefix if not already there
-                log_dict = {f"{split}/{k}" if not k.startswith(split) else k: float(v) for k, v in loss.items()}
-            elif torch.is_tensor(loss):
-                log_dict = {f"{split}/loss": float(loss)}
-            self.log_dict(log_dict, on_step=False, on_epoch=True)
+            aggregators["diffusion_loss"].update(loss=loss)
 
         _ = batch.pop("targets", None)  # Remove normalized targets if present, not needed any more
         # Get predictions
@@ -95,7 +90,9 @@ class EmulationExperiment(BaseExperiment):
 
         # Compute metrics
         for agg_name, agg in aggregators.items():
-            agg.record_batch(
+            if agg_name == "diffusion_loss":
+                continue  # already logged above
+            agg.update(
                 target_data=targets_raw,
                 gen_data=preds_raw,
                 target_data_norm=targets_normed,

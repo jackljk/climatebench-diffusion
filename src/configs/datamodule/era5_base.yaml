@@ -11,7 +11,8 @@ text_data_path: null
 text_type: null    # can be "tf-idf" or "bert"
 # predict_slice: Optional[slice] = slice("2020-12-01", "2020-12-31"),
 hourly_resolution: 1
-subsample_valid: 20   #  1 for no subsampling. 20 gives around 72 samples for validation
+subsample_valid: 1   #  1 for no subsampling. 20 gives around 72 samples for validation
+max_val_samples: 128   # Will choose optimal subsampling. To have a round number of batches for validation that can be used with many GPUs
 prediction_horizon: 240   #${datamodule.horizon}   # may set to higher rollouts
 prediction_horizon_long: null   #${datamodule.horizon}   # may set to higher rollouts
 static_fields:

@@ -1,0 +1,24 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=kolmogorov_erdm3d
+
+defaults:
+  - kolmogorov.yaml
+  - override /module: rdm.yaml
+  - override /model: adm_tempo.yaml
+  - override /diffusion: erdm.yaml
+  - _self_
+
+name: "Kolg-H${datamodule.horizon}-ERDM"
+model:
+  with_time_emb: True  # set to true to use time embeddings
+
+
+diffusion:
+  time_to_channels: False  # time is modeled as an extra dimension
+
+module:
+  stack_window_to_channel_dim: False
+  initialize_window: "regression"
+  from_pretrained_checkpoint_run_id: ???

@@ -12,9 +12,9 @@ diffusion:
   interpolator: null
    # Option 2. Wandb run id of the interpolator (set the desired file name in interpolator_wandb_ckpt_filename, e.g. "last.ckpt")
   interpolator_run_id: null
-  interpolator_wandb_ckpt_filename: "best-val_ipol_avg_crps.ckpt"   # only used if interpolator_run_id is not None
+  interpolator_wandb_ckpt_filename: "best-val_avg_crps.ckpt"   # only used if interpolator_run_id is not None
   # Option 3. Local path to the interpolator checkpoint (what is saved by, e.g., torch.save(model.state_dict(), path))
-  interpolator_local_checkpoint_path: True
+  interpolator_local_checkpoint_path: True   # If True, search in checkpoint dir for checkpoint file (based on interpolator_run_id and interpolator_wandb_ckpt_filename)
   interpolator_artificial_steps_run_id: null
   # Contribution of the loss term to the total loss.
   lambda_reconstruction: 1.0    # corresponds to the main loss term (diffusion loss)

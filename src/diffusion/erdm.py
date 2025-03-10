@@ -86,13 +86,21 @@ class ERDM(BaseDiffusion):
         self.tmax = sigma_max
         if learnable_schedule:
             if "edm" in schedule:
-                if learnable_schedule in [True, "v0"]:
+                if learnable_schedule == "v2":
+                    self._rho_max = 100.0  # both for negative and positive, convexity: 3 -> 100 -> -100 -> -3
+                    self.raw_sigma_min = torch.nn.Parameter(torch.log(torch.tensor(sigma_min)))
+                    self.raw_sigma_delta = torch.nn.Parameter(torch.log(torch.tensor(sigma_max - sigma_min)))
+                    rho = torch.nn.Parameter(torch.tensor(torch.pi))
+
+                elif learnable_schedule in [True, "v0"]:
                     rho = torch.nn.Parameter(torch.tensor(float(rho), dtype=torch.float32))  # c))  # clamp to [4, 10]
                 elif learnable_schedule == "v1":
                     # y = 7 + 5 * (torch.sigmoid(rho)-0.5)  # sigmoid gives values between 0 and 1, so multiply by 5 to get values between 5 and 10
                     rho = torch.nn.Parameter(torch.tensor(0.0))
                 else:
                     raise ValueError(f"Invalid value for learnable_schedule: {learnable_schedule}")
+            else:
+                raise NotImplementedError(f"learnable_schedule not implemented for schedule {schedule}")
 
         self.exp = rho
         self.a = a
@@ -128,7 +136,14 @@ class ERDM(BaseDiffusion):
 
     def get_exp(self, **kwargs):
         if self.hparams.learnable_schedule:
-            if self.hparams.learnable_schedule in [True, "v0"]:
+            if self.hparams.learnable_schedule == "v2":
+                angle = self.exp % (2 * torch.pi)
+                if angle < torch.pi:
+                    rho = 3 + (self._rho_max - 3) * angle / torch.pi
+                else:
+                    rho = -self._rho_max + (self._rho_max - 3) * (angle - torch.pi) / torch.pi
+                return rho
+            elif self.hparams.learnable_schedule in [True, "v0"]:
                 return torch.clamp(self.exp, 4, 10)
             elif self.hparams.learnable_schedule == "v1":
                 return 7 + 5 * (torch.sigmoid(self.exp) - 0.5)
@@ -138,13 +153,17 @@ class ERDM(BaseDiffusion):
             return self.exp
 
     def get_tmax(self, **kwargs):
-        if self.hparams.sigma_max_training is not None and self.training:
+        if self.hparams.learnable_schedule == "v2":
+            return self.get_tmin() + torch.exp(self.raw_sigma_delta)
+        elif self.hparams.sigma_max_training is not None and self.training:
             return sample_random_real(*self.hparams.sigma_max_training, self.hparams.training_distribution, **kwargs)
         else:
             return self.tmax
 
     def get_tmin(self, **kwargs):
-        if self.hparams.sigma_min_training is not None and self.training:
+        if self.hparams.learnable_schedule == "v2":
+            return torch.exp(self.raw_sigma_min)
+        elif self.hparams.sigma_min_training is not None and self.training:
             return sample_random_real(*self.hparams.sigma_min_training, self.hparams.training_distribution, **kwargs)
         else:
             return self.tmin
@@ -360,13 +379,11 @@ class ERDM(BaseDiffusion):
 
         else:
             # EDM paper preconditioning: use the log of the noise level as a time-conditioning signal
-            # Below is not like EDM! It would need to be noise_std.log()/4 to match EDM: todo: fix this?
             if self.hparams.emb_transform == "edm":
                 time_cond = noise_std.flatten(start_dim=1).log() / 4
             else:
-                time_cond = (
-                    0.5 * noise_std.flatten(start_dim=1)
-                ).log()  # flatten squeezes all singleton dims after 1.
+                # flatten squeezes all singleton dims after 1.
+                time_cond = (0.5 * noise_std.flatten(start_dim=1)).log()
             if self.hparams.conditional:
                 assert condition is not None, "Condition must be provided for conditional RDM"
                 # Reshape condition to repeat it along the time dimension, copying it to the batch dimension

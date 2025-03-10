@@ -19,13 +19,14 @@ class MyTensorDataset(Dataset[Dict[str, Tensor]]):
 
     tensors: Dict[str, Tensor]
 
-    def __init__(self, tensors: Dict[str, Tensor] | Dict[str, np.ndarray], dataset_id: str = ""):
+    def __init__(self, tensors: Dict[str, Tensor] | Dict[str, np.ndarray], dataset_id: str = "", max_samples: int = None):
         tensors = {
             key: torch.from_numpy(tensor.copy()).float() if isinstance(tensor, np.ndarray) else tensor
             for key, tensor in tensors.items()
         }
         any_tensor = next(iter(tensors.values()))
         self.dataset_size = any_tensor.size(0)
+        self.max_samples = max_samples
         for k, value in tensors.items():
             if torch.is_tensor(value):
                 assert value.size(0) == self.dataset_size, "Size mismatch between tensors"
@@ -43,7 +44,7 @@ class MyTensorDataset(Dataset[Dict[str, Tensor]]):
         return {key: tensor[index] for key, tensor in self.tensors.items()}
 
     def __len__(self):
-        return self.dataset_size
+        return self.dataset_size if self.max_samples is None else min(self.dataset_size, self.max_samples)
 
 
 def get_tensor_dataset_from_numpy(*ndarrays, dataset_id="", dataset_class=MyTensorDataset, **kwargs):

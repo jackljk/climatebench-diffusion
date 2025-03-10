@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import hydra
@@ -305,30 +306,68 @@ def reload_checkpoint_from_wandb(
     return {**reloaded_model_data, "config": config, "ckpt_path": ckpt_path}
 
 
+def find_wandb_run_dir(local_dir: str, run_id: str) -> str:
+    """
+    Find any subdirectory of local_dir that contains wandb_run.id as one of its subdirectories.
+
+    Args:
+        local_dir (str): Root directory to start the search
+        run_id (str): WandB run ID to look for
+
+    Returns:
+        str: Full path of the directory containing the run_id, or None if not found
+
+    Example:
+        find_wandb_run_dir("/home", "4628219")
+        # might return "/home/checkpoints/4628219" if it exists
+    """
+    local_path = Path(local_dir)
+
+    # Walk through all subdirectories
+    for root, dirs, _ in os.walk(local_path):
+        # Check if run_id matches any directory name
+        if run_id in dirs:
+            print(f"Found {run_id=} ckpt in {root=}, {dirs=}")
+            return str(Path(root) / run_id)
+
+    return None
+
+
 def get_local_ckpt_path(
     config: DictConfig,
     wandb_run,  #: wandb.apis.public.Run,
     ckpt_filename: str = "last.ckpt",
     throw_error_if_local_not_found: bool = False,
 ) -> Optional[str]:
+    work_dir = config.work_dir.replace("-test", "")
     potential_dirs = [
         config.ckpt_dir,
-        os.path.join(config.work_dir.replace("-test", ""), "checkpoints"),
+        os.path.join(work_dir, "checkpoints"),
+        os.path.join(work_dir, wandb_run.id, "checkpoints"),
         os.path.join(os.getcwd(), "results", "checkpoints"),
     ]
+    if os.environ.get("PSCRATCH", None) is not None:
+        potential_dirs.append(os.path.join(os.environ["PSCRATCH"], "genie/output", wandb_run.id, "checkpoints"))
     for callback_k in config.get("callbacks", {}).keys():
         if "checkpoint" in callback_k and config.callbacks[callback_k] is not None:
             if config.callbacks[callback_k].get("dirpath", None) is not None:
                 potential_dirs.append(config.callbacks[callback_k].dirpath)
 
     for local_dir in potential_dirs:
-        log.info(f"Checking {local_dir}. {os.path.exists(local_dir)=}")
+        # log.info(f"Checking {local_dir}. {os.path.exists(local_dir)=}")
         if not os.path.exists(local_dir):
             continue
         if wandb_run.id not in local_dir:
-            local_dir = os.path.join(local_dir, wandb_run.id)
-            if not os.path.exists(local_dir):
-                continue
+            # Find any subdir of local_dir with wandb_run.id as one subdir
+            if os.path.exists(os.path.join(local_dir, wandb_run.id)):
+                local_dir = os.path.join(local_dir, wandb_run.id)
+            else:
+                local_dir = find_wandb_run_dir(local_dir, wandb_run.id)
+                if local_dir is None:
+                    continue
+            if os.path.exists(os.path.join(local_dir, "checkpoints")):
+                local_dir = os.path.join(local_dir, "checkpoints")
+
         ckpt_files = [f for f in os.listdir(local_dir) if f.endswith(".ckpt")]
         if ckpt_filename == "last.ckpt":
             ckpt_files = [f for f in ckpt_files if "last" in f]
@@ -339,7 +378,7 @@ def get_local_ckpt_path(
             else:
                 # Get their epoch numbers from inside the file
                 # epochs = [torch.load(os.path.join(local_dir, f), weights_only=True)["epoch"] for f in ckpt_files]
-                epochs = [torch.load(os.path.join(local_dir, f))["epoch"] for f in ckpt_files]
+                epochs = [torch.load(os.path.join(local_dir, f), weights_only=False)["epoch"] for f in ckpt_files]
                 # Find the ckpt file with the latest epoch
                 latest_ckpt_file = ckpt_files[np.argmax(epochs)]
                 log.info(

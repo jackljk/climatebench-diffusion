@@ -74,7 +74,7 @@ distribution_params_to_edit = ["loc", "scale"]
 
 
 def torch_to_numpy(x: Union[Tensor, Dict[str, Tensor]]) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-    if isinstance(x, Tensor):
+    if torch.is_tensor(x):
         return x.detach().cpu().numpy()
     elif isinstance(x, TensorDictBase):
         return {k: torch_to_numpy(v) for k, v in x.items()}
@@ -1040,6 +1040,137 @@ def sample_random_real(par1, par2, distribution="uniform", size=1, device=None):
         return torch.randn(size, device=device) * par2 + par1
     else:
         raise ValueError(f"Invalid distribution: {distribution}")
+
+
+def subsample_preselected_indices(preselected_indices, max_num_samples):
+    """
+    Evenly subsample from a list of pre-selected indices.
+
+    Args:
+        preselected_indices: List of pre-selected indices
+        max_num_samples: Maximum number of samples to select
+
+    Returns:
+        List of evenly spaced indices from the pre-selected indices
+    """
+    M = len(preselected_indices)
+
+    # If max_num_samples >= M, return all pre-selected indices
+    if max_num_samples >= M:
+        return preselected_indices
+
+    # Calculate the ideal spacing
+    spacing = (M - 1) / (max_num_samples - 1) if max_num_samples > 1 else 0
+
+    # Generate positions with even spacing
+    positions = [int(round(i * spacing)) for i in range(max_num_samples)]
+
+    # Make sure the last position doesn't exceed M-1
+    if positions and positions[-1] >= M:
+        positions[-1] = M - 1
+
+    # Get the actual indices at these positions
+    subsampled_indices = [preselected_indices[pos] for pos in positions]
+
+    return subsampled_indices
+
+# Saving metadata to later reconstruct the xarray from a (synchronized) tensor
+# Example usage:
+# 1. Extract metadata and convert to tensor
+# metadata = extract_xarray_metadata(spectra_summed)
+# tensor_data = torch.tensor(spectra_summed.values)
+#
+# 2. After distributed processing, reconstruct the xarray
+# reconstructed_xarray = reconstruct_xarray(synchronized_tensor, metadata
+
+def extract_xarray_metadata(xarray_obj: xr.DataArray) -> Dict[str, Any]:
+    """
+    Extract all necessary metadata from an xarray DataArray to reconstruct it later.
+
+    Parameters:
+    -----------
+    xarray_obj : xr.DataArray
+        The xarray DataArray to extract metadata from
+
+    Returns:
+    --------
+    Dict[str, Any]
+        A dictionary containing all metadata needed to reconstruct the DataArray:
+        - dims: dimension names
+        - coords: coordinate data and attributes
+        - attrs: DataArray attributes
+        - name: DataArray name
+        - encoding: DataArray encoding information
+    """
+    # Create a dictionary for all coordinates
+    coords_dict = {}
+    for name, coord in xarray_obj.coords.items():
+        coords_dict[name] = {
+            'data': coord.values,
+            'dims': coord.dims,
+            'attrs': coord.attrs,
+            'encoding': coord.encoding
+        }
+
+    # Create the complete metadata dictionary
+    metadata = {
+        'dims': xarray_obj.dims,
+        'coords': coords_dict,
+        'attrs': xarray_obj.attrs,
+        'name': xarray_obj.name,
+        'encoding': xarray_obj.encoding
+    }
+    return metadata
+
+
+def reconstruct_xarray(data: Union[torch.Tensor, np.ndarray], metadata: Dict[str, Any]) -> xr.DataArray:
+    """
+    Reconstruct an xarray DataArray from tensor/array data and previously extracted metadata.
+
+    Parameters:
+    -----------
+    data : Union[torch.Tensor, np.ndarray]
+        The data to use for the reconstructed DataArray
+    metadata : Dict[str, Any]
+        The metadata dictionary as returned by extract_xarray_metadata()
+
+    Returns:
+    --------
+    xr.DataArray
+        A reconstructed xarray DataArray with the original structure
+    """
+    # Convert torch tensor to numpy if needed
+    if isinstance(data, torch.Tensor):
+        numpy_data = data.cpu().numpy()
+    else:
+        numpy_data = data
+
+    # Reconstruct coordinates
+    coords = {}
+    for name, coord_info in metadata['coords'].items():
+        # Create a variable for each coordinate
+        coord = xr.Variable(
+            dims=coord_info['dims'],
+            data=coord_info['data'],
+            attrs=coord_info['attrs'],
+            encoding=coord_info['encoding']
+        )
+        coords[name] = coord
+
+    # Reconstruct the DataArray
+    reconstructed = xr.DataArray(
+        data=numpy_data,
+        dims=metadata['dims'],
+        coords=coords,
+        attrs=metadata['attrs'],
+        name=metadata['name']
+    )
+
+    # Add encoding if it exists
+    if metadata['encoding']:
+        reconstructed.encoding = metadata['encoding']
+
+    return reconstructed
 
 
 if __name__ == "__main__":

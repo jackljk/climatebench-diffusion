@@ -22,5 +22,6 @@ module:
   logging_infix: ""               # infix to add to the metric keys when logging to wandb
   verbose: ${verbose}
   seed: ${seed}
+  work_dir: ${work_dir}   # Don't change this unless you know what you're doing
 
 #################################################################################################

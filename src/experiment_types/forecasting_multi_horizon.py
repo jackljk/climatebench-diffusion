@@ -24,6 +24,7 @@ from src.diffusion.pderefiner import PDERefiner
 from src.experiment_types._base_experiment import BaseExperiment
 from src.interface import NoTorchModuleWrapper
 from src.models.modules.ema import LitEma
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.utilities.checkpointing import reload_checkpoint_from_wandb
 from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.utils import (
@@ -152,7 +153,8 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         horizon = self.get_horizon(stage)
         ar_steps = self.num_autoregressive_steps_for_horizon(horizon)
         # max_horizon = horizon * (ar_steps + 1)
-        self.log_text.info(f"Using {ar_steps} autoregressive steps for stage ``{stage}`` with horizon={horizon}.")
+        if "val" not in stage and ar_steps > 0:
+            self.log_text.info(f"Using {ar_steps} autoregressive steps for stage ``{stage}`` with horizon={horizon}.")
 
     # --------------------------------- Metrics
     def get_epoch_aggregators(self, split: str, dataloader_idx: int = None) -> dict:
@@ -176,7 +178,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         boundary_conditions: Callable = None,
         t0: float = 0.0,
         dt: float = 1.0,
-        aggregators: Dict[str, Callable] = None,
+        aggregators: Dict[str, _Aggregator] = None,
         verbose: bool = True,
         prediction_horizon: int = None,
     ):
@@ -222,18 +224,19 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         batch["dynamics"] = batch["dynamics"][:, : self.window + self.true_horizon, ...]
 
         if self.is_diffusion_model and split == "val" and dataloader_idx in [0, None]:
-            self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
+            # self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
             # log validation loss
             if dynamic_conds is not None:
                 # first window of dyn. condition
                 batch["dynamical_condition"] = dynamic_conds[:, : self.window + self.true_horizon]
             loss = self.get_loss(batch)
-            if isinstance(loss, dict):
-                # add split/ prefix if not already there
-                log_dict = {f"{split}/{k}" if not k.startswith(split) else k: float(v) for k, v in loss.items()}
-            elif torch.is_tensor(loss):
-                log_dict = {f"{split}/loss": float(loss)}
-            self.log_dict(log_dict, on_step=False, on_epoch=True)
+            aggregators["diffusion_loss"].update(loss=loss)
+            # if isinstance(loss, dict):
+            #     # add split/ prefix if not already there
+            #     log_dict = {f"{split}/{k}" if not k.startswith(split) else k: float(v) for k, v in loss.items()}
+            # elif torch.is_tensor(loss):
+            #     log_dict = {f"{split}/loss": float(loss)}
+            # self.log_dict(log_dict, on_step=False, on_epoch=True)
 
         # Initialize autoregressive loop
         autoregressive_inputs = None
@@ -248,11 +251,13 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
             disable=not self.verbose or n_outer_loops <= 1,
         )
         # Loop over autoregressive steps (to cover timesteps beyond training horizon)
+        preds_normed = None
         for ar_step in pbar:
             self.print_gpu_memory_usage(tqdm_bar=pbar, empty_cache=self.hparams.empty_cache_at_autoregressive_step)
             ar_window_steps = []
             # Loop over training horizon
             for t_step_last, t_step in zip(predicted_range_last, self.prediction_timesteps):
+                preds_normed_last = preds_normed
                 total_horizon = ar_step * self.true_horizon + t_step
                 if total_horizon > prediction_horizon:
                     # May happen if we have a prediction horizon that is not a multiple of the true horizon
@@ -301,7 +306,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                             )
                 preds_normed = results.pop(PREDS_NORMED_K)
                 if not no_aggregators and "save_to_disk" in aggregators.keys():
-                    aggregators["save_to_disk"].record_batch(
+                    aggregators["save_to_disk"].update(
                         target_data=targets_raw,
                         gen_data=results[PREDS_RAW_K],
                         target_data_norm=targets_normed,
@@ -340,7 +345,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                     assert predictions_mask is None, "Predictions mask not yet supported for aggregators"
                     pred_data = split3d_and_merge_variables_p(results[PREDS_RAW_K])
                     target_data = split3d_and_merge_variables_p(targets_raw)
-                    aggregators[f"t{total_horizon}"].record_batch(
+                    aggregators[f"t{total_horizon}"].update(
                         target_data=target_data,
                         gen_data=pred_data,
                         target_data_norm=split3d_and_merge_variables_p(targets_normed),
@@ -348,7 +353,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                         predictions_mask=predictions_mask,
                     )
                     if "time_mean" in aggregators:
-                        aggregators["time_mean"].record_batch(
+                        aggregators["time_mean"].update(
                             target_data=target_data, gen_data=pred_data, predictions_mask=predictions_mask
                         )
                 del results, targets
@@ -360,6 +365,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                     for k in list(autoregressive_inputs.keys()):
                         autoregressive_inputs[k.replace("preds", "inputs")] = autoregressive_inputs.pop(k)
                 batch["dynamics"] = autoregressive_inputs
+                batch["x_prev"] = preds_normed_last  # todo: fix
             del ar_window_steps
 
         self.on_autoregressive_loop_end(split, dataloader_idx=dataloader_idx)
@@ -421,6 +427,10 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                 self, xaxis, metrics_agg, wandb_key_stem, x_label="time", log_as_table=log_as_table
             )
             self._test_metrics_aggregate = defaultdict(list)
+            for i, aggregators in enumerate(self.aggregators_test):
+                if "save_to_disk" in aggregators:
+                    metadata = self.get_logger_metadata()
+                    aggregators["save_to_disk"].compute(prefix="test", epoch=self.current_epoch, metadata=metadata)
 
     def get_preds_at_t_for_batch(
         self,
@@ -535,6 +545,8 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                 extra_kwargs[k] = self.get_condition_from_dynamica_cond(
                     v, split=split, time=time, ensemble=ensemble, add_noise=False
                 )
+            elif k == "x_prev":
+                pass  # extra_kwargs[k] = v
             else:
                 raise ValueError(f"Unsupported key {k} in batch")
         return extra_kwargs
@@ -780,16 +792,18 @@ class AbstractSimultaneousMultiHorizonForecastingModule(AbstractMultiHorizonFore
         super().__init__(**kwargs)
         self.autoregressive_train_steps = self.horizon // self.horizon_at_once
         if self.autoregressive_train_steps > 1:
-            self.log_text.info(
-                f"Training autoregressively for {self.autoregressive_train_steps} steps with horizon_at_once={self.horizon_at_once}"
-            )
+            self.log_text.info(f"Training with {self.autoregressive_train_steps=} steps with {self.horizon_at_once=}")
+
         if autoregressive_loss_weights is None:
             autoregressive_loss_weights = [
                 1.0 / self.autoregressive_train_steps for _ in range(self.autoregressive_train_steps)
             ]
-        assert (
-            len(autoregressive_loss_weights) == self.autoregressive_train_steps
-        ), f"Expected {self.autoregressive_train_steps} autoregressive loss weights, but got {len(autoregressive_loss_weights)}"
+        elif autoregressive_loss_weights == "logvar":
+            self._ar_logvars = torch.nn.Parameter(
+                torch.randn(self.autoregressive_train_steps, requires_grad=True) * 0.01
+            )
+        else:
+            assert len(autoregressive_loss_weights) == self.autoregressive_train_steps
         self.autoregressive_loss_weights = autoregressive_loss_weights
 
         if self.stack_window_to_channel_dim:
@@ -868,15 +882,16 @@ class AbstractSimultaneousMultiHorizonForecastingModule(AbstractMultiHorizonFore
         # results_new = TensorDict(results_new, batch_size=new_shape)
         return super().unpack_predictions(results)
 
+    def weigh_ar_loss(self, loss_raw, ar_step: int):
+        if self.autoregressive_loss_weights == "logvar":
+            return loss_raw / self._ar_logvars[ar_step].exp() + self._ar_logvars[ar_step]
+        return loss_raw * self.autoregressive_loss_weights[ar_step]
+
 
 class SimultaneousMultiHorizonForecasting(AbstractSimultaneousMultiHorizonForecastingModule):
     def __init__(self, timestep_loss_weights: Sequence[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.save_hyperparameters(ignore=["model", "timestep_loss_weights"])
-
-        if timestep_loss_weights is None:
-            timestep_loss_weights = [1.0 / self.horizon_at_once for _ in range(self.horizon_at_once)]
-        self.timestep_loss_weights = timestep_loss_weights
 
     def get_loss(self, batch: Any) -> Tensor:
         r"""Compute the loss for the given batch."""
@@ -884,7 +899,7 @@ class SimultaneousMultiHorizonForecasting(AbstractSimultaneousMultiHorizonForeca
         split = "train" if self.training else "val"
         inputs, extra_kwargs = self.get_inputs_and_extra_kwargs(batch, split=split, ensemble=False)
 
-        losses = dict(loss=0.0)
+        losses = dict(loss=0.0, raw_loss=0.0)
         for ar_step in range(self.autoregressive_train_steps):
             offset_left = self.window + self.horizon_at_once * ar_step
             offset_right = self.window + self.horizon_at_once * (ar_step + 1)
@@ -897,10 +912,8 @@ class SimultaneousMultiHorizonForecasting(AbstractSimultaneousMultiHorizonForeca
             # targets = self.targets_pre_process(targets)  # This will still do it, but only if t > 1
             if self.model.predict_non_spatial_condition:
                 # Forecasting condition_non_spatial too (only last time step)
-                targets_non_spatial = batch["condition_non_spatial"][:, offset_right - 1 : offset_right, ...].squeeze(
-                    1
-                )
-                targets_non_spatial = self.model.non_spatial_cond_preprocessing(targets_non_spatial)
+                targets_non_spatial = batch["condition_non_spatial"][:, offset_right - 1 : offset_right, ...]
+                targets_non_spatial = self.model.non_spatial_cond_preprocessing(targets_non_spatial.squeeze(1))
                 targets = dict(preds=targets, condition_non_spatial=targets_non_spatial)
 
             loss_ar_i, preds = self.model.get_loss(
@@ -911,13 +924,16 @@ class SimultaneousMultiHorizonForecasting(AbstractSimultaneousMultiHorizonForeca
                 targets_pre_process=self.targets_pre_process,
                 **extra_kwargs,
             )
-            if isinstance(loss_ar_i, dict):
-                losses["loss"] += loss_ar_i.pop("loss") * self.autoregressive_loss_weights[ar_step]
-                for k, v in loss_ar_i.items():
-                    k_ar = f"{k}_ar{ar_step}" if ar_step > 0 else k
-                    losses[k_ar] = float(v)
-            else:
-                losses["loss"] += loss_ar_i * self.autoregressive_loss_weights[ar_step]
+            loss_ar_i_dict = {"loss": loss_ar_i} if not isinstance(loss_ar_i, dict) else loss_ar_i
+            loss_ar_i = loss_ar_i_dict.pop("loss")
+            losses["raw_loss"] += float(loss_ar_i_dict.get("raw_loss", loss_ar_i))
+            for k, v in loss_ar_i_dict.items():
+                k_ar = f"{k}_ar{ar_step}" if ar_step > 0 else k
+                losses[k_ar] = float(v) if not isinstance(v, dict) else v
+
+            loss_ar_i = self.weigh_ar_loss(loss_ar_i, ar_step)
+            losses["loss"] += loss_ar_i
+            losses[f"loss_ar{ar_step}"] = float(loss_ar_i)
 
             if ar_step < self.autoregressive_train_steps - 1:
                 if isinstance(preds, dict):
@@ -1143,6 +1159,9 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         if self.model.hparams.learnable_schedule:
             self.log("model/rho_proxy", self.model.exp.detach().item())
             self.log("model/rho", self.model.get_exp().detach().item())
+            if self.model.hparams.learnable_schedule == "v2":
+                self.log("model/sigma_min", self.model.get_tmin().detach().item())
+                self.log("model/sigma_max", self.model.get_tmax().detach().item())
         if self.model.hparams.variance_loss:
             times_vars = self.get_logvar("times").exp().detach()
             times_vars = {f"train/learned_var/time_{i}": float(v) for i, v in enumerate(times_vars)}
@@ -1383,7 +1402,7 @@ class ClimatologyBaseline(AbstractMultiHorizonForecastingExperiment):
 
 def infer_class_from_ckpt(ckpt_path: str, state=None) -> Type[AbstractMultiHorizonForecastingExperiment]:
     """Infer the experiment class from the checkpoint path."""
-    ckpt = torch.load(ckpt_path, map_location="cpu") if state is None else state
+    ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu") if state is None else state
     module_config = ckpt["hyper_parameters"]
     abstract_kwargs = inspect.signature(AbstractMultiHorizonForecastingExperiment).parameters
     base_kwargs = {k: v for k, v in module_config.items() if k not in abstract_kwargs}

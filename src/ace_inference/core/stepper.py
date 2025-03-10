@@ -574,7 +574,7 @@ def run_on_batch(
     metrics["loss"] = loss.detach()
     optimization.step_weights(loss)
 
-    aggregator.record_batch(
+    aggregator.update(
         float(loss),
         target_data=data,
         gen_data=gen_data,

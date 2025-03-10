@@ -24,3 +24,12 @@ normalization_type: null   # How to preprocess the targets, e.g. 'standard'
 
 # Debugging parameters
 DEBUG_dataset_size: null # Set to None to use the full dataset, value is the number of years to use
+
+# Extended Validation Parameters
+comprehensive_validation:
+  run: False
+  n_epochs: 1 # Run every x epoch
+  temporal_scale: 'monthly' # 'monthly' or 'yearly'
+  metrics: ['rmse', 'crps', 'brier', 'ssr']
+  save_to_disk: True
+

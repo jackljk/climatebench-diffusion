@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 
 from src.utilities.utils import get_logger
 
+
 log = get_logger(__name__)
 
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
@@ -54,7 +55,7 @@ def get_local_files(s3_path, local_path):
         prefix = s3_path[:wildcard_index]
         if "/" in prefix:
             prefix = os.path.dirname(prefix)
-            pattern = s3_path[len(prefix) + 1:]
+            pattern = s3_path[len(prefix) + 1 :]
         else:
             prefix = "."
             pattern = s3_path
@@ -88,9 +89,9 @@ def get_s3_objects(s3_path):
         prefix = s3_path[:wildcard_index]
         if prefix.endswith("/"):
             prefix = prefix[:-1]
-            pattern = s3_path[len(prefix) + 1:]
+            pattern = s3_path[len(prefix) + 1 :]
         else:
-            pattern = s3_path[len(prefix):]
+            pattern = s3_path[len(prefix) :]
 
     paginator = s3_client.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=prefix)
@@ -100,7 +101,7 @@ def get_s3_objects(s3_path):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if pattern:  # only apply fnmatch if there's a pattern to match
-                if fnmatch.fnmatch(key[len(prefix):], pattern):
+                if fnmatch.fnmatch(key[len(prefix) :], pattern):
                     filtered_s3_objects.append(key)
             else:
                 filtered_s3_objects.append(key)
@@ -256,7 +257,7 @@ def upload_s3_object(local_file_path, s3_file_path, force_upload: bool = True, r
         local_file_ext = os.path.splitext(local_file_path)[1]
         s3_file_ext = os.path.splitext(s3_file_path)[1]
         assert (
-                local_file_ext == s3_file_ext
+            local_file_ext == s3_file_ext
         ), f"File extensions do not match: {local_file_ext} != {s3_file_ext}. If you intended s3_filepath to be a directory, append a '/' to the end of it."
 
     if not force_upload and exists_s3_object(s3_file_path):
@@ -276,6 +277,7 @@ def upload_s3_object(local_file_path, s3_file_path, force_upload: bool = True, r
             if i == retry - 1:
                 raise e
     return False
+
 
 def upload_s3_objects(local_files, local_path="./", s3_path=""):
     """

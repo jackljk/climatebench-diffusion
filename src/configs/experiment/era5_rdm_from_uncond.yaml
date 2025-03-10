@@ -25,7 +25,7 @@ module:
   torch_compile: null
 #  GENIE-6h-1AR-EDM_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_adam_14lr_5Dr_fLV-Pm0Ps1.2-Uncond_11seed_23h52mDec16_4448800
   from_pretrained_checkpoint_run_id: "4448800"
-  from_pretrained_frozen: True #  todo: unfreeze logvar?
+  from_pretrained_frozen: False
 
 datamodule:
   hourly_resolution: 6   # can be easily changed!

@@ -159,8 +159,13 @@ class MyWandbLogger(pl.loggers.WandbLogger):
         resume_run_id: str = None,
         **kwargs,
     ):
-        """If using S3, set save_to_s3_bucket=True and provide your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as
-        environment variables."""
+        """
+        If using S3, set save_to_s3_bucket=True and provide your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as
+        environment variables.
+
+        If save_best_ckpt=True or save_last_ckpt=True, one of save_to_wandb or save_to_s3_bucket must be True ...
+        The corresponding checkpoint will be saved to wandb or S3 bucket.
+        """
         try:
             super().__init__(**kwargs)
         except Exception as e:

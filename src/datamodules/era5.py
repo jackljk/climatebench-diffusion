@@ -30,7 +30,7 @@ from src.utilities.utils import (
     get_logger,
     raise_error_if_invalid_type,
     raise_error_if_invalid_value,
-    to_torch_and_device,
+    to_torch_and_device, subsample_preselected_indices,
 )
 
 
@@ -97,7 +97,9 @@ class ERA5DataModuleBase(BaseDataModule):
         text_period_start: Optional[str] = None,  # If None, use all text data
         text_period_end: Optional[str] = None,  # If None, use all text data. The end date is inclusive.
         shift_text_date: int = 0,
+        text_history: int = 0,
         text_conditioning: str = "time",
+        text_skip_missing_dates: bool = False,  # If false, use null embeddings for missing dates
         return_future_date_for_training: bool = False,  # set to true if self.model.predict_non_spatial_condition=True
         normalize_std_fname: str = "std",  # use std_rescaled for residual prediction, std for direct prediction
         use_dask: bool = False,
@@ -323,11 +325,12 @@ class ERA5DataModuleBase(BaseDataModule):
             assert len(corpus) > 0, f"No text data found for {text_period_start=} and {text_period_end=}"
 
             metadata = dict(corpus_filename=text_data_path, period_start=text_period_start, period_end=text_period_end)
+            embs_kwargs = dict(metadata=metadata, history_length=self.hparams.text_history)
             if text_type == "bert":
                 from src.utilities.text import get_or_create_embeddings
 
                 model_name = "bert-base-uncased"
-                text_features = get_or_create_embeddings(corpus, model_name, None, metadata=metadata)
+                text_features = get_or_create_embeddings(corpus, model_name, None, **embs_kwargs)
                 self.text_emb_dim = len(text_features[0])  # First text feature
 
             elif "llama" in text_type.lower():
@@ -337,7 +340,7 @@ class ERA5DataModuleBase(BaseDataModule):
                 model_name = f"meta-llama/{model_name}"
                 # try meta-llama/Llama-3.1-8B-Instruct
                 cache_dir = os.path.join(os.environ.get("PSCRATCH", os.environ.get("HOME")), ".cache", "huggingface")
-                text_features = get_or_create_embeddings(corpus, model_name, cache_dir, metadata=metadata)
+                text_features = get_or_create_embeddings(corpus, model_name, cache_dir, **embs_kwargs)
                 self.text_emb_dim = len(text_features[0])  # First text feature
 
             elif text_type == "bow":
@@ -366,17 +369,12 @@ class ERA5DataModuleBase(BaseDataModule):
             self.raw_text_dataset = {}  # to analyse the text data, if needed
             for text, feature, date in zip(corpus, text_features, dates):
                 # log.info(f"Text: {text[:10]}... Feature: {feature[:15]}...")
+                if feature is None:
+                    log.warning(f"Text data for {date=} is None. Skipping...")
+                    continue
                 date_feature = extract_date(date, shift_text_date)
                 self.text_data[date_feature] = torch.from_numpy(feature).squeeze()
                 self.raw_text_dataset[date_feature] = text
-
-            date = list(self.text_data.keys())[0]
-            for h in range(3):
-                date_h = date + np.timedelta64(h, "D")
-                text_example = self.raw_text_dataset.get(date_h) or "No text"
-                text_example = text_example[:80].replace("\n", "\t")
-                feature_shape = self.text_data[date_h].shape if date_h in self.text_data else "None"
-                log.info(f"{h=}, {date_h=}, {text_example=}... {feature_shape=}")
 
             # Compute how many days from training+val period are missing in the text data
             missing_dates = set()
@@ -385,6 +383,15 @@ class ERA5DataModuleBase(BaseDataModule):
                 slice_datetimes = pd.date_range(slice_.start, slice_.stop, freq="D")
                 slice_datetimes = [np.datetime64(x, "D") for x in slice_datetimes]
                 missing_dates.update(set(slice_datetimes) - set(self.text_data.keys()))
+                if split == "train":
+                    # Go over first 3 dates in training period
+                    for h in range(3):
+                        date_h = slice_datetimes[h]
+                        text_example = self.raw_text_dataset.get(date_h) or "No text"
+                        text_example = text_example[:80].replace("\n", "\t")
+                        feature_shape = self.text_data[date_h].shape if date_h in self.text_data else "None"
+                        log.info(f"{h=}, {date_h=}, {text_example=}... {feature_shape=}")
+
                 # print(list(slice_datetimes)[:10], list(self.text_data.keys())[:10])
             if missing_dates:
                 missing_dates = sorted(set([str(x)[:7] for x in missing_dates]))  # Get unique years and months only
@@ -471,6 +478,9 @@ class ERA5DataModuleBase(BaseDataModule):
         kwargs["use_dask"] = self.hparams.use_dask
         kwargs["hourly_resolution"] = self.hparams.hourly_resolution
         kwargs["possible_initial_times"] = self.hparams.possible_initial_times
+        kwargs["spatial_crop_outputs"] = self.spatial_crop_outputs
+        kwargs["output_mask_area"] = self.hparams.output_mask_area
+        kwargs["text_skip_missing_dates"] = self.hparams.text_skip_missing_dates
         if split in ["fit", "train"]:
             # Set loss weights
             kwargs["loss_latitude_weighting"] = self.hparams.loss_latitude_weighting
@@ -478,11 +488,7 @@ class ERA5DataModuleBase(BaseDataModule):
             kwargs["loss_pressure_weighting_levels"] = self.hparams.loss_pressure_weighting_levels
             kwargs["loss_pressure_weighting_divide_by"] = self.hparams.loss_pressure_weighting_divide_by
             kwargs["loss_surface_vars_weighting"] = self.hparams.loss_surface_vars_weighting
-        if not self.hparams.spatial_crop_during_training and split in ["fit", "train"]:
-            log.info("Disabling spatial cropping for training data. This is only used for validation and testing.")
-        else:
-            kwargs["spatial_crop_outputs"] = self.spatial_crop_outputs
-            kwargs["output_mask_area"] = self.hparams.output_mask_area
+            kwargs["spatial_crop_during_training"] = self.hparams.spatial_crop_during_training
 
         if self.hparams.lat_lon_format == "lat_lon":
             ds = ds.transpose(..., "latitude", "longitude")  # Don't put this before spatial crop! (it will be slower)
@@ -516,7 +522,7 @@ class ERA5DataModuleBase(BaseDataModule):
             ds_splits["val"] = [self.get_split_dataset(**val_kwargs, max_num_samples=self.hparams.max_val_samples)]
             if self.get_horizon("val", dataloader_idx=1) is not None:
                 log.info(f"Using long inference horizon={self.get_horizon('val', dataloader_idx=1)} for validation")
-                ds_splits["val"] += [self.get_split_dataset(**val_kwargs, max_num_samples=8, dataloader_idx=1)]
+                ds_splits["val"] += [self.get_split_dataset(**val_kwargs, max_num_samples=16, dataloader_idx=1)]
 
         if stage in ["test", None]:
             ds_splits["test"] = self.get_split_dataset("test", self.test_slice)
@@ -634,6 +640,7 @@ class ERA5DataModuleBase(BaseDataModule):
         if save_to_path is not None:
             # Specify ++module.save_predictions_filename="xarray" to save the predictions in xarray format
             aggregators_all["save_to_disk"] = SaveToDiskAggregator(
+                final_dims_of_data=["longitude", "latitude"],
                 is_ensemble=is_ensemble,
                 coords=aggr_kwargs["coords"],
                 concat_dim_name="lead_time",
@@ -717,11 +724,13 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
         possible_initial_times: Optional[Sequence[str]] = None,
         spatial_crop_outputs: Optional[Dict[str, slice]] = None,
         output_mask_area: Optional[str] = None,
+        spatial_crop_during_training: bool = False,
         loss_latitude_weighting: bool = False,
         max_num_samples: Optional[int] = None,
         subsample: int = 1,
         lat_lon_format: Tuple[str, str] = ("longitude", "latitude"),
         use_dask: bool = False,
+        text_skip_missing_dates: bool = False,
         return_future_date_for_training: bool = False,
     ):
         self.dataset = dataset
@@ -738,7 +747,8 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
             ds_idxs = ds_idxs[valid_hours]
 
         if max_num_samples is not None:
-            ds_idxs = ds_idxs[: max_num_samples * subsample : subsample]
+            ds_idxs = subsample_preselected_indices(ds_idxs, max_num_samples)
+            # Used to be: ds_idxs = ds_idxs[: max_num_samples * subsample : subsample]
         else:
             ds_idxs = ds_idxs[::subsample]
 
@@ -750,6 +760,7 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
         self.window = window
         self.loss_latitude_weighting = loss_latitude_weighting
         self.use_dask = use_dask
+        self.text_skip_missing_dates = text_skip_missing_dates
         self.return_future_date_for_training = return_future_date_for_training
         # Get whether the dataset is formatted as lat/lon or lon/lat
 
@@ -830,10 +841,15 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
                 raise ValueError(f"Invalid output_mask_area: {output_mask_area}")
             mask = mask.transpose(*lat_lon_format)
             self.mask = torch.from_numpy(mask.values)  # .nonzero(as_tuple=True)
-            if split in ["train", "fit"]:  # , "val", "validate"]:
+            if split in ["train", "fit"] and spatial_crop_during_training is True:
                 # Adjust area weights to fit the mask
                 self.return_mask = self.mask
                 self._area_weights_tensor = self._area_weights_tensor[self.mask]
+            elif split in ["train", "fit"] and spatial_crop_during_training not in [False, True, None]:
+                # Upweight the area weights for the masked area, but don't use the mask for cropping
+                log.info(f"Upweighting area weights for the masked area by {spatial_crop_during_training}")
+                self._area_weights_tensor[self.mask] *= spatial_crop_during_training
+                self.return_mask = None
             else:
                 # For othes (eval) splits, mask is only used inside aggregators (with special prefix(es))
                 self.return_mask = None
@@ -897,6 +913,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
         self.all_vars = set(input_vars) | set(output_vars)
         self.input_only_vars = set(input_vars) - set(output_vars)
         self.in_only_packer = in_only_packer
+        self.skip_idxs = set()
         self.possible_2d_vars = [
             "mean_sea_level_pressure",
             "10m_u_component_of_wind",
@@ -1086,7 +1103,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
                 else:
                     raise ValueError(f"Invalid loss_surface_vars_weighting: {self.loss_surface_vars_weighting}")
 
-            n_spatial_dims = 2 if self.mask is None else 1
+            n_spatial_dims = 2 if weights is None else len(weights.shape)
             # Create singleton dimensions for the spatial dimensions (after the variable dimension)
             var_to_weight = var_to_weight.view(len(self.output_vars), *([1] * n_spatial_dims))
             if self.loss_pressure_weighting == "makani":
@@ -1150,6 +1167,8 @@ class ERA5Dataset2D(ERA5DatasetBase):
         return batch_start_time  # .astype("datetime64[D]")
 
     def __getitem__(self, idx):
+        if idx in self.skip_idxs:
+            return self.__getitem__(idx + 1)
         idx_actual = int(self.ds_idxs[idx])
         # static conditions are time-independent variables such as land_sea_mask, altitude, etc.
         arrays = dict(static_condition=self.static_conditions) if self.static_conditions is not None else dict()
@@ -1212,6 +1231,12 @@ class ERA5Dataset2D(ERA5DatasetBase):
             if self.text_dataset is not None:
                 date = batch_start_time.astype("datetime64[D]")
                 if date not in self.text_dataset:  # e.g.: KeyError: numpy.datetime64('2018-06-18')
+                    if self.text_skip_missing_dates:  # Skip missing dates
+                        log.warning(
+                            f"[{idx=}] Date {date} ({type(date)=}) not found in text dataset. {len(self.skip_idxs)=} Skipping."
+                        )
+                        self.skip_idxs.add(idx)
+                        return self.__getitem__(idx + 1)
                     arrays["condition_non_spatial"] = torch.zeros(self._text_dim)
                     # may be replaced with null embeddings inside model
                     # arrays["condition_non_spatial"] = None  # this leads to a collate fn error
@@ -1227,6 +1252,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
                         dim=0,
                     )
                 else:
+                    # log.info(f"Date {date} found in text dataset.")
                     arrays["condition_non_spatial"] = self.text_dataset[date]
                 # print(f"{self.dataset_id} idx: {idx}, batch_start_time: {batch_start_time}, text: {arrays['text']}")
         return arrays

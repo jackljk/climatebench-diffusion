@@ -119,7 +119,6 @@ class Unet(BaseModel):
         outer_sample_mode: str = None,  # bilinear or nearest
         upsample_dims: tuple = None,  # (256, 256) or (128, 120) etc.
         upsample_outputs_by: int = 1,
-        upsample_condition_by: int = 1,
         keep_spatial_dims: bool = False,
         init_kernel_size: int = 7,
         init_padding: int = 3,
@@ -319,9 +318,6 @@ class Unet(BaseModel):
         default_out_dim = input_channels * (1 if not learned_variance else 2)
         self.out_dim = default(output_channels, default_out_dim)
 
-        self.upsample_condition = (
-            nn.Upsample(scale_factor=upsample_condition_by) if upsample_condition_by > 1 else nn.Identity()
-        )
         if upsample_outputs_by == 1:
             self.final_res_block = block_klass(dim * 2, dim)
         else:
@@ -373,8 +369,7 @@ class Unet(BaseModel):
     ):
         x = self.concat_condition_if_needed(inputs, condition, dynamical_condition, static_condition)
         if condition_non_spatial is not None:
-            if condition_non_spatial.shape[-1] != self.non_spatial_cond_hdim:
-                condition_non_spatial = self.non_spatial_cond_preprocessing(condition_non_spatial)
+            condition_non_spatial = self.preprocess_non_spatial_conditioning(condition_non_spatial)
 
         condition_cross_attn = None
         if self.non_spatial_conditioning_mode == "cross_attn":
@@ -470,13 +465,20 @@ class Unet(BaseModel):
 
 
 if __name__ == "__main__":
+    n_non_spatial_c = 396
     unet = Unet(
         dim=64,
         num_input_channels=3,
-        num_output_channels=3,
+        num_output_channels=6,
         spatial_shape_in=(45, 90),
         upsample_dims=(48, 96),
         outer_sample_mode="bilinear",
+        non_spatial_conditioning_mode="cross_attn",
+        num_conditional_channels_non_spatial=n_non_spatial_c,
+        non_spatial_cond_hdim=None,
     )
-    x = torch.rand(10, 3, 45, 90)
-    print(unet.print_intermediate_shapes(x))
+    B = 10
+    x = torch.rand(B, 3, 45, 90)
+    cond = torch.randn(B, n_non_spatial_c)
+    y = unet(x, condition_non_spatial=cond)
+    # print(unet.print_intermediate_shapes(x, n_non_spatial_c))

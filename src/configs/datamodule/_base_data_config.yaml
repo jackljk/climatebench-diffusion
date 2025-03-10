@@ -7,7 +7,7 @@
 data_dir: "${oc.env:HOME}/data"
 
 # --> Optional edits:
-batch_size: 16                 # batch size for training (global over all GPUs. Per-GPU batch size is batch_size // world_size)
+batch_size: 64                 # batch size for training (global over all GPUs. Per-GPU batch size is batch_size // world_size)
 batch_size_per_gpu: null       # batch size per GPU (if null, batch_size // world_size is used). If smaller than batch_size, gradient accumulation is used
 eval_batch_size: ${datamodule.batch_size} # batch size for validation/testing (larger might be faster, but uses more RAM)
 

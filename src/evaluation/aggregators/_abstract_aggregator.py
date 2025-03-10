@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 import torch
+from src.evaluation.torchmetrics import Metric
 from tensordict import TensorDictBase
 
 from src.utilities.utils import ellipsis_torch_dict_boolean_tensor, get_logger, to_tensordict
 
 
-class AbstractAggregator(ABC):
+class AbstractAggregator(Metric):
     def __init__(
         self,
         is_ensemble: bool = False,
@@ -18,7 +19,9 @@ class AbstractAggregator(ABC):
         name: str | None = None,
         verbose: bool = True,
         coords: Optional[Dict[str, Any]] = None,
+        **kwargs
     ):
+        super().__init__(**kwargs)
         self.log_text = get_logger(name=self.__class__.__name__)
 
         self.mask = mask
@@ -34,12 +37,13 @@ class AbstractAggregator(ABC):
         self._is_ensemble = is_ensemble
         assert name is None or isinstance(name, str), f"Name must be a string, got {name} ({type(name)=})"
         self.name = name
+        self.prefix_name = name
         self.coords = coords
 
     @abstractmethod
     def _record_batch(self, **kwargs) -> None: ...
 
-    def record_batch(self, predictions_mask: Optional[torch.Tensor] = None, **kwargs) -> None:
+    def update(self, predictions_mask: Optional[torch.Tensor] = None, **kwargs) -> None:
         assert predictions_mask is None, f"Deprecated predictions_mask {predictions_mask}"
         if self.mask is not None:
             # Apply mask to all tensors
@@ -59,13 +63,13 @@ class AbstractAggregator(ABC):
         return self._record_batch(**kwargs)
 
     @torch.inference_mode()
-    def get_logs(self, prefix: str = None, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    def compute(self, prefix: str = None, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         prefix = "" if prefix is None else prefix
         if "label" in kwargs.keys():
             prefix_prefix = kwargs.pop("label")
             prefix = f"{prefix_prefix}/{prefix}" if prefix_prefix not in prefix else prefix
-        if self.name is not None and self.name not in prefix:
-            prefix = f"{prefix}/{self.name}"
+        if self.prefix_name is not None and self.prefix_name not in prefix:
+            prefix = f"{prefix}/{self.prefix_name}"
         prefix = prefix.replace("//", "/").rstrip("/").lstrip("/")
         logs_values, logs_media, logs_own_xaxis = self._get_logs(label=prefix, **kwargs)
         return logs_values, logs_media, logs_own_xaxis
@@ -77,9 +81,36 @@ class AbstractAggregator(ABC):
 
 
 class _Aggregator(Protocol):
-    def get_logs(self, label: str) -> Mapping[str, torch.Tensor]: ...
+    def compute(self, prefix: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: ...
 
-    def record_batch(
+    """
+    Returns a tuple of three dictionaries:
+    1. logs_values: A dictionary of scalar values that can be reported to WandB.
+    2. logs_media: A dictionary of media that can be reported to WandB.
+    3. logs_own_xaxis: A dictionary of media that can be reported to WandB with its own x-axis.
+    
+    For the latter, return a dict following this structure:
+    {
+        "<primary_x_axis_name>": {  // E.g. "lead_time", "wavelength", etc.
+            "x_axes": <list-of-all-x-axis-names>,  // Should be at least [<primary_x_axis_name>]
+            
+            <x_axis_value_1>: {     // Specific value of the primary x-axis
+                "<metric_name_1>": <metric_value_1>,  // Log metric for this x-axis value
+                "<metric_name_2>": <metric_value_2>,  // Log another metric for this x-axis value
+                "<primary_x_axis_name>": <x_axis_value_1>,  // This is redundant, but needed for now
+                // ... potentially more metrics and x_axes values such as:
+                // "<secondary_x_axis_name>": <secondary_x_axis_value>,  // E.g. "lead_time": 24
+            },
+            
+            <x_axis_value_2>: {
+                // ... similar structure for the next x-axis value
+            },
+            // etc.. for all x-axis values
+        },
+    }
+    """
+
+    def update(
         self,
         target_data: Mapping[str, torch.Tensor],
         gen_data: Mapping[str, torch.Tensor],

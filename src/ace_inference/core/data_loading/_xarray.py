@@ -1,4 +1,3 @@
-import logging
 import os
 from collections import namedtuple
 from glob import glob
@@ -14,6 +13,7 @@ from src.ace_inference.core.data_loading.requirements import DataRequirements
 from src.ace_inference.core.data_loading.utils import get_lons_and_lats, get_times, load_series_data
 from src.ace_inference.core.device import get_device
 from src.ace_inference.core.winds import lon_lat_to_xyz
+from src.utilities.utils import get_logger
 
 from .data_typing import (
     Dataset,
@@ -21,6 +21,8 @@ from .data_typing import (
     SigmaCoordinates,
     VariableMetadata,
 )
+
+log = get_logger(__name__)
 
 
 VariableNames = namedtuple(
@@ -168,7 +170,7 @@ class XarrayDataset(Dataset):
         self._metadata = result
 
     def _get_files_stats(self):
-        logging.info(f"Opening data at {os.path.join(self.path, '*.nc')}")
+        log.info(f"Opening data at {os.path.join(self.path, '*.nc')}")
         cum_num_timesteps = get_cumulative_timesteps(self.full_paths)
         self.start_indices = cum_num_timesteps[:-1]
         self.total_timesteps = cum_num_timesteps[-1]
@@ -186,9 +188,9 @@ class XarrayDataset(Dataset):
                     break
             else:
                 raise ValueError(f"None of the requested variables {self.names} are present " f"in the dataset.")
-            logging.info(f"Found {self._n_initial_conditions} samples.")
-            logging.info(f"Image shape is {img_shape[0]} x {img_shape[1]}.")
-            # logging.info(f"Following variables are available: {list(ds.variables)}.")
+            log.info(f"Found {self._n_initial_conditions} samples.")
+            log.info(f"Image shape is {img_shape[0]} x {img_shape[1]}.")
+            # log.info(f"Following variables are available: {list(ds.variables)}.")
 
     def _group_variable_names_by_time_type(self) -> VariableNames:
         """Returns lists of time-dependent variable names, time-independent
@@ -306,14 +308,23 @@ class XarrayDatasetSalva(XarrayDataset):
         forcing_normalizer: Optional[Callable] = None,
         min_idx_shift: int = 0,
         split_id: Optional[str] = None,
+        loss_latitude_weighting: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.forcing_names = forcing_names if len(forcing_names) > 0 else None
         self.forcing_packer = forcing_packer
         self.forcing_normalizer = forcing_normalizer
+        self.loss_latitude_weighting = loss_latitude_weighting
         self.min_idx_shift = min_idx_shift
         self.split_id = split_id
+
+    @property
+    def loss_weights_tensor(self) -> Optional[torch.Tensor]:
+        weights = None
+        if self.loss_latitude_weighting:
+            weights = self._area_weights
+        return weights
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], xr.DataArray]:
         idx = idx + self.min_idx_shift

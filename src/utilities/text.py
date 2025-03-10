@@ -74,7 +74,9 @@ def get_dict_hash(d, length=8):
     return dhash[:length]
 
 
-def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False, metadata: Dict = None):
+def get_or_create_embeddings(
+    corpus, model_name, save_dir, history_length=0, force_recreate=False, metadata: Dict = None
+):
     """
     Load embeddings if they exist, otherwise create and save them.
 
@@ -82,6 +84,7 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
         corpus: List of texts to embed
         model_name: Name of the model to use for embeddings (e.g. 'bert-base-uncased', "Meta-Llama-3.1-8B")
         save_dir: Directory to save embeddings
+        history_length: Number of previous messages to include in the context
         force_recreate: Whether to recreate embeddings even if they exist
         metadata: Optional metadata to save with the embeddings (and verify when loading)
 
@@ -94,6 +97,8 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
         save_filename = str(model_name)
         if metadata is not None:
             save_filename += str(get_dict_hash(metadata))
+        if history_length > 0:
+            save_filename += f"-history{history_length}"
         save_filename += "-embeddings.h5"
         save_path = save_dir / save_filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,7 +127,7 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
             log.warning(f"Error loading embeddings: {e}")
 
     # Create new embeddings
-    log.info(f"Computing {model_name} embeddings for text data...")
+    log.info(f"Computing {model_name} embeddings for text data ({save_path=})...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     load_kwargs = dict()
     embed_kwargs = dict()
@@ -175,12 +180,22 @@ def get_or_create_embeddings(corpus, model_name, save_dir, force_recreate=False,
 
     text_features = []
     # embeddings = corpus.apply(lambda x: get_bert_embeddings(x, tokenizer=tokenizer, model=model, device=device))
+    history = []
     for x in tqdm(corpus, desc=f"{model_name} embeddings", total=len(corpus)):
+        if history_length > 0:
+            history.append(x)
+            if len(history) > history_length:
+                history.pop(0)
+            # elif len(history) < history_length:
+            #     text_features.append(None)  # Skip until we have enough history
+            #     continue
+            x = f"These are {len(history)} successive expert meteorologist forecast discussions:"
+            for i, h in enumerate(history, 1):
+                x += f"Forecast discussion {i}: {h}"
         embedding = embedding_func(x, tokenizer=tokenizer, model=model, **embed_kwargs)
-        embedding = np.array(embedding, dtype=np.float32)
-        text_features.append(embedding)
+        text_features.append(np.array(embedding, dtype=np.float32))
 
-    embedding_dim = len(text_features[0])
+    embedding_dim = len(text_features[-1])
     try:
         # Save embeddings
         with h5py.File(save_path, "w") as f:

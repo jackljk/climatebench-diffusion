@@ -9,12 +9,14 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 from einops import rearrange
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from torch import Tensor
 
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.datamodules.datasets.physical_systems_benchmark import TrajectoryDataset
 from src.datamodules.torch_datasets import MyTensorDataset
 from src.evaluation.aggregators.main import OneStepAggregator
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.utilities.utils import (
     get_logger,
     raise_error_if_invalid_type,
@@ -37,6 +39,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         multi_horizon: bool = True,
         num_test_obstacles: int = 1,
         test_out_of_distribution: bool = False,
+        max_val_samples: int = None,
         num_trajectories: int = None,  # None means all trajectories for training
         **kwargs,
     ):
@@ -104,6 +107,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
             join(self.hparams.data_dir, self._first_subdir)
         ), f"Could not find data directory {self._first_subdir} in {self.hparams.data_dir}. Did you download the data?"
         log.info(f"Using data directory: {self.hparams.data_dir}")
+        self._sigma_data = None
 
     @property
     def test_set_names(self):
@@ -113,6 +117,20 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
             return ["ood"]
         else:
             return ["test"]
+
+    @property
+    def sigma_data(self) -> float:
+        if self._sigma_data is None:
+            # xmean = self._data_train.tensors["dynamics"].mean(dim=(0, 1, 3, 4))
+            # xstd = self._data_train.tensors["dynamics"].std(dim=(0, 1, 3, 4))
+            # mean_train = tensor([6.3220e-01, -2.4435e-04, 6.7128e-01]), mean_test = tensor([0.6290, -0.0020, 0.7504])
+            # std_train = tensor([0.4818, 0.1900, 0.8180]), std_test = tensor([0.4943, 0.2044, 0.9091])
+            if self.hparams.physical_system == "navier-stokes":
+                self._sigma_data = 0.6380864381790161
+            else:
+                self._sigma_data = self._data_train.tensors["dynamics"].std().item()
+                log.info(f"Computed sigma_data={self._sigma_data} in sigma_data()")
+        return self._sigma_data
 
     def get_horizon(self, split: str, dataloader_idx: int = 0) -> int:
         if split in ["predict", "test"] or (split == "val" and dataloader_idx == 1):
@@ -183,10 +201,14 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
                 raise ValueError("Please use ``datamodule.multi_horizon=True`` for this datamodule.")
                 numpy_tensors = self.create_dataset_single_horizon(**dkwargs)
 
+            kwargs = {}
+            if split == "val":
+                kwargs["max_samples"] = self.hparams.max_val_samples
+
             # Create the pytorch tensor dataset
             # For the test set, we keep the trajectory dimension, so that we can evaluate the predictions
             # on the full trajectories, thus the test dataset will have a length of num_trajectories
-            tensor_ds = MyTensorDataset(numpy_tensors, dataset_id=split)
+            tensor_ds = MyTensorDataset(numpy_tensors, dataset_id=split, **kwargs)
             # Save the tensor dataset to self._data_{split}
             setattr(self, f"_data_{split}", tensor_ds)
             assert getattr(self, f"_data_{split}") is not None, f"Could not create {split} dataset"
@@ -335,7 +357,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         device: torch.device = None,
         verbose: bool = True,
         save_to_path: str = None,
-    ) -> Dict[str, OneStepAggregator]:
+    ) -> Dict[str, _Aggregator]:
         aggr_kwargs = dict(is_ensemble=is_ensemble)
         one_step_kwargs = {
             **aggr_kwargs,
@@ -351,7 +373,17 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
 
         if split == "val" and dataloader_idx == 1:
             assert len(self._data_val) > 1, "Full rollout is only supported for inference"
-            aggregators = {f"t{h}": OneStepAggregator(**one_step_kwargs, name=f"t{h}") for h in horizon_range}
-        else:
-            aggregators = {f"t{h}": OneStepAggregator(**one_step_kwargs, name=f"t{h}") for h in horizon_range}
+
+        aggregators = {f"t{h}": OneStepAggregator(**one_step_kwargs, name=f"t{h}") for h in horizon_range}
+
+        if save_to_path is not None:
+            # Specify ++module.save_predictions_filename="xarray" to save the predictions in xarray format
+            aggregators["save_to_disk"] = SaveToDiskAggregator(
+                final_dims_of_data=["channel", "x", "y"],
+                is_ensemble=is_ensemble,
+                coords={"channel": ["vel_x", "vel_y", "pressure"]},
+                concat_dim_name="lead_time",
+                save_to_path=save_to_path,
+            )
+
         return aggregators

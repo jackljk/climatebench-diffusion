@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import wandb
 from src.datamodules._dataset_dimensions import get_dims_of_dataset
 from src.datamodules.abstract_datamodule import BaseDataModule
+from src.evaluation.aggregators.main import LossAggregator
 from src.models._base_model import BaseModel
 from src.models.gan import BaseGAN
 from src.models.modules import padding
@@ -101,6 +102,7 @@ class BaseExperiment(LightningModule):
         enable_inference_dropout: bool = False,
         conv_padding_mode_global: Optional[str] = None,
         learned_channel_variance_loss: bool = False,
+        learned_spatial_variance_loss: bool = False,
         reset_optimizer: bool = False,
         from_pretrained_checkpoint_run_id: Dict[str, Any] = None,
         from_pretrained_local_path: Optional[str] = None,
@@ -320,7 +322,7 @@ class BaseExperiment(LightningModule):
     @property
     def channel_dim(self):
         channel_dim = self.CHANNEL_DIM
-        if self.datamodule_config.get("spatial_crop_during_training"):
+        if self.datamodule_config.get("spatial_crop_during_training") is True:
             channel_dim += 1
         return channel_dim
 
@@ -336,6 +338,7 @@ class BaseExperiment(LightningModule):
         assert isinstance(out_channels, (int, dict)), f"Expected int, got {type(out_channels)} for out_channels."
         kwargs["datamodule_config"] = self.datamodule_config
         kwargs["learned_channel_variance_loss"] = self.hparams.learned_channel_variance_loss
+        kwargs["learned_spatial_variance_loss"] = self.hparams.learned_spatial_variance_loss
         kwargs["channel_dim"] = self.channel_dim
         model = hydra.utils.instantiate(
             self.model_config,
@@ -449,6 +452,12 @@ class BaseExperiment(LightningModule):
             verbose=self.current_epoch == 0,
             save_to_path=self.prediction_outputs_filepath,
         )
+        if self.is_diffusion_model and split == "val" and dataloader_idx in [0, None]:
+            # Add aggregator for loss aggregated over batches of validation dataloader
+            self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
+            aggregators["diffusion_loss"] = LossAggregator()
+        for v in aggregators.values():
+            v.to(self.device)
         return aggregators
 
     def get_dataset_attribute(self, attribute: str, split: str = "train") -> Any:
@@ -792,8 +801,8 @@ class BaseExperiment(LightningModule):
         """Log some info about the model/data at the start of training"""
         assert "/" in self.WANDB_LAST_SEP, f'Please use a separator that contains a "/" in {self.WANDB_LAST_SEP}'
         # Find size of the validation set(s)
-        ds_val = self.datamodule.val_dataloader()
-        val_sizes = [len(dl.dataset) for dl in (ds_val if isinstance(ds_val, list) else [ds_val])]
+        dl_val = self.datamodule.val_dataloader()
+        val_sizes = [len(dl.dataset) for dl in (dl_val if isinstance(dl_val, list) else [dl_val])]
         # Compute the effective batch size
         # bs * acc * n_gpus
         bs = self.datamodule.train_dataloader().batch_size
@@ -809,6 +818,7 @@ class BaseExperiment(LightningModule):
             "Training set size": float(len(self.datamodule.train_dataloader().dataset)),
             "Validation set size": float(sum(val_sizes)),
             "Effective batch size": float(eff_bs),
+            "Dataloader batch size": float(bs),
             "Steps per epoch": float(n_steps_per_epoch),
             "Steps per epoch per GPU": float(n_steps_per_epoch_per_gpu),
             "n_gpus": n_gpus,
@@ -827,25 +837,50 @@ class BaseExperiment(LightningModule):
         self._set_loss_weights()
 
         # Print the world size, rank, and local rank
-        if self.trainer.world_size > 1:
+        world_size = self.trainer.world_size
+        if world_size > 1:
             self.log_text.info(
-                f"World size: {self.trainer.world_size}, Rank: {self.trainer.global_rank}, Local rank: {self.trainer.local_rank}"
+                f"World size: {world_size}, Rank: {self.trainer.global_rank}, Local rank: {self.trainer.local_rank}"
             )
+            # Check that validation dataset sizes are divisible by the world size
+            self.check_eval_dataset_divisibility(dl_val, "validation")
+
+    def check_eval_dataset_divisibility(self, eval_loaders, split: str) -> None:
+        eval_loaders = eval_loaders if isinstance(eval_loaders, list) else [eval_loaders]
+        world_size = self.trainer.world_size
+        if world_size <= 1:
+            return  # No need to check divisibility if using a single GPU or CPU
+        for i, eval_loader in enumerate(eval_loaders):
+            eval_size = len(eval_loader.dataset)
+            if eval_size % (eval_loader.batch_size * world_size) != 0:
+                raise ValueError(
+                    f"{split.capitalize()}_{i} set size ({eval_size}) is not divisible by "
+                    f"{eval_loader.batch_size * world_size=} ({eval_loader.batch_size=}, {world_size=}). "
+                    f"This will cause data point duplications across GPUs, leading to incorrect metrics. "
+                    f"Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
+                    f"Alternatively, you may use a single GPU or try to use datamodule.drop_last=True. "
+                )
 
     @property
     def channels_logvar(self):
-        if not self.hparams.learned_channel_variance_loss:
-            return None
-        return self.get_logvar("channels")
+        if self.hparams.learned_channel_variance_loss:
+            return self.get_logvar("channels")
+
+    @property
+    def spatial_logvar(self):
+        if self.hparams.learned_spatial_variance_loss:
+            return self.get_logvar("spatial")
 
     def get_logvar(self, dim_name: str):
-        if not isinstance(self.model.criterion, (dict, torch.nn.ModuleDict)):
-            return self.model.criterion.logvar_vector(dim_name)
+        if isinstance(self.model.criterion, (dict, torch.nn.ModuleDict)):
+            criterions = self.model.criterion.values()
         else:
-            assert isinstance(self.model.criterion, torch.nn.ModuleDict), "Criterion must be a ModuleDict."
-            for k, criterion_k in self.model.criterion.items():
-                if hasattr(criterion_k, "logvar_vector"):
-                    return criterion_k.logvar_vector(dim_name)
+            criterions = [self.model.criterion]
+        for criterion in criterions:
+            if dim_name == "spatial" and hasattr(criterion, "spatial_logvar"):
+                return criterion.spatial_logvar
+            if hasattr(criterion, "logvar_vector"):
+                return criterion.logvar_vector(dim_name)
 
     def _reshape_loss_weights(self, loss_weights: Tensor) -> Tensor:
         return loss_weights
@@ -968,9 +1003,13 @@ class BaseExperiment(LightningModule):
         self.log_dict(train_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         return loss  # {"loss": loss}
 
-    def on_train_batch_end(self, *args, **kwargs):
+    def on_train_batch_end(self, outputs=None, batch=None, batch_idx: int = None):
         if self.update_ema:
             self.model_ema(self.model_handle_for_ema)  # update the model EMA
+        if not (batch_idx == 0 or batch_idx % (self.trainer.log_every_n_steps * 2) == 0):
+            return  # Do not log the next things at every step
+
+        log_dict = {}
         # Log logvar of the channels
         if self.channels_logvar is not None:
             channel_vars = self.channels_logvar.exp().detach()
@@ -983,7 +1022,27 @@ class BaseExperiment(LightningModule):
                 channel_vars = {f"channel_{i}": v for i, v in enumerate(channel_vars)}
             # Pre-pend with "train/learned_var/" and make float
             channel_vars = {f"train/learned_var/{k}": float(v) for k, v in channel_vars.items()}
-            self.log_dict(channel_vars, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            log_dict.update(channel_vars)
+
+        if self.spatial_logvar is not None:
+            spatial_vars = self.spatial_logvar.exp().detach()
+            assert len(spatial_vars.shape) == 2, f"Expected 2D tensor, got {spatial_vars.shape=}"
+            # Make a heatmap plot of the 2D spatial variance
+            spatial_lv_log = {
+                "train/learned_var/spatial": wandb.Image(spatial_vars),
+                "train/learned_var/spatial_mean": float(spatial_vars.mean()),
+                "train/learned_var/spatial_std": float(spatial_vars.std()),
+                "train/learned_var/spatial_min": float(spatial_vars.min()),
+                "train/learned_var/spatial_max": float(spatial_vars.max()),
+            }
+            self.logger.experiment.log(spatial_lv_log)
+
+        if hasattr(self, "_ar_logvars"):
+            ar_logvars = self._ar_logvars.exp().detach()
+            ar_logvars = {f"train/learned_var/ar_{i}": float(v) for i, v in enumerate(ar_logvars)}
+            log_dict.update(ar_logvars)
+
+        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
 
     def on_train_epoch_end(self) -> None:
         train_time = time.time() - self._start_epoch_time
@@ -1266,25 +1325,24 @@ class BaseExperiment(LightningModule):
             "noise_level": self.inputs_noise,
             "epoch": float(self.current_epoch),
             "global_step": self.global_step,
+            "eval_batch_size": self.datamodule_config.get("eval_batch_size"),
+            "world_size": self.trainer.world_size,
         }
         val_media = {"epoch": self.current_epoch, "global_step": self.global_step}
         data_split_names = data_split_names or [split]
 
         skip_temporal_metrics_after = 60
         total_mean_metrics_all = []
+        # Loop over dataloader's
         for prefix, aggregators in zip(data_split_names, aggregators):
             label = f"{prefix}/{logging_infix}".rstrip("/")  # e.g. "val/5ens_mems" or "val"
             per_variable_mean_metrics = defaultdict(list)
             temporal_metrics_logged = 0
+            # Loop over aggregators
             for agg_name, agg in aggregators.items():
                 if agg_name == "save_to_disk":
-                    metadata = dict()
-                    if hasattr(self.logger, "experiment") and self.logger.experiment is not None:
-                        metadata["id"] = self.logger.experiment.id
-                        metadata["name"] = self.logger.experiment.name
-                        metadata["group"] = self.logger.experiment.group
-
-                    agg.get_logs(prefix=label, epoch=self.current_epoch, metadata=metadata)
+                    metadata = self.get_logger_metadata()
+                    agg.compute(prefix=label, epoch=self.current_epoch, metadata=metadata)
                     continue
                 # agg.name takes precedence over agg_name as it may better specify the lead time
                 agg_name_substrings = agg.name.split("/") if agg.name is not None else []
@@ -1294,19 +1352,38 @@ class BaseExperiment(LightningModule):
                     if agg_name_substring.startswith("t") and agg_name_substring[1:].isdigit():
                         agg_name_part_with_t = agg_name_substring
                         lead_time = int(agg_name_substring[1:])
+                        lead_time_name = "lead_time"
                         break
+                    elif all(c.isdigit() for c in agg_name_substring.split("-")):
+                        agg_name_part_with_t = agg_name_substring
+                        lead_time = agg_name_substring
+                        if len(agg_name_substrings.split("-")) == 1:
+                            lead_time_name = "Year"
+                        elif len(agg_name_substrings.split("-")) == 2:
+                            lead_time_name = "Year-Month"
+                        else:
+                            raise ValueError(f"Unknown lead time format: {agg_name_substring}")
+                        break
+                    elif agg_name_substring != "" and "loss" not in agg_name_substring:
+                        print(f"agg_name_substring={agg_name_substring} does not start with 't' and is not a number.")
 
                 # if agg.name is None:  # does not work when using a listaggregator
                 #     label = f"{label}/{agg_name}"   # e.g. "val/5ens_mems/t3" or "val/t1"
-                logs_metrics, logs_media, logs_own_xaxis = agg.get_logs(prefix=label, epoch=self.current_epoch)
+                logs_metrics, logs_media, logs_own_xaxis = agg.compute(prefix=label, epoch=self.current_epoch)
+                # log.info(f"Aggregator {agg_name} has logs: {logs_metrics.keys()}, {agg_name_substrings=}")
                 val_media.update(logs_media)
-                if temporal_metrics_logged <= skip_temporal_metrics_after:
+                if lead_time is not None:
                     # Don't overload the logs with too many temporal metrics (they will be logged as lines below too)
+                    if temporal_metrics_logged <= skip_temporal_metrics_after:
+                        val_stats.update(logs_metrics)
+                else:
                     val_stats.update(logs_metrics)
+
                 # Log the custom x-axis metrics
                 for x_axis_name, values_list in logs_own_xaxis.items():
                     # values_list is e.g. wavenumber -> {wv_1: {wv_1: 1, pow: 2}, wv_2: {wv_2: 2, pow: 3}, ...}
-                    x_axes = values_list.pop("x_axes")
+                    x_axes = values_list.pop("x_axes")  # Dict of <x_axis_name> -> [<x_values>]
+                    first_x_axis = list(x_axes.keys())[0]
                     for x_axis in x_axes:
                         # define our custom x axis metric
                         wandb.define_metric(x_axis)
@@ -1316,10 +1393,14 @@ class BaseExperiment(LightningModule):
                                 for custom_x_axis in x_axes:
                                     # define which metrics will be plotted against it
                                     wandb.define_metric(value_i_k, step_metric=custom_x_axis)
-                        self.logger.experiment.log({"lead_time": lead_time, **values})
+                        if first_x_axis not in values.keys():
+                            # alternatively, specify exact x-axis value inside values
+                            values[first_x_axis] = x_axis_value  # e.g. "sigma" -> 0.02
+                        self.logger.experiment.log({lead_time_name: lead_time, **values})
 
                 if lead_time is None:  # Don't use these aggregators for the mean metrics (not temporal)
-                    self.log_text.info(f"Skipping aggregator ``{agg_name}`` for mean metrics.")
+                    if "loss" not in agg_name:
+                        self.log_text.info(f"Skipping aggregator ``{agg_name}`` for mean metrics.")
                     continue
 
                 # Log the temporal metrics with t<number> as the x-axis
@@ -1328,12 +1409,12 @@ class BaseExperiment(LightningModule):
                 }
                 if temporal_metrics_logged == 0:
                     try:
-                        wandb.define_metric("lead_time")
+                        wandb.define_metric(lead_time_name)
                         for k in logs_metrics_no_t.keys():
-                            wandb.define_metric(k, step_metric="lead_time")
+                            wandb.define_metric(k, step_metric=lead_time_name)
                     except Exception as e:
-                        self.log_text.warning(f"Could not define metric 'lead_time' in wandb: {e}.")
-                self.logger.experiment.log({"lead_time": lead_time, **logs_metrics_no_t})
+                        self.log_text.warning(f"Could not define metric '{lead_time_name}' in wandb: {e}.")
+                self.logger.experiment.log({lead_time_name: lead_time, **logs_metrics_no_t})
                 temporal_metrics_logged += 1
 
                 # Compute average metrics over all aggregators I
@@ -1369,6 +1450,7 @@ class BaseExperiment(LightningModule):
     def on_test_epoch_start(self) -> None:
         self._start_test_epoch_time = time.time()
         test_loaders = self.datamodule.test_dataloader()
+        self.check_eval_dataset_divisibility(test_loaders, "test")
         n_test_loaders = len(test_loaders) if isinstance(test_loaders, list) else 1
         self.aggregators_test = [
             self.get_epoch_aggregators(split="test", dataloader_idx=i) for i in range(n_test_loaders)
@@ -1472,6 +1554,7 @@ class BaseExperiment(LightningModule):
                     "force_pure_noise_last_frame",
                     "val_slice",
                     "max_val_samples",
+                    "data_dir",
                 ]
                 skip_tags_with_value = ["initialize_window=regression"]
                 tags = [
@@ -1493,6 +1576,10 @@ class BaseExperiment(LightningModule):
                     sigma_max_inf="Smax",
                     sigma_min="Smin",
                     possible_initial_times="IC",
+                    use_same_dropout_state_for_sampling="DropState",
+                    use_cold_sampling_for_intermediate_steps="cI",
+                    use_cold_sampling_for_last_step="cL",
+                    use_cold_sampling_for_init_of_ar_step="cIAR",
                 )
                 tags_to_short["True"] = "T"
                 tags_to_short["False"] = "F"
@@ -1583,7 +1670,7 @@ class BaseExperiment(LightningModule):
         allow_disable_weight_decay = kwargs.pop("allow_disable_weight_decay", True)
 
         if allow_disable_weight_decay:
-            no_decay_params = {"channel_embed", "pos_embed", "_logvar"}
+            no_decay_params = {"channel_embed", "pos_embed", "_logvar", "logvars"}
         else:
             no_decay_params = set()
 
@@ -1725,14 +1812,42 @@ class BaseExperiment(LightningModule):
     def monitor(self):
         return self.hparams.monitor
 
+    def get_logger_metadata(self) -> Dict[str, Any]:
+        metadata = dict()
+        if hasattr(self.logger, "experiment") and self.logger.experiment is not None:
+            metadata["id"] = self.logger.experiment.id
+            metadata["name"] = self.logger.experiment.name
+            metadata["group"] = self.logger.experiment.group
+            metadata["project"] = self.logger.experiment.project
+        return metadata
+
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
         if not self.use_ema:
             # Remove the model EMA parameters from the state_dict (since unwanted here)
             state_dict = {k: v for k, v in state_dict.items() if "model_ema" not in k}
 
+        logvar_c_key = None
+        for k in state_dict.keys():
+            if "criterion.preds.channels_logvar" in k:
+                logvar_c_key = k
+                if self.hparams.learned_spatial_variance_loss and not self.model.hparams.log_vars_learn_per_dim:
+                    # Repeat into spatial dims self.model.spatial_shape_out
+                    logvar_all_k = k.replace("channels_logvar", "logvars")
+                    state_dict[logvar_all_k] = state_dict[k].unsqueeze(-1).unsqueeze(-1)
+                    state_dict[logvar_all_k] = state_dict[logvar_all_k].repeat(1, *self.model.spatial_shape_out)
+                    state_dict.pop(k)
+                    self.log_text.info(f"Repeated {k} into shape {state_dict[logvar_all_k].shape=}")
+                break
+
         if self.hparams.reset_optimizer:
             strict = False  # Allow loading of partial state_dicts (e.g. fine-tune new layers)
-        return super().load_state_dict(state_dict, strict=strict)
+        try:
+            super().load_state_dict(state_dict, strict=strict)
+        except Exception:
+            # try adding 2 singleton dims to criterion.preds.channels_logvar key
+            if self.model.hparams.log_vars_learn_per_dim:
+                state_dict[logvar_c_key] = state_dict[logvar_c_key].unsqueeze(-1).unsqueeze(-1)
+            super().load_state_dict(state_dict, strict=strict)
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """Save a model checkpoint with extra info"""
