@@ -11,7 +11,7 @@ python run.py "$@" \
     datamodule.window=1 \
     datamodule.data_dir=/data \
     datamodule.batch_size=512 \
-    datamodule.eval_batch_size=5 \
+    datamodule.eval_batch_size=3 \
     datamodule.batch_size_per_gpu=8 \
     datamodule.output_vars='pr' \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-AllEns-pr" \
