@@ -17,8 +17,6 @@ from src.ace_inference.core.normalizer import (
 )
 from src.ace_inference.core.prescriber import NullPrescriber, Prescriber, PrescriberConfig
 from src.ace_inference.core.stepper import SingleModuleStepper
-from src.ace_inference.training.utils.darcy_loss import LpLoss
-from src.ace_inference.training.utils.data_requirements import DataRequirements
 from src.evaluation.aggregators.main import OneStepAggregator
 from src.experiment_types.forecasting_multi_horizon import (
     AbstractMultiHorizonForecastingExperiment,
@@ -30,6 +28,14 @@ from src.utilities.utils import to_tensordict, update_dict_with_other
 from .optimization import NullOptimization, Optimization
 from .stepper import SteppedData, get_name_and_time_query_fn
 
+
+@dataclasses.dataclass
+class DataRequirements:
+    names: List[str]
+    # TODO: delete these when validation no longer needs them
+    in_names: List[str]
+    out_names: List[str]
+    n_timesteps: int
 
 @dataclasses.dataclass
 class MultiStepStepperConfig:
@@ -146,7 +152,6 @@ class MultiStepStepper(SingleModuleStepper):
         self._no_optimization = NullOptimization()
         self._is_distributed = dist.is_distributed()
 
-        self.loss_obj = LpLoss()
 
     def run_on_batch(
         self,

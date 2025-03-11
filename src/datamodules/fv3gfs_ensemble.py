@@ -10,11 +10,10 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch import Tensor
 
-from src.ace_inference.core.data_loading._xarray import XarrayDatasetSalva
-from src.ace_inference.core.data_loading.getters import get_dataset
-from src.ace_inference.core.data_loading.params import DataLoaderParams, XarrayDataParams
+from src.ace_inference.ace.data_loading._xarray_old import XarrayDatasetSalva
+from src.ace_inference.ace.data_loading.getters import get_dataset
+from src.ace_inference.ace.data_loading.params import DataLoaderParams, XarrayDataParams
 from src.ace_inference.core.prescriber import Prescriber
-from src.ace_inference.training.utils.data_loader_fv3gfs import FV3GFSDataset
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
 from src.evaluation.aggregators.time_mean import TimeMeanAggregator
@@ -101,7 +100,7 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         )
         return all_names
 
-    def _create_ds(self, split: str, dataloader_idx: Optional[int] = None, **kwargs) -> Optional[FV3GFSDataset]:
+    def _create_ds(self, split: str, dataloader_idx: Optional[int] = None, **kwargs) -> Optional[XarrayDatasetSalva]:
         kwargs = kwargs.copy()
         kwargs["split_id"] = split
         horizon = self.get_horizon(split, dataloader_idx)

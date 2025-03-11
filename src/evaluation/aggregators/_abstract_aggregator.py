@@ -92,7 +92,7 @@ class _Aggregator(Protocol):
     For the latter, return a dict following this structure:
     {
         "<primary_x_axis_name>": {  // E.g. "lead_time", "wavelength", etc.
-            "x_axes": <list-of-all-x-axis-names>,  // Should be at least [<primary_x_axis_name>]
+            "x_axes": <dict-of-all-x-axis-names-to-their-values>,  // Should be at least {<primary_x_axis_name>: [<x_axis_values>]}
             
             <x_axis_value_1>: {     // Specific value of the primary x-axis
                 "<metric_name_1>": <metric_value_1>,  // Log metric for this x-axis value

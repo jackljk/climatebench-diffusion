@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import xarray as xr
 from tensordict import TensorDict
-from itertools import chain
 
 from src.evaluation.aggregators._abstract_aggregator import AbstractAggregator
 from src.utilities.utils import get_logger, rrearrange, to_tensordict, torch_to_numpy
@@ -22,7 +21,7 @@ class SaveToDiskAggregator(AbstractAggregator):
         self,
         final_dims_of_data: List[str],  # e.g. ["channel", "latitude", "longitude"], or ["latitude", "longitude"]
         var_names: Optional[List[str]] = None,
-        coords: Optional[Dict[str, np.ndarray]] = None,
+        coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         concat_dim_name: Optional[str] = None,
         batch_dim_name: Optional[str] = "batch",
         max_ensemble_members: Optional[int] = 5,  # Number of ensemble members to save (if applicable)
@@ -93,7 +92,7 @@ class SaveToDiskAggregator(AbstractAggregator):
     @torch.inference_mode()
     def _get_logs(self, label: str = "", epoch: Optional[int] = None, metadata=None) -> Dict[str, float]:
         """Converts running data to xarray dataset."""
-        if self._running_data is None:
+        if not self._running_data:
             log.warning("No data to log.")
             return {}
         metadata = metadata or {}
@@ -134,19 +133,15 @@ class SaveToDiskAggregator(AbstractAggregator):
                 if isinstance(value, (np.ndarray, dict)):
                     log.info(f"Adding {type(value)} to metadata is not supported. Skipping {key}")
                     continue
-                
-                attrs_value = [m[key] for m in self._metadatas if m[key] is not None]
-                # handle case where the is a multi-dim list
-                if isinstance(attrs_value, list) and isinstance(attrs_value[0], list):
-                    attrs_value = list(chain(*attrs_value))
-                final_ds.attrs[key] = attrs_value
+
+                final_ds.attrs[key] = [m[key] for m in self._metadatas if m[key] is not None]
                 log.info(f"Added {key} to metadata: {final_ds.attrs[key]}")
 
         for key, value in metadata.items():
             final_ds.attrs[key] = value
 
         # Save to file if path is provided
-        save_to_path = self.save_to_path + f"{label}-epoch{epoch}-results.nc" if self.save_to_path else f"{label}-epoch{epoch}-results.nc"
+        save_to_path = self.save_to_path or f"{label}-epoch{epoch}-results.nc"
         log.info(f"Saving results to {save_to_path}")
         # predictions/6h-1AR_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_54lr_LC5:200_15wd_fLV_11seed_19h03mOct18_3423514-5214396-hor30-TAG-ENS=5-max_val_samples=1-val_slice=20210329_20210430-possible_initial_times=12-prediction_horizon=30-TAG-epoch199.nc
         final_ds.to_netcdf(save_to_path)

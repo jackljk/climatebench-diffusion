@@ -13,7 +13,6 @@ from torch.utils.data import Dataset
 
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
-from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
     get_mean_std_of_variables,
@@ -203,7 +202,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             set_train = set_val = None
 
         if stage in ["test", "predict", None]:
-            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM], self.hparams.mean_over_ensemble)
+            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM])
             set_test = self._setup_test(X_test, Y_test)
         else:
             set_test = None
@@ -363,11 +362,9 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         split_ds = getattr(self, f"_data_{split}")
         if split == "val" and isinstance(split_ds, list):
             split_ds = split_ds[0]  # just need it for the area weights
-            
 
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
-        aggregators = dict()
 
         aggregator = OneStepAggregator(
             record_rmse=True,
@@ -378,19 +375,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             temporal_kwargs=self.hparams.comprehensive_validation,
             **aggr_kwargs,
         )
-        aggregators[""] = aggregator
-        
-        if self.hparams.comprehensive_validation.run and self.hparams.comprehensive_validation.save_to_disk:
-            save_to_disk_aggregator = SaveToDiskAggregator(
-                is_ensemble=is_ensemble,
-                final_dims_of_data=["latitude", "longitude"],
-                save_to_path=save_to_path,
-                max_ensemble_members=None, # save all ensemble members
-            )
-            aggregators["save_to_disk"] = save_to_disk_aggregator
-    
-    
-        
+        aggregators = {"": aggregator}
         return aggregators
 
 

@@ -1,23 +1,7 @@
 import dataclasses
-import warnings
 from typing import Literal, Optional
 
-
-@dataclasses.dataclass
-class Slice:
-    """
-    Configuration of a python `slice` built-in.
-
-    Required because `slice` cannot be initialized directly by dacite.
-    """
-
-    start: Optional[int] = None
-    stop: Optional[int] = None
-    step: Optional[int] = None
-
-    @property
-    def slice(self) -> slice:
-        return slice(self.start, self.stop, self.step)
+#todo: remove for config.py
 
 
 @dataclasses.dataclass
@@ -54,24 +38,9 @@ class DataLoaderParams:
     batch_size: int
     num_data_workers: int
     data_type: Literal["xarray", "ensemble_xarray"]
-    subset: Slice = dataclasses.field(default_factory=Slice)
     n_samples: Optional[int] = None
 
     def __post_init__(self):
-        if self.n_samples is not None:
-            if self.subset.stop is not None:
-                raise ValueError("Both 'n_samples' and 'subset.stop' are specified. " "Only one of them can be used.")
-            warnings.warn(
-                "Specifying 'n_samples' is deprecated. Use 'subset.stop' instead.",
-                category=DeprecationWarning,
-            )
-            self.subset.stop = self.n_samples
-        # dist = Distributed.get_instance()
-        # if self.batch_size % dist.world_size != 0:
-        #     raise ValueError(
-        #         "batch_size must be divisible by the number of parallel "
-        #         f"workers, got {self.batch_size} and {dist.world_size}"
-        #     )
 
         if self.dataset.n_repeats != 1 and self.data_type == "ensemble_xarray":
             raise ValueError("n_repeats must be 1 when using ensemble_xarray")

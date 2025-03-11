@@ -256,7 +256,7 @@ class AbstractWeightedLoss(torch.nn.Module):
         else:
             assert (
                 add_weight is not None or multiply_weight is not None or batch_logvars is not None
-            ), "No weights provided. Please set or provide."
+            ), "No weights given. Please provide/set - for example, as `loss_weights_tensor` in your training dataset."
             weights = torch.ones_like(loss)
 
         # Shapes are e.g.: inputs: (B, C, H, W), targets: (B, C, H, W), weights: (H, W) or (C, H, W)

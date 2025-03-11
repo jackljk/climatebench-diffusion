@@ -9,14 +9,14 @@ import numpy as np
 import torch
 import xarray as xr
 
-from src.ace_inference.core.aggregator.inference.main import InferenceAggregator
-from src.ace_inference.core.aggregator.null import NullAggregator
-from src.ace_inference.core.data_loading.data_typing import GriddedData
+from src.ace_inference.ace.aggregator.inference.main import InferenceAggregator
+from src.ace_inference.ace.aggregator.null import NullAggregator
+from src.ace_inference.ace.data_loading.data_typing import GriddedData
 from src.ace_inference.core.device import get_device
 from src.ace_inference.core.optimization import NullOptimization
 from src.ace_inference.core.stepper import SingleModuleStepper, SteppedData
-from src.ace_inference.inference.data_writer.main import DataWriter, NullDataWriter
-from src.ace_inference.inference.derived_variables import (
+from src.ace_inference.ace.inference.data_writer.main import DataWriter, NullDataWriter
+from src.ace_inference.ace.inference.derived_variables import (
     compute_derived_quantities,
     # compute_stepped_derived_quantities,
 )

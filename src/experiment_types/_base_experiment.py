@@ -113,6 +113,7 @@ class BaseExperiment(LightningModule):
         torch_compile: str = None,
         num_predictions: int = 1,
         num_predictions_in_memory: int = None,
+        allow_validation_size_indivisible_on_ddp: bool = False,   # Throw error if False, else only log warning
         logging_infix: str = "",
         prediction_inputs_noise: float = 0.0,
         save_predictions_filename: Optional[str] = None,
@@ -481,6 +482,7 @@ class BaseExperiment(LightningModule):
 
         # Try to get the attribute from the dataset
         ds = dl.dataset if isinstance(dl, torch.utils.data.DataLoader) else dl[0].dataset
+        # log.info(ds.__dict__, getattr(ds, attribute), attribute)
         attr_value = getattr(ds, attribute, getattr(ds, f"_{attribute}", None))
         if attr_value is not None:
             # Cache the attribute
@@ -805,25 +807,35 @@ class BaseExperiment(LightningModule):
         val_sizes = [len(dl.dataset) for dl in (dl_val if isinstance(dl_val, list) else [dl_val])]
         # Compute the effective batch size
         # bs * acc * n_gpus
-        bs = self.datamodule.train_dataloader().batch_size
+        train_dl = self.datamodule.train_dataloader()
+        bs = train_dl.batch_size
         acc = self.trainer.accumulate_grad_batches
         n_gpus = max(1, self.trainer.num_devices)
         n_nodes = max(1, self.trainer.num_nodes)
         eff_bs = bs * acc * n_gpus * n_nodes
         # compute number of steps per epoch
-        n_steps_per_epoch = len(self.datamodule.train_dataloader())
+        n_steps_per_epoch = len(train_dl)
         n_steps_per_epoch_per_gpu = n_steps_per_epoch / n_gpus
         to_log = {
             "Parameter count": float(self.model.num_params),
-            "Training set size": float(len(self.datamodule.train_dataloader().dataset)),
+            "Training set size": float(len(train_dl.dataset)),
             "Validation set size": float(sum(val_sizes)),
             "Effective batch size": float(eff_bs),
             "Dataloader batch size": float(bs),
             "Steps per epoch": float(n_steps_per_epoch),
             "Steps per epoch per GPU": float(n_steps_per_epoch_per_gpu),
             "n_gpus": n_gpus,
+            "world_size": self.trainer.world_size,
             "TESTED": False,
         }
+        # Log some dataloader args (useful for debugging/optimizing dataloader speed)
+        dataloader_args_to_log = [
+            "batch_size", "num_workers", "pin_memory", "drop_last", "persistent_workers", "prefetch_factor"
+        ]
+        for arg in dataloader_args_to_log:
+            if hasattr(train_dl, arg):
+                to_log[f"train_dataloader/{arg}"] = getattr(train_dl, arg)
+
         self.log_dict(to_log, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         # provide access to trainer to the model
         self.model.trainer = self.trainer
@@ -853,13 +865,19 @@ class BaseExperiment(LightningModule):
         for i, eval_loader in enumerate(eval_loaders):
             eval_size = len(eval_loader.dataset)
             if eval_size % (eval_loader.batch_size * world_size) != 0:
-                raise ValueError(
+                message = (
                     f"{split.capitalize()}_{i} set size ({eval_size}) is not divisible by "
                     f"{eval_loader.batch_size * world_size=} ({eval_loader.batch_size=}, {world_size=}). "
                     f"This will cause data point duplications across GPUs, leading to incorrect metrics. "
                     f"Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
-                    f"Alternatively, you may use a single GPU or try to use datamodule.drop_last=True. "
+                    f"If you prefer ignoring this warning for the validation dataloaders, "
+                    f"set `module.allow_validation_size_indivisible_on_ddp=True`."
+                    f"Alternatively, you may use a single GPU to get correct results. "
                 )
+                if "val" in split and self.hparams.allow_validation_size_indivisible_on_ddp:
+                    self.log_text.warning(message)
+                else:
+                    raise ValueError(message)
 
     @property
     def channels_logvar(self):
@@ -1396,7 +1414,7 @@ class BaseExperiment(LightningModule):
                         if first_x_axis not in values.keys():
                             # alternatively, specify exact x-axis value inside values
                             values[first_x_axis] = x_axis_value  # e.g. "sigma" -> 0.02
-                        self.logger.experiment.log({lead_time_name: lead_time, **values})
+                        self.logger.experiment.log(values)
 
                 if lead_time is None:  # Don't use these aggregators for the mean metrics (not temporal)
                     if "loss" not in agg_name:

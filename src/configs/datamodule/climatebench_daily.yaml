@@ -27,9 +27,8 @@ DEBUG_dataset_size: null # Set to None to use the full dataset, value is the num
 
 # Extended Validation Parameters
 comprehensive_validation:
-  run: False
+  run: True
   n_epochs: 1 # Run every x epoch
   temporal_scale: 'monthly' # 'monthly' or 'yearly'
   metrics: ['rmse', 'crps', 'brier', 'ssr']
-  save_to_disk: True
 
