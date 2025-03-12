@@ -113,7 +113,7 @@ class BaseExperiment(LightningModule):
         torch_compile: str = None,
         num_predictions: int = 1,
         num_predictions_in_memory: int = None,
-        allow_validation_size_indivisible_on_ddp: bool = True,   # Throw error if False, else only log warning
+        allow_validation_size_indivisible_on_ddp: bool = False,  # Throw error if False, else only log warning
         logging_infix: str = "",
         prediction_inputs_noise: float = 0.0,
         save_predictions_filename: Optional[str] = None,
@@ -830,7 +830,12 @@ class BaseExperiment(LightningModule):
         }
         # Log some dataloader args (useful for debugging/optimizing dataloader speed)
         dataloader_args_to_log = [
-            "batch_size", "num_workers", "pin_memory", "drop_last", "persistent_workers", "prefetch_factor"
+            "batch_size",
+            "num_workers",
+            "pin_memory",
+            "drop_last",
+            "persistent_workers",
+            "prefetch_factor",
         ]
         for arg in dataloader_args_to_log:
             if hasattr(train_dl, arg):
@@ -868,15 +873,18 @@ class BaseExperiment(LightningModule):
                 message = (
                     f"{split.capitalize()}_{i} set size ({eval_size}) is not divisible by "
                     f"{eval_loader.batch_size * world_size=} ({eval_loader.batch_size=}, {world_size=}). "
-                    f"This will cause data point duplications across GPUs, leading to incorrect metrics. "
-                    f"Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
-                    f"If you prefer ignoring this warning for the validation dataloaders, "
-                    f"set `module.allow_validation_size_indivisible_on_ddp=True`."
-                    f"Alternatively, you may use a single GPU to get correct results. "
+                    f"This will cause data point duplications across GPUs, leading to (slightly) incorrect metrics. "
                 )
                 if "val" in split and self.hparams.allow_validation_size_indivisible_on_ddp:
+                    message += "Ignoring this warning because `module.allow_validation_size_indivisible_on_ddp=True`."
                     self.log_text.warning(message)
                 else:
+                    message += (
+                        f"Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
+                        f"If you prefer ignoring this warning for the validation dataloaders, "
+                        f"set `module.allow_validation_size_indivisible_on_ddp=True`."
+                        f"Alternatively, you may use a single GPU to get correct results. "
+                    )
                     raise ValueError(message)
 
     @property

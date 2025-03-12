@@ -46,9 +46,7 @@ class ModuleConfig(abc.ABC):
         Create a ModuleSelector from a dictionary containing all the information
         needed to build a ModuleConfig.
         """
-        return dacite.from_dict(
-            data_class=cls, data=state, config=dacite.Config(strict=True)
-        )
+        return dacite.from_dict(data_class=cls, data=state, config=dacite.Config(strict=True))
 
 
 MT = TypeVar("MT", bound=nn.Module)
@@ -123,9 +121,7 @@ class ModuleSelector:
         Create a ModuleSelector from a dictionary containing all the information
         needed to build a ModuleConfig.
         """
-        return dacite.from_dict(
-            data_class=cls, data=state, config=dacite.Config(strict=True)
-        )
+        return dacite.from_dict(data_class=cls, data=state, config=dacite.Config(strict=True))
 
     @classmethod
     def from_dict(cls, config: dict):

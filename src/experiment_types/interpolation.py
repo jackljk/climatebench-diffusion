@@ -282,7 +282,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
                 )
 
             # Retrieve preds and update autoregressive inputs
-            autoregressive_inputs = preds = results["preds"]
+            autoregressive_inputs = preds = self.postprocess_inputs(results["preds_normed"])
 
             results = {f"t{t_step}_{k}": v for k, v in results.items()}
             if return_only_preds_and_targets:
@@ -347,6 +347,7 @@ class NextStepInterpolationExperiment(InterpolationExperiment):
         # take random choice of time
         t = possible_times[torch.randint(len(possible_times), (b,), device=self.device, dtype=torch.long)]  # (b,)
         targets = dynamics[torch.arange(b), self.window + t - 1, ...]  # (b, c, h, w), zero-based indexing
+        targets = self.pack_data(targets, input_or_output="output")
         inputs = self.get_inputs_from_dynamics(dynamics, time=t)
 
         loss, preds = self.model.get_loss(

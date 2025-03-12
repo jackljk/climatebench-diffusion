@@ -21,9 +21,7 @@ class PerturbationConfig(abc.ABC):
         Create a PerturbationSelector from a dictionary containing all the information
         needed to build a PerturbationConfig.
         """
-        return dacite.from_dict(
-            data_class=cls, data=state, config=dacite.Config(strict=True)
-        )
+        return dacite.from_dict(data_class=cls, data=state, config=dacite.Config(strict=True))
 
     @abc.abstractmethod
     def apply_perturbation(
@@ -83,9 +81,7 @@ class SSTPerturbation:
     sst: list[PerturbationSelector]
 
     def __post_init__(self):
-        self.perturbations: list[PerturbationConfig] = [
-            perturbation.build() for perturbation in self.sst
-        ]
+        self.perturbations: list[PerturbationConfig] = [perturbation.build() for perturbation in self.sst]
 
 
 def _get_ocean_mask(ocean_fraction: torch.Tensor, cutoff: float = 0.5) -> torch.Tensor:
@@ -174,19 +170,8 @@ class GreensFunctionConfig(PerturbationConfig):
         mask = lat_in_patch & lon_in_patch
         ocean_mask = _get_ocean_mask(ocean_fraction)
         perturbation = self.amplitude * (
-            torch.cos(
-                torch.pi
-                / 2
-                * (lat.deg2rad() - self._lat_center_rad)
-                / (self._lat_width_rad / 2.0)
-            )
-            ** 2
-            * torch.cos(
-                torch.pi
-                / 2
-                * (lon_shifted.deg2rad() - self._lon_center_rad)
-                / (self._lon_width_rad / 2.0)
-            )
+            torch.cos(torch.pi / 2 * (lat.deg2rad() - self._lat_center_rad) / (self._lat_width_rad / 2.0)) ** 2
+            * torch.cos(torch.pi / 2 * (lon_shifted.deg2rad() - self._lon_center_rad) / (self._lon_width_rad / 2.0))
             ** 2
         )
         mask = mask.expand(data.shape)

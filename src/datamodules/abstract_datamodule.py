@@ -234,7 +234,6 @@ class BaseDataModule(pl.LightningDataModule):
             )
         return batch_size
 
-
     def val_dataloader(self):
         if self._data_val is None:
             return None
@@ -242,27 +241,27 @@ class BaseDataModule(pl.LightningDataModule):
         dataloaders = []
         for i, ds in enumerate(ds_val):
             bs_here = self.adjust_eval_batch_size_for_dataset(ds, self.hparams.eval_batch_size, f"val_{i}")
-            dataloaders.append(DataLoader(dataset=ds,batch_size=bs_here, **self._shared_eval_dataloader_kwargs()))
+            dataloaders.append(DataLoader(dataset=ds, batch_size=bs_here, **self._shared_eval_dataloader_kwargs()))
         return dataloaders
 
     def test_dataloader(self) -> DataLoader:
         if self._data_test is None:
             return None
         return DataLoader(
-                dataset=self._data_test,
-                batch_size=self.adjust_eval_batch_size_for_dataset(self._data_test, self.test_batch_size, "test"),
-                **self._shared_eval_dataloader_kwargs(),
-            )
+            dataset=self._data_test,
+            batch_size=self.adjust_eval_batch_size_for_dataset(self._data_test, self.test_batch_size, "test"),
+            **self._shared_eval_dataloader_kwargs(),
+        )
 
     def predict_dataloader(self) -> DataLoader:
         if self._data_predict is None:
             return None
         ebs_here = self.adjust_eval_batch_size_for_dataset(self._data_predict, self.hparams.eval_batch_size, "predict")
         return DataLoader(
-                dataset=self._data_predict,
-                batch_size=ebs_here,
-                **self._shared_eval_dataloader_kwargs(),
-            )
+            dataset=self._data_predict,
+            batch_size=ebs_here,
+            **self._shared_eval_dataloader_kwargs(),
+        )
 
     def boundary_conditions(
         self,

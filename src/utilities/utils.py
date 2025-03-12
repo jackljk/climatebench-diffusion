@@ -1074,6 +1074,7 @@ def subsample_preselected_indices(preselected_indices, max_num_samples):
 
     return subsampled_indices
 
+
 # Saving metadata to later reconstruct the xarray from a (synchronized) tensor
 # Example usage:
 # 1. Extract metadata and convert to tensor
@@ -1082,6 +1083,7 @@ def subsample_preselected_indices(preselected_indices, max_num_samples):
 #
 # 2. After distributed processing, reconstruct the xarray
 # reconstructed_xarray = reconstruct_xarray(synchronized_tensor, metadata
+
 
 def extract_xarray_metadata(xarray_obj: xr.DataArray) -> Dict[str, Any]:
     """
@@ -1106,19 +1108,19 @@ def extract_xarray_metadata(xarray_obj: xr.DataArray) -> Dict[str, Any]:
     coords_dict = {}
     for name, coord in xarray_obj.coords.items():
         coords_dict[name] = {
-            'data': coord.values,
-            'dims': coord.dims,
-            'attrs': coord.attrs,
-            'encoding': coord.encoding
+            "data": coord.values,
+            "dims": coord.dims,
+            "attrs": coord.attrs,
+            "encoding": coord.encoding,
         }
 
     # Create the complete metadata dictionary
     metadata = {
-        'dims': xarray_obj.dims,
-        'coords': coords_dict,
-        'attrs': xarray_obj.attrs,
-        'name': xarray_obj.name,
-        'encoding': xarray_obj.encoding
+        "dims": xarray_obj.dims,
+        "coords": coords_dict,
+        "attrs": xarray_obj.attrs,
+        "name": xarray_obj.name,
+        "encoding": xarray_obj.encoding,
     }
     return metadata
 
@@ -1147,28 +1149,24 @@ def reconstruct_xarray(data: Union[torch.Tensor, np.ndarray], metadata: Dict[str
 
     # Reconstruct coordinates
     coords = {}
-    for name, coord_info in metadata['coords'].items():
+    for name, coord_info in metadata["coords"].items():
         # Create a variable for each coordinate
         coord = xr.Variable(
-            dims=coord_info['dims'],
-            data=coord_info['data'],
-            attrs=coord_info['attrs'],
-            encoding=coord_info['encoding']
+            dims=coord_info["dims"],
+            data=coord_info["data"],
+            attrs=coord_info["attrs"],
+            encoding=coord_info["encoding"],
         )
         coords[name] = coord
 
     # Reconstruct the DataArray
     reconstructed = xr.DataArray(
-        data=numpy_data,
-        dims=metadata['dims'],
-        coords=coords,
-        attrs=metadata['attrs'],
-        name=metadata['name']
+        data=numpy_data, dims=metadata["dims"], coords=coords, attrs=metadata["attrs"], name=metadata["name"]
     )
 
     # Add encoding if it exists
-    if metadata['encoding']:
-        reconstructed.encoding = metadata['encoding']
+    if metadata["encoding"]:
+        reconstructed.encoding = metadata["encoding"]
 
     return reconstructed
 

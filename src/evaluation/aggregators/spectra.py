@@ -50,7 +50,9 @@ class SpectraAggregator(Metric):
             xr_metadata = extract_xarray_metadata(to_add_spectrum)
             self._spectra_vars_to_xr_metadata[var_name] = xr_metadata
             # Add state
-            self.add_state(f"_running_spectra_{var_name}", default=torch.zeros_like(to_add_spectrum_tensor), dist_reduce_fx="sum")
+            self.add_state(
+                f"_running_spectra_{var_name}", default=torch.zeros_like(to_add_spectrum_tensor), dist_reduce_fx="sum"
+            )
         # Update state
         self.__dict__[f"_running_spectra_{var_name}"] += to_add_spectrum_tensor
 

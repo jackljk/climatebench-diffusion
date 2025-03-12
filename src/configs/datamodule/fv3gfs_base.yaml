@@ -16,10 +16,15 @@ in_names: null
 out_names: null
 auxiliary_names: null
 # horizon for inference
-prediction_horizon: 500   #${datamodule.horizon}   # may set to higher rollouts
+prediction_horizon: 504   #${datamodule.horizon}   # may set to higher rollouts
 prescriber:
   _target_: src.ace_inference.core.prescriber.Prescriber
   prescribed_name: surface_temperature
   mask_name: ocean_fraction
   mask_value: 1
-num_workers: 2
+num_workers: 8
+batch_size_per_gpu: 4
+persistent_workers: True
+prefetch_factor: 2
+multiprocessing_context: null
+drop_last: True

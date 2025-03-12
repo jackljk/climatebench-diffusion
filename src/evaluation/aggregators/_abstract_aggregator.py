@@ -19,7 +19,7 @@ class AbstractAggregator(Metric):
         name: str | None = None,
         verbose: bool = True,
         coords: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.log_text = get_logger(name=self.__class__.__name__)

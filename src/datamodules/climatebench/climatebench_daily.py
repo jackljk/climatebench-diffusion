@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
     get_mean_std_of_variables,
@@ -202,7 +203,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             set_train = set_val = None
 
         if stage in ["test", "predict", None]:
-            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM])
+            X_test, Y_test = self.preprocess_xarray_datasets([self.TEST_SIM], self.hparams.mean_over_ensemble)
             set_test = self._setup_test(X_test, Y_test)
         else:
             set_test = None
@@ -233,20 +234,28 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         sim_val_Y = self.hparams.sim_validation["Y"]
 
         # Handle the val inputs set
-        X_val = X_train[sim_val_X].isel(time=slice(-self.hparams.validation_size, None))
+        if hasattr(self.hparams.comprehensive_validation, "val_years"):
+            val_time_slice = slice(
+                self.hparams.comprehensive_validation.val_years[0],
+                self.hparams.comprehensive_validation.val_years[1]
+            )
+            log.info(f"Only using the time period {val_time_slice} for validation")
+            X_val = X_train[sim_val_X].sel(time=val_time_slice)
+            val_end_year_day = self._get_validation_end_date(X_val.time[-1].item())
+        else:
+            # Start year with validation_size years=45 will be 2056
+            X_val = X_train[sim_val_X].isel(time=slice(-self.hparams.validation_size, None))
+            val_end_year_day = None
+
+        val_start_year_day = self._get_validation_start_date(X_val.time[0].item())
+
+        # Now remove the validation set from the training set inputs
         X_train[sim_val_X] = X_train[sim_val_X].isel(time=slice(None, -self.hparams.validation_size))
 
-        sim_val_start_year = X_val.time[0].item()
+        Y_val = Y_train[sim_val_Y].sel(time=slice(val_start_year_day, val_end_year_day))
 
-        Y_val = Y_train[sim_val_Y].sel(time=slice(self._get_validation_start_date(sim_val_start_year), None))
-
-        # Remove the validation set from the training set
-        Y_train[sim_val_Y] = Y_train[sim_val_Y].sel(
-            time=slice(
-                None,
-                self._get_validation_start_date(sim_val_start_year) - timedelta(days=1),
-            )
-        )
+        # Remove the validation set from the training set targets
+        Y_train[sim_val_Y] = Y_train[sim_val_Y].sel(time=slice(None, val_start_year_day - timedelta(days=1)))
 
         # Log the validation set
         if self.hparams.mean_over_ensemble == "stack":
@@ -348,6 +357,10 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
     def _get_validation_start_date(self, start_year: int) -> cftime.DatetimeNoLeap:
         return cftime.DatetimeNoLeap(start_year, 1, 1)
 
+    def _get_validation_end_date(self, end_year: int) -> cftime.DatetimeNoLeap:
+        return cftime.DatetimeNoLeap(end_year, 12, 31)
+
+
     def get_epoch_aggregators(
         self,
         split: str,
@@ -360,11 +373,20 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
     ) -> Dict[str, OneStepAggregator]:
         # Use area weights for the aggregators to compute weighted metrics
         split_ds = getattr(self, f"_data_{split}")
+        # get the coords from the dataset
+        first_key = next(iter(split_ds.ds_outputs))
+        coords = {
+            "latitude": split_ds.ds_outputs[first_key].latitude,
+            "longitude": split_ds.ds_outputs[first_key].longitude,
+        }
+        
         if split == "val" and isinstance(split_ds, list):
             split_ds = split_ds[0]  # just need it for the area weights
+            
 
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
+        aggregators = dict()
 
         aggregator = OneStepAggregator(
             record_rmse=True,
@@ -373,9 +395,24 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
             snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
             temporal_kwargs=self.hparams.comprehensive_validation,
+            coords=coords,
             **aggr_kwargs,
         )
-        aggregators = {"": aggregator}
+        aggregators[""] = aggregator
+        
+        if self.hparams.comprehensive_validation.run and self.hparams.comprehensive_validation.save_to_disk:
+            save_to_disk_aggregator = SaveToDiskAggregator(
+                is_ensemble=is_ensemble,
+                final_dims_of_data=["latitude", "longitude"],
+                save_to_path=save_to_path,
+                max_ensemble_members=None, # save all ensemble members
+                batch_dim_name='datetime',
+                coords=coords,
+            )
+            aggregators["save_to_disk"] = save_to_disk_aggregator
+    
+    
+        
         return aggregators
 
 
@@ -402,6 +439,8 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         comprehensive_validation: Dict = None,
         additional_vars: Dict[str, xr.DataArray] = None,
     ):
+        if comprehensive_validation is not None and not comprehensive_validation.run:
+            comprehensive_validation = None  # to avoid unnecessary computation, just don't use it
         self.output_var = output_var
         self.ovar_to_var_id = {
             "tas": "tas",
@@ -437,7 +476,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         }
 
         # Getting the sizes of the datasets
-        if dataset_id == "val" and not comprehensive_validation:
+        if dataset_id == "val" and comprehensive_validation is None:
             # get only the validation size as the number of years
             self.ssp_sizes = {ssp: self.ds_inputs[ssp].sizes["time"] for ssp in ds_ssps["inputs"]}
             if mean_over_mems == "stack":

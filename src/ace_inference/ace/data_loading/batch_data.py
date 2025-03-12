@@ -82,9 +82,7 @@ class BatchData:
 
     data: TensorMapping
     time: xr.DataArray
-    horizontal_dims: List[str] = dataclasses.field(
-        default_factory=lambda: ["lat", "lon"]
-    )
+    horizontal_dims: List[str] = dataclasses.field(default_factory=lambda: ["lat", "lon"])
 
     @property
     def dims(self) -> List[str]:
@@ -140,10 +138,7 @@ class BatchData:
 
     def __post_init__(self):
         if len(self.time.shape) != 2:
-            raise ValueError(
-                "Expected time to have shape (n_samples, n_times), got shape "
-                f"{self.time.shape}."
-            )
+            raise ValueError("Expected time to have shape (n_samples, n_times), got shape " f"{self.time.shape}.")
         for k, v in self.data.items():
             if v.shape[:2] != self.time.shape[:2]:
                 raise ValueError(
@@ -184,9 +179,7 @@ class BatchData:
             forcing_data: The forcing data to compute derived variables from.
         """
         if not np.all(forcing_data.time.values == self.time.values):
-            raise ValueError(
-                "Forcing data must have the same time coordinate as the batch data."
-            )
+            raise ValueError("Forcing data must have the same time coordinate as the batch data.")
         derived_data = derive_func(self.data, forcing_data.data)
         return self.__class__(
             data={**self.data, **derived_data},
@@ -216,29 +209,17 @@ class BatchData:
             horizontal_dims=self.horizontal_dims,
         )
 
-    def get_start(
-        self: SelfType, prognostic_names: Collection[str], n_ic_timesteps: int
-    ) -> PrognosticState:
+    def get_start(self: SelfType, prognostic_names: Collection[str], n_ic_timesteps: int) -> PrognosticState:
         """
         Get the initial condition state.
         """
-        return PrognosticState(
-            self.subset_names(prognostic_names).select_time_slice(
-                slice(0, n_ic_timesteps)
-            )
-        )
+        return PrognosticState(self.subset_names(prognostic_names).select_time_slice(slice(0, n_ic_timesteps)))
 
-    def get_end(
-        self: SelfType, prognostic_names: Collection[str], n_ic_timesteps: int
-    ) -> PrognosticState:
+    def get_end(self: SelfType, prognostic_names: Collection[str], n_ic_timesteps: int) -> PrognosticState:
         """
         Get the final state which can be used as a new initial condition.
         """
-        return PrognosticState(
-            self.subset_names(prognostic_names).select_time_slice(
-                slice(-n_ic_timesteps, None)
-            )
-        )
+        return PrognosticState(self.subset_names(prognostic_names).select_time_slice(slice(-n_ic_timesteps, None)))
 
     def select_time_slice(self: SelfType, time_slice: slice) -> SelfType:
         """
@@ -262,10 +243,7 @@ class BatchData:
             if k not in filled_data:
                 filled_data[k] = torch.full_like(example_tensor, fill_value=np.nan)
         return self.__class__(
-            data={
-                k: torch.cat([filled_data[k].to(state_data_device), v], dim=1)
-                for k, v in self.data.items()
-            },
+            data={k: torch.cat([filled_data[k].to(state_data_device), v], dim=1) for k, v in self.data.items()},
             time=xr.concat([initial_batch_data.time, self.time], dim="time"),
             horizontal_dims=self.horizontal_dims,
         )
@@ -379,9 +357,7 @@ class InferenceGriddedData(InferenceDataABC[PrognosticState, BatchData]):
         self._properties = properties.to_device()
         self._n_initial_conditions: Optional[int] = None
         if isinstance(initial_condition, PrognosticStateDataRequirements):
-            self._initial_condition: PrognosticState = get_initial_condition(
-                loader, initial_condition
-            )
+            self._initial_condition: PrognosticState = get_initial_condition(loader, initial_condition)
         else:
             self._initial_condition = initial_condition.to_device()
 
@@ -448,9 +424,7 @@ class InferenceGriddedData(InferenceDataABC[PrognosticState, BatchData]):
         return self._initial_condition
 
     def log_info(self, name: str):
-        logging.info(
-            f"{name} data: {self._n_samples} samples, " f"{self._n_batches} batches"
-        )
+        logging.info(f"{name} data: {self._n_samples} samples, " f"{self._n_batches} batches")
         logging.info(f"{name} data: first sample's initial time: {self._first_time}")
         logging.info(f"{name} data: last sample's initial time: {self._last_time}")
 
@@ -555,9 +529,7 @@ class GriddedData(GriddedDataABC[BatchData]):
         return self._batch_size
 
     def log_info(self, name: str):
-        logging.info(
-            f"{name} data: {self.n_samples} samples, " f"{self.n_batches} batches"
-        )
+        logging.info(f"{name} data: {self.n_samples} samples, " f"{self.n_batches} batches")
         logging.info(f"{name} data: first sample's initial time: {self._first_time}")
         logging.info(f"{name} data: last sample's initial time: {self._last_time}")
 
@@ -565,7 +537,5 @@ class GriddedData(GriddedDataABC[BatchData]):
         """
         Set the epoch for the data loader sampler, if it is a distributed sampler.
         """
-        if self._sampler is not None and isinstance(
-            self._sampler, torch.utils.data.DistributedSampler
-        ):
+        if self._sampler is not None and isinstance(self._sampler, torch.utils.data.DistributedSampler):
             self._sampler.set_epoch(epoch)

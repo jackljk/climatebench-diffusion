@@ -19,7 +19,9 @@ class MyTensorDataset(Dataset[Dict[str, Tensor]]):
 
     tensors: Dict[str, Tensor]
 
-    def __init__(self, tensors: Dict[str, Tensor] | Dict[str, np.ndarray], dataset_id: str = "", max_samples: int = None):
+    def __init__(
+        self, tensors: Dict[str, Tensor] | Dict[str, np.ndarray], dataset_id: str = "", max_samples: int = None
+    ):
         tensors = {
             key: torch.from_numpy(tensor.copy()).float() if isinstance(tensor, np.ndarray) else tensor
             for key, tensor in tensors.items()

@@ -143,9 +143,7 @@ def test_infer_horizontal_dimension_names_error():
 )
 def test__get_indexers(variable_dims, expected):
     dim_sizes = get_sizes()
-    shape = tuple(
-        dim_size.size for dim_size in dim_sizes if dim_size.name in variable_dims
-    )
+    shape = tuple(dim_size.size for dim_size in dim_sizes if dim_size.name in variable_dims)
     variable = xr.Variable(variable_dims, np.zeros(shape))
     dims = (TIME_DIM, LAT_DIM, LON_DIM)
     result = _get_indexers(variable, dims)

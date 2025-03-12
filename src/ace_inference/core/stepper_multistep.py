@@ -37,6 +37,7 @@ class DataRequirements:
     out_names: List[str]
     n_timesteps: int
 
+
 @dataclasses.dataclass
 class MultiStepStepperConfig:
     in_names: List[str]
@@ -151,7 +152,6 @@ class MultiStepStepper(SingleModuleStepper):
 
         self._no_optimization = NullOptimization()
         self._is_distributed = dist.is_distributed()
-
 
     def run_on_batch(
         self,

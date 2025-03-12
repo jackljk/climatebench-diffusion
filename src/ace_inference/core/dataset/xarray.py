@@ -1,11 +1,10 @@
 import datetime
 import json
-import logging
 import os
 import warnings
 from collections import namedtuple
 from functools import lru_cache
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, Type, Union
 from urllib.parse import urlparse
 
 import fsspec
@@ -31,9 +30,10 @@ from .utils import (
     infer_horizontal_dimension_names,
     load_series_data,
 )
+from src.utilities.utils import get_logger
 
 SLICE_NONE = slice(None)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 VariableNames = namedtuple(
     "VariableNames",
@@ -45,9 +45,7 @@ VariableNames = namedtuple(
 )
 
 
-def _get_vertical_coordinates(
-    ds: xr.Dataset, dtype: Optional[torch.dtype]
-) -> HybridSigmaPressureCoordinate:
+def _get_vertical_coordinates(ds: xr.Dataset, dtype: Optional[torch.dtype]) -> HybridSigmaPressureCoordinate:
     """
     Get hybrid sigma-pressure coordinates from a dataset.
 
@@ -59,16 +57,8 @@ def _get_vertical_coordinates(
         dtype: Data type of the returned tensors. If None, the dtype is not
             changed from the original in ds.
     """
-    ak_mapping = {
-        int(v[3:]): torch.as_tensor(ds[v].values)
-        for v in ds.variables
-        if v.startswith("ak_")
-    }
-    bk_mapping = {
-        int(v[3:]): torch.as_tensor(ds[v].values)
-        for v in ds.variables
-        if v.startswith("bk_")
-    }
+    ak_mapping = {int(v[3:]): torch.as_tensor(ds[v].values) for v in ds.variables if v.startswith("ak_")}
+    bk_mapping = {int(v[3:]): torch.as_tensor(ds[v].values) for v in ds.variables if v.startswith("bk_")}
     ak_list = [ak_mapping[k] for k in sorted(ak_mapping.keys())]
     bk_list = [bk_mapping[k] for k in sorted(bk_mapping.keys())]
 
@@ -223,13 +213,35 @@ def _open_xr_dataset(path: str, *args, **kwargs):
     if protocol_kw:
         kwargs.update({"storage_options": protocol_kw})
 
+    # Configure for optimal performance:
+    # - Enable caching for local files (improves performance for repeated access patterns)
+    # - Use chunking for local access (None for NetCDF4/HDF5 will use the file's native chunks)
+    protocol = _get_protocol(path)
+    is_local = not protocol or protocol == "file"
+
+    # Determine engine - use optimal settings for each engine type
+    engine = kwargs.get("engine", "netcdf4")
+
+    if is_local:
+        # For local files, enable caching
+        cache_kwargs = {
+            "cache": True,  # Enable caching for local files
+            "chunks": None,  # Use file's native chunks for optimal performance
+        }
+
+        # Note: We're not using parallel=True for netCDF4 since it's not supported in all versions
+        # The 'parallel' argument was causing TypeError in your xarray version
+
+        kwargs.update(cache_kwargs)
+    else:
+        # For remote files, disable caching to prevent memory issues
+        kwargs.update({"cache": False, "chunks": {}})
+
     return xr.open_dataset(
         path,
         *args,
         use_cftime=True,
         mask_and_scale=False,
-        cache=False,
-        chunks={},
         **kwargs,
     )
 
@@ -237,6 +249,7 @@ def _open_xr_dataset(path: str, *args, **kwargs):
 _open_xr_dataset_lru = lru_cache()(_open_xr_dataset)
 
 
+@lru_cache(maxsize=32)  # Increase cache size for better performance with many files
 def _open_file_fh_cached(path, **kwargs):
     protocol = _get_protocol(path)
     if protocol:
@@ -291,9 +304,21 @@ class DatasetProperties:
 
 
 def get_xarray_dataset(
-    config: XarrayDataConfig, requirements: DataRequirements
+    config: XarrayDataConfig, requirements: DataRequirements, dataset_class: Optional[Type[Dataset]] = None, **kwargs
 ) -> Tuple["Dataset", DatasetProperties]:
-    dataset = XarrayDataset(config, requirements)
+    """Get a dataset instance and its properties.
+
+    Args:
+        config: Configuration for the dataset.
+        requirements: Data requirements for the model.
+        dataset_class: Optional dataset class to use. If None, uses XarrayDataset.
+        **kwargs: Additional keyword arguments to pass to the dataset constructor.
+
+    Returns:
+        Tuple of dataset instance and its properties.
+    """
+    dataset_class = dataset_class or XarrayDataset
+    dataset = dataset_class(config, requirements, **kwargs)
     properties = dataset.properties
     index_slice = as_index_selection(config.subset, dataset)
     dataset = dataset.subset(index_slice)
@@ -328,9 +353,7 @@ class XarrayDataset(Dataset):
         glob_paths = sorted(fs.glob(os.path.join(self.path, config.file_pattern)))
         self._raw_paths = _preserve_protocol(self.path, glob_paths)
         if len(self._raw_paths) == 0:
-            raise ValueError(
-                f"No files found matching '{self.path}/{self.file_pattern}'."
-            )
+            raise ValueError(f"No files found matching '{self.path}/{self.file_pattern}'.")
         self.full_paths = self._raw_paths * config.n_repeats
         self.n_steps = requirements.n_timesteps  # one input, n_steps - 1 outputs
         self._get_files_stats(config.n_repeats, config.infer_timestep)
@@ -348,10 +371,16 @@ class XarrayDataset(Dataset):
             self._time_invariant_names,
             self._static_derived_names,
         ) = self._group_variable_names_by_time_type()
-        self._vertical_coordinates = _get_vertical_coordinates(
-            first_dataset, self.dtype
-        )
+        self._vertical_coordinates = _get_vertical_coordinates(first_dataset, self.dtype)
         self.overwrite = config.overwrite
+
+        # Default values for XarrayDatasetSalva properties
+        self.forcing_names = None
+        self.forcing_packer = None
+        self.forcing_normalizer = None
+        self.loss_latitude_weighting = False
+        self.min_idx_shift = 0
+        self.split_id = None
 
     @property
     def properties(self) -> DatasetProperties:
@@ -399,7 +428,7 @@ class XarrayDataset(Dataset):
         self._variable_metadata = result
 
     def _get_files_stats(self, n_repeats: int, infer_timestep: bool):
-        logging.info(f"Opening data at {os.path.join(self.path, self.file_pattern)}")
+        logger.info(f"Opening data at {os.path.join(self.path, self.file_pattern)}")
         raw_times = get_raw_times(self._raw_paths, engine=self.engine)
 
         self._timestep: Optional[datetime.timedelta]
@@ -414,9 +443,7 @@ class XarrayDataset(Dataset):
         self.start_indices = cum_num_timesteps[:-1]
         self.total_timesteps = cum_num_timesteps[-1]
         self._n_initial_conditions = self.total_timesteps - self.n_steps + 1
-        self._sample_start_time = xr.CFTimeIndex(
-            np.concatenate(time_coord)[: self._n_initial_conditions]
-        )
+        self._sample_start_time = xr.CFTimeIndex(np.concatenate(time_coord)[: self._n_initial_conditions])
         self._all_times = xr.CFTimeIndex(np.concatenate(time_coord))
 
         del cum_num_timesteps, time_coord
@@ -424,7 +451,7 @@ class XarrayDataset(Dataset):
         ds = self._open_file(0)
         self._get_variable_metadata(ds)
 
-        logging.info(f"Found {self._n_initial_conditions} samples.")
+        logger.info(f"Found {self._n_initial_conditions} samples.")
 
     def _group_variable_names_by_time_type(self) -> VariableNames:
         """Returns lists of time-dependent variable names, time-independent
@@ -447,18 +474,14 @@ class XarrayDataset(Dataset):
                     try:
                         da = ds[name]
                     except KeyError:
-                        raise ValueError(
-                            f"Required variable not found in dataset: {name}."
-                        )
+                        raise ValueError(f"Required variable not found in dataset: {name}.")
                     else:
                         dims = da.dims
                         if "time" in dims:
                             time_dependent_names.append(name)
                         else:
                             time_invariant_names.append(name)
-            logging.info(
-                f"The required variables have been found in the dataset: {self._names}."
-            )
+            logger.info(f"The required variables have been found in the dataset: {self._names}.")
 
         return VariableNames(
             time_dependent_names,
@@ -466,9 +489,7 @@ class XarrayDataset(Dataset):
             static_derived_names,
         )
 
-    def configure_horizontal_coordinates(
-        self, first_dataset
-    ) -> Tuple[HorizontalCoordinates, StaticDerivedData]:
+    def configure_horizontal_coordinates(self, first_dataset) -> Tuple[HorizontalCoordinates, StaticDerivedData]:
         horizontal_coordinates: HorizontalCoordinates
         static_derived_data: StaticDerivedData
         dims = get_horizontal_dimensions(first_dataset, self.dtype)
@@ -501,11 +522,8 @@ class XarrayDataset(Dataset):
                 f"unexpected config.spatial_dimensions {self.spatial_dimensions},"
                 " should be one of 'latlon' or 'healpix'"
             )
-        coords_sizes = {
-            coord_name: len(coord)
-            for coord_name, coord in horizontal_coordinates.coords.items()
-        }
-        logging.info(f"Horizontal coordinate sizes are {coords_sizes}.")
+        coords_sizes = {coord_name: len(coord) for coord_name, coord in horizontal_coordinates.coords.items()}
+        logger.info(f"Horizontal coordinate sizes are {coords_sizes}.")
         return horizontal_coordinates, static_derived_data
 
     @property
@@ -552,15 +570,9 @@ class XarrayDataset(Dataset):
         time_slice = slice(idx, idx + self.n_steps)
         return self.get_sample_by_time_slice(time_slice)
 
-    def get_sample_by_time_slice(
-        self, time_slice: slice
-    ) -> Tuple[TensorDict, xr.DataArray]:
-        input_file_idx, input_local_idx = get_file_local_index(
-            time_slice.start, self.start_indices
-        )
-        output_file_idx, output_local_idx = get_file_local_index(
-            time_slice.stop - 1, self.start_indices
-        )
+    def get_sample_by_time_slice(self, time_slice: slice) -> Tuple[TensorDict, xr.DataArray]:
+        input_file_idx, input_local_idx = get_file_local_index(time_slice.start, self.start_indices)
+        output_file_idx, output_local_idx = get_file_local_index(time_slice.stop - 1, self.start_indices)
 
         # get the sequence of observations
         arrays: Dict[str, List[torch.Tensor]] = {}
@@ -597,11 +609,18 @@ class XarrayDataset(Dataset):
             ds = self._open_file(idxs[0])
             dims = ["time"] + self._horizontal_coordinates.loaded_dims
             shape = [total_steps] + [ds.sizes[dim] for dim in dims[1:]]
+
+            # Pre-fetch all variables in one batch for better IO efficiency
+            invariant_vars = {}
             for name in self._time_invariant_names:
-                variable = ds[name].variable
+                invariant_vars[name] = ds[name].variable
+
+            # Process all invariant variables
+            for name, variable in invariant_vars.items():
                 tensors[name] = as_broadcasted_tensor(variable, dims, shape)
+
             ds.close()
-            del ds
+            del ds, invariant_vars
 
         # load static derived variables
         for name in self._static_derived_names:
@@ -627,7 +646,7 @@ class XarrayDataset(Dataset):
     def subset(self, subset: Union[slice, torch.Tensor]) -> Dataset:
         """Returns a subset of the dataset and propagates other properties."""
         indices = range(len(self))[subset]
-        logging.info(f"Subsetting dataset samples according to {subset}.")
+        logger.info(f"Subsetting dataset samples according to {subset}.")
         subsetted_dataset = torch.utils.data.Subset(self, indices)
         return subsetted_dataset
 
@@ -672,6 +691,75 @@ def get_timestep(time: np.ndarray) -> datetime.timedelta:
 
         return timestep
     else:
-        raise ValueError(
-            "Time coordinate does not have enough times to infer a timestep."
-        )
+        raise ValueError("Time coordinate does not have enough times to infer a timestep.")
+
+
+class XarrayDatasetSalva(XarrayDataset):
+    """Extended version of XarrayDataset with additional functionality for handling forcing variables
+    and loss weighting. This class is primarily used for the FV3GFS ensemble datamodule.
+    """
+
+    def __init__(
+        self,
+        config: XarrayDataConfig,
+        requirements: DataRequirements,
+        forcing_names: List[str] = tuple(),
+        forcing_packer: Optional[Callable] = None,
+        forcing_normalizer: Optional[Callable] = None,
+        min_idx_shift: int = 0,
+        split_id: Optional[str] = None,
+        loss_latitude_weighting: bool = False,
+        **kwargs,
+    ):
+        super().__init__(config, requirements, **kwargs)
+
+        # Forcing variables handling
+        self.forcing_names = forcing_names if len(forcing_names) > 0 else None
+        self.forcing_packer = forcing_packer
+        self.forcing_normalizer = forcing_normalizer
+
+        # Loss weighting
+        self.loss_latitude_weighting = loss_latitude_weighting
+
+        # Dataset configuration
+        self.min_idx_shift = min_idx_shift
+        self.split_id = split_id
+
+    @property
+    def loss_weights_tensor(self) -> Optional[torch.Tensor]:
+        """Returns the area weights tensor if loss_latitude_weighting is enabled."""
+        weights = None
+        if self.loss_latitude_weighting:
+            # Use the area weights from the horizontal coordinates
+            weights = self._horizontal_coordinates.area_weights
+        return weights
+
+    def __getitem__(self, idx: int) -> TensorDict:
+        """Returns a sample with the specified index, shifted by min_idx_shift.
+
+        The returned data is structured differently than the parent class:
+        - If forcing_names is specified, returns a nested dict with "dynamics" and "dynamical_condition"
+        - Otherwise returns a dict with just "dynamics"
+
+        Args:
+            idx: Index of the sample to retrieve
+
+        Returns:
+            Dictionary containing the data in the appropriate structure
+        """
+        # Apply the index shift
+        idx = idx + self.min_idx_shift
+
+        # Get the raw data from the parent class
+        tensors, times = super().__getitem__(idx)
+
+        # Structure the return data
+        if self.forcing_names is not None:
+            # Separate forcing variables and apply normalization
+            forcings = {k: tensors.pop(k) for k in list(tensors.keys()) if k in self.forcing_names}
+            forcings = self.forcing_packer.pack(self.forcing_normalizer.normalize(forcings))
+            data = {"dynamics": tensors, "dynamical_condition": forcings}
+        else:
+            data = {"dynamics": tensors}
+
+        return data

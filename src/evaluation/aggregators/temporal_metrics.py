@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Mapping, Optional
 
-# import cartopy.crs as ccrs
+import cartopy.crs as ccrs
 import cftime
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,12 +9,18 @@ import xarray as xr
 from torch import Tensor
 
 import wandb
-from src.evaluation import metrics
+from src.evaluation.metrics import root_mean_squared_error
 from src.losses.losses import crps_ensemble
 from src.utilities.utils import get_logger
 
 
 log = get_logger(__name__)
+
+metric_functions = {
+    "rmse": root_mean_squared_error,
+    "crps": crps_ensemble,
+    "rmse_member_avg": root_mean_squared_error,
+}
 
 
 class TemporalMetricsAggregator:
@@ -27,9 +33,10 @@ class TemporalMetricsAggregator:
         is_ensemble: bool,
         area_weights: Optional[Tensor] = None,
         normalization: str = "raw",
-        metrics: List[str] = ["rmse", "mae", "crps"],
+        metrics: List[str] = ["rmse", "crps", "rmse_member_avg"],
         temporal_scale: str = "monthly",
         var_names: Optional[List[str]] = None,
+        coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         save_data: bool = False,
     ):
         """
@@ -38,18 +45,24 @@ class TemporalMetricsAggregator:
             temporal_scale: Temporal scale of the aggregation (e.g. 'monthly', 'yearly')
         """
         self.is_ensemble = is_ensemble
-        self.metrics = metrics
         self.normalization = normalization
         self.temporal_scale = temporal_scale  # 'monthly' or 'yearly'
         self.var_names = var_names
         self.area_weights = None if area_weights is None else area_weights.cpu()
         self.save_data = save_data
+        self.metrics = metrics
+        
 
         # Build dictionarys to store the aggregated data (i.e, when record_batch is called we only get a batch of data, so we need to store it)
         self._aggregated_generated_data = {}
         self._aggregated_target_data = {}
         self._aggregated_generated_data_norm = {}
         self._aggregated_target_data_norm = {}
+        
+        # log parameters
+        self._log_dict = {
+            "date": {"x_axes": {'date': []}},
+        }
 
         # Some plotting parameters
         map_transform = ccrs.PlateCarree()
@@ -60,8 +73,7 @@ class TemporalMetricsAggregator:
             "error": {"cmap": "coolwarm", "add_colorbar": False, "transform": map_transform},
         }
 
-        self.lat = None
-        self.lon = None
+        self.coords = coords
 
     @torch.inference_mode()
     def update(
@@ -76,8 +88,6 @@ class TemporalMetricsAggregator:
         Record batch of data to be aggregated
         - Data to be generated for all of available years in validation/predict set. (data to be years long)
         """
-        # def to_arr(x):
-        #     return {k: v.cpu().numpy() for k, v in x.items()} if isinstance(x, dict) else x.cpu().numpy()
 
         def to_tensor(x):
             return {k: v.cpu() for k, v in x.items()} if isinstance(x, dict) else x.cpu()
@@ -133,7 +143,7 @@ class TemporalMetricsAggregator:
 
         log.info("Getting logs for temporal metrics(extended validation) --- May take a while")
         # asset data to ensure trustworthy evaluation
-        # self._assert_data()
+        self._assert_data()
 
         # mean the aggregated data
         data_dict = {
@@ -144,63 +154,34 @@ class TemporalMetricsAggregator:
         }
         # calculate metrics for log
         dates = list(data_dict["generated"].keys())
-        # infer lat and lon from shape of the data
-        shape = data_dict["target"][dates[0]][self.var_names[0]].shape
-        self.lat = np.arange(-90, 90, 180 / shape[0])
-        self.lon = np.arange(-180, 180, 360 / shape[1])
 
-        logs = {}
+        logs = self._log_dict.copy()
         image_logs = {}
+        ssp = label if label else ""
         label = f"extended_{label}/" if label else ""
         for date in dates:  # loop for each date separating metrics by the date
             # get date from date
             gen = data_dict["generated"][date]
             target = data_dict["target"][date]
+            if self.is_ensemble:
+                # get ens means
+                gen_ens_mean = {k: v.mean(dim=0) for k, v in gen.items()}
+            
 
             ####
-            # TODO: fix metrics for temporal aggregation
+            # TODO: add more metrics?
             ####
-            for var in self.var_names:
-                if self.is_ensemble:
-                    # if ensemble, get ens means
-                    gen_ens_mean = {k: v.mean(dim=0) for k, v in gen.items()}
+            # get the values for the x-axis
+            logs['date']['x_axes']['date'].append(date)
+            # get metrics for each date
+            logs['date'][date] = self._get_metrics(target, gen, gen_ens_mean, date, self.var_names, self.metrics)
+            
 
-                    # if ens, get ens metrics
-                    logs[f"{label}rmse_member_avg/{date}/{var}"] = np.mean(
-                        [
-                            metrics.root_mean_squared_error(
-                                predicted=gen[var][i], truth=target[var], weights=self.area_weights
-                            )
-                            for i in range(gen[var].shape[0])
-                        ]
-                    )
-                    # logs[f"bias_member_avg/{date}/{var}"] = np.mean(
-                    #     [
-                    #         metrics.time_and_global_mean_bias(predicted=gen[var][i], truth=target[var], weights=self.area_weights)
-                    #         for i in range(gen[var].shape[0])
-                    #     ]
-                    # )
-                logs[f"{label}rmse/{date}/{var}"] = float(
-                    metrics.root_mean_squared_error(
-                        predicted=gen_ens_mean[var], truth=target[var], weights=self.area_weights
-                    )
-                )
-
-                # logs[f"bias/{date}/{var}"] = float(
-                #     metrics.time_and_global_mean_bias(predicted=gen_ens_mean[var], truth=target[var], weights=self.area_weights)
-                # )
-                logs[f"{label}crps/{date}/{var}"] = float(
-                    crps_ensemble(predicted=gen[var], truth=target[var], weights=self.area_weights)
-                )
-
-            #######
-            # TODO: Add addition metrics that we want to incorporate (especially for precipitation)
-            #######
             image_logs.update(
                 {
                     f"{label}snapshots-{self.temporal_scale}-mean/{key}": val
                     for key, val in self._timeAggSnapshots(
-                        target, gen, gen_ens_mean, date, is_ensemble=self.is_ensemble
+                        target, gen, gen_ens_mean, date, is_ensemble=self.is_ensemble, ssp=ssp
                     ).items()
                 }
             )
@@ -208,13 +189,64 @@ class TemporalMetricsAggregator:
                 image_logs.update(
                     {
                         f"{label}snapshots-crps/{key}": val
-                        for key, val in self._crpsSnapshots(target, gen, date).items()
+                        for key, val in self._crpsSnapshots(target, gen, date, ssp=ssp).items()
                     }
                 )
+        # {
+        #     "date" : {
+        #         "x_axes": ["date"],
+        #         "2015-01": {
+        #             "rmse/tas": 0.1,
+        #             "crps/tas": 0.2,
+        #             "rmse/pr": 0.1,
+        #             "crps/pr": 0.2,
+        #             "date": "2015-01"
+        #         },
+        #         "2015-02": {
+        #             "rmse": 0.1,
+        #             "crps": 0.2,
+        #             "date": "2015-02"
+        #         }
+        #         # etc...
+        #     }
+        # }
 
-        return logs, image_logs, {}
+        return {}, image_logs, logs
+    
+    def _get_metrics(self, target, pred, pred_ens_mean, date, vars, metrics):
+        computed_metrics = {}
+        for var in vars:
+            for metric in metrics:
+                label = metric + '/' + var
+                if "member_avg" in metric:
+                    computed_metrics[label] = np.mean(
+                            [
+                                metric_functions[metric](
+                                    predicted=pred[var][i], truth=target[var], weights=self.area_weights
+                                )
+                                for i in range(pred[var].shape[0])
+                            ]
+                        )
+                elif metric == "crps":
+                    computed_metrics[label] = float(
+                        metric_functions[metric](predicted=pred[var], truth=target[var], weights=self.area_weights)
+                    )
+                    continue
+                else:
+                    computed_metrics[label] = float(
+                        metric_functions[metric](
+                            predicted=pred_ens_mean[var], truth=target[var], weights=self.area_weights
+                        )
+                    )
+            
+        # add date with key 'date' for wandb logging purposes
+        computed_metrics['date'] = date
+         
+        return computed_metrics
+            
+        
 
-    def _crpsSnapshots(self, target, gen, date):
+    def _crpsSnapshots(self, target, gen, date, ssp=''):
         """
         For comparing at a Monthly time scale, get a large figure of all 12 months for a given year
         Args:
@@ -226,7 +258,7 @@ class TemporalMetricsAggregator:
         snapshots = {}
 
         def to_xr_dataarray(data):
-            return xr.DataArray(data, coords=[("lat", self.lat), ("lon", self.lon)], dims=["lat", "lon"])
+            return xr.DataArray(data, coords=self.coords)
 
         for var in self.var_names:
             # Handle CRPS plot
@@ -247,7 +279,7 @@ class TemporalMetricsAggregator:
             snapshots[f"image-crps-fair/{date}/{var}"] = wandb.Image(fig)
         return snapshots
 
-    def _timeAggSnapshots(self, target, gen, gen_ens_mean, date, is_ensemble=True):
+    def _timeAggSnapshots(self, target, gen, gen_ens_mean, date, is_ensemble=True, ssp=''):
         """
         Generate Snapshots of the data aggregated in time
         Args:
@@ -257,11 +289,13 @@ class TemporalMetricsAggregator:
         """
         if not is_ensemble:
             raise NotImplementedError("Only implemented for ensemble data")
+        
+        ssp = ssp + "-" if ssp else ""
 
         snapshots = {}
 
         def to_xr_dataarray(data):
-            return {k: xr.DataArray(v, coords=[("lat", self.lat), ("lon", self.lon)]) for k, v in data.items()}
+            return {k: xr.DataArray(v, coords=self.coords) for k, v in data.items()}
 
         def get_random_ensembles(data):
             # get 2 random ensemble members
@@ -285,7 +319,7 @@ class TemporalMetricsAggregator:
                 gen_ens_2_log = np.log(gen_ens_2[var] + 1)
 
                 fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-                fig.suptitle(f"image full field - {var} - log - {date}")
+                fig.suptitle(f"{var}image full field - {var} - log - {date}")
 
                 # First row - target and generated mean
                 vmin = min(np.min(target_log), np.min(gen_log), np.min(gen_ens_1_log), np.min(gen_ens_2_log))
@@ -312,7 +346,7 @@ class TemporalMetricsAggregator:
 
                 # Handle Error plot
                 fig, axs = plt.subplots(1, 3, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-                fig.suptitle(f"Error - {var} - log - {date}")
+                fig.suptitle(f"{var}Error - {var} - log - {date}")
 
                 # Calculate error
                 error = gen_log - target_log
@@ -338,7 +372,7 @@ class TemporalMetricsAggregator:
 
             # Handle General plot
             fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-            fig.suptitle(f"Full Field {var} - {date}")
+            fig.suptitle(f"{var}Full Field {var} - {date}")
 
             # First row Target and Generated Mean
             vmin = min(np.min(target[var]), np.min(gen[var]), np.min(gen_ens_1[var]), np.min(gen_ens_2[var]))
@@ -365,7 +399,7 @@ class TemporalMetricsAggregator:
 
             # Handle Error plot
             fig, axs = plt.subplots(1, 3, figsize=(16, 4), subplot_kw={"projection": ccrs.PlateCarree()})
-            fig.suptitle(f"Error {var} - {date}")
+            fig.suptitle(f"{var}Error {var} - {date}")
 
             # Calculate error
             error = gen[var] - target[var]

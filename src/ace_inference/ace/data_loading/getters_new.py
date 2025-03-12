@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch.utils.data
 from torch.utils.data.distributed import DistributedSampler
@@ -9,7 +9,7 @@ from src.ace_inference.ace.data_loading.batch_data import BatchData
 from src.ace_inference.ace.requirements import PrognosticStateDataRequirements
 from src.ace_inference.core.dataset.getters import get_dataset
 from src.ace_inference.core.dataset.requirements import DataRequirements
-from src.ace_inference.core.dataset.xarray import XarrayDataset
+from src.ace_inference.core.dataset.xarray import XarrayDataset, XarrayDatasetSalva
 from src.ace_inference.core.device import using_gpu
 from src.ace_inference.core.distributed import Distributed
 
@@ -37,9 +37,7 @@ def get_data_loader(
             then data will be shuffled.
         requirements: Data requirements for the model.
     """
-    dataset, properties = get_dataset(
-        config.dataset, requirements, strict=config.strict_ensemble
-    )
+    dataset, properties = get_dataset(config.dataset, requirements, strict=config.strict_ensemble)
     dist = Distributed.get_instance()
 
     if dist.is_distributed():
@@ -193,9 +191,7 @@ def get_forcing_data(
     start_time_indices = []
     for time in initial_time.values[:, 0]:
         start_time_indices.append(available_times.get_loc(time))
-    inference_config = config.build_inference_config(
-        start_indices=ExplicitIndices(start_time_indices)
-    )
+    inference_config = config.build_inference_config(start_indices=ExplicitIndices(start_time_indices))
     return get_inference_data(
         config=inference_config,
         total_forward_steps=total_forward_steps,

@@ -304,8 +304,13 @@ def extras(
     strategy_name = strategy if isinstance(strategy, str) else strategy._target_.lower().split(".")[-1]
     if strategy_name.startswith("ddp") or strategy_name.startswith("dp"):
         if config.datamodule.get("pin_memory"):
-            log.info(f"Forcing ddp friendly configuration! <config.trainer.strategy={strategy_name}>")
-            config.datamodule.pin_memory = False
+            if config.datamodule.get("pin_memory") == "force_true":
+                config.datamodule.pin_memory = True
+            else:
+                if config.datamodule.pin_memory is True:
+                    log.info(f"Forcing pin_memory to False for multi-GPU training ({strategy_name=}). "
+                             f"Force True with `pin_memory=force_true`.")
+                config.datamodule.pin_memory = False
 
     torch_matmul_precision = config.get("torch_matmul_precision", "highest")
     if torch_matmul_precision != "highest":

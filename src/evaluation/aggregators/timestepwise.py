@@ -88,14 +88,16 @@ class MetricAggregator(Metric):
                         )
                         self._variable_metrics[f"std_gen{suffix}"][var_name] = StdDeviation(
                             # weights=area_weights,
-                            source="pred", dim="except_1"
+                            source="pred",
+                            dim="except_1",
                         )
                         self._variable_metrics[f"mean_target{suffix}"][var_name] = Average(
                             weights=area_weights, source="target", batch_dim=0
                         )
                         self._variable_metrics[f"std_target{suffix}"][var_name] = StdDeviation(
                             # weights=area_weights,
-                            source="target", dim=None
+                            source="target",
+                            dim=None,
                         )
             # Move to device
             for metric in self._variable_metrics.values():
@@ -169,9 +171,7 @@ class MetricAggregator(Metric):
             for variable, metric_value in self._variable_metrics[metric].items():
                 metric_value = metric_value.compute()
                 if metric_value is None:
-                    raise ValueError(
-                        f"{metric=} hasn't been computed for {variable=}. ({label=},  {i=})"
-                    )
+                    raise ValueError(f"{metric=} hasn't been computed for {variable=}. ({label=},  {i=})")
                 log_key = f"{label}{metric}/{variable}".rstrip("/")
                 logs[log_key] = float(metric_value.detach().item())
 

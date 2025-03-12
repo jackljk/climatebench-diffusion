@@ -6,13 +6,14 @@ from typing import Any, Dict, List, Optional, Union
 
 import hydra
 import torch
-from omegaconf import OmegaConf
+from src.ace_inference.core.typing_ import Slice
 from tensordict import TensorDict
 from torch import Tensor
 
-from src.ace_inference.ace.data_loading._xarray_old import XarrayDatasetSalva
-from src.ace_inference.ace.data_loading.getters import get_dataset
-from src.ace_inference.ace.data_loading.params import DataLoaderParams, XarrayDataParams
+from src.ace_inference.core.dataset.config import XarrayDataConfig
+from src.ace_inference.core.dataset.getters import get_dataset
+from src.ace_inference.core.dataset.requirements import DataRequirements
+from src.ace_inference.core.dataset.xarray import XarrayDatasetSalva
 from src.ace_inference.core.prescriber import Prescriber
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
@@ -49,6 +50,7 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         raise_error_if_invalid_type(data_dir, possible_types=[str], name="data_dir")
         if not os.path.isdir(data_dir):
             raise ValueError(f"Data dir={data_dir} not found.")
+        # Pass explicit optimal parameters for local dataloading
         super().__init__(data_dir=data_dir, **kwargs)
         self.save_hyperparameters(ignore=["prescriber"])
 
@@ -106,6 +108,9 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         horizon = self.get_horizon(split, dataloader_idx)
         n_valid_samples = self.hparams.max_val_samples
         n_samples = None
+        min_idx_shift = 0
+        sub_paths = None
+
         if split == "train":
             if self.hparams.max_train_samples is not None:
                 log.info(f"Limiting training samples to {self.hparams.max_train_samples}")
@@ -113,7 +118,6 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
             if self.hparams.training_sub_paths is not None:
                 sub_paths = self.hparams.training_sub_paths
                 log.info(f"Limiting training sub-paths to {sub_paths}")
-                kwargs["sub_paths"] = sub_paths
 
         elif split == "val" and n_valid_samples is not None:
             log.info(f"Limiting validation samples to {n_valid_samples}")
@@ -122,40 +126,102 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
         elif split == "test" and n_valid_samples is not None:
             log.info(f"Limiting test samples to val samples {n_valid_samples}:{n_valid_samples*3}")
             n_samples = n_valid_samples * 2
-            kwargs["min_idx_shift"] = n_valid_samples  # preclude test samples
+            min_idx_shift = n_valid_samples  # preclude test samples
 
         elif split == "predict":
             n_samples = 1
 
-        requirements = {k: getattr(self.hparams, k) for k in ["in_names", "out_names"]}
-        requirements.update(
-            {
-                "names": self.all_names,
-                "n_timesteps": self.hparams.window + horizon,
-            }
-        )
-        requirements = OmegaConf.create(requirements)
+        # Create requirements object
+        requirements_dict = {
+            "names": list(self.all_names),
+            "n_timesteps": self.hparams.window + horizon,
+            # "in_names": list(self.hparams.in_names),
+            # "out_names": list(self.hparams.out_names),
+        }
 
-        params = DataLoaderParams(
-            dataset=XarrayDataParams(
-                data_path=self.train_dir if split == "train" else self.validation_dir,
+        data_requirements = DataRequirements(**requirements_dict)
+
+        # Create dataset configs
+        data_path = self.train_dir if split == "train" else self.validation_dir
+        configs = []
+
+        # Handle ensemble data organization
+        if split == "train":
+            # For training data, we might have multiple ensemble members as subdirectories
+            # If sub_paths is None and we're in train split, automatically discover subdirectories
+            if sub_paths is None and data_path.exists():
+                # Get all subdirectories in the data path that contain .nc files
+                discovered_sub_paths = []
+                for subdir in data_path.iterdir():
+                    if subdir.is_dir() and list(subdir.glob("*.nc")):
+                        discovered_sub_paths.append(subdir.name)
+
+                if discovered_sub_paths:
+                    log.info(f"Automatically discovered ensemble members: {discovered_sub_paths}")
+                    sub_paths = discovered_sub_paths
+
+            # Create configs for each ensemble member if subdirectories exist
+            if sub_paths:
+                # Sort sub_paths to ensure consistent order
+                sub_paths = sorted(sub_paths)
+                for sub_path in sub_paths:
+                    ensemble_path = data_path / sub_path
+                    if ensemble_path.exists():
+                        config = XarrayDataConfig(
+                            data_path=str(ensemble_path),
+                            file_pattern="*.nc",
+                            n_repeats=1,
+                            engine="netcdf4",
+                            spatial_dimensions="latlon",
+                            subset=Slice() if n_samples is None else Slice(0, n_samples * 10, 10),
+                            infer_timestep=True,
+                        )
+                        configs.append(config)
+                    else:
+                        log.warning(f"Ensemble member path not found: {ensemble_path}")
+
+        # If no configs were created yet (non-training split or no subdirectories), use single path
+        if not configs:
+            config = XarrayDataConfig(
+                data_path=str(data_path),
+                file_pattern="*.nc",
                 n_repeats=1,
-                engine=None,
-            ),
-            batch_size=0,
-            num_data_workers=self.hparams.num_workers,
-            data_type="ensemble_xarray" if split == "train" else "xarray",
-            n_samples=n_samples,
-        )
+                engine="netcdf4",
+                spatial_dimensions="latlon",
+                subset=Slice() if n_samples is None else Slice(0, n_samples * 10, 10),
+                infer_timestep=True,
+            )
+            configs.append(config)
 
-        kwargs_final = dict(
-            # window_time_slice=kwargs.get("window_time_slice", None),
-            forcing_names=self.hparams.forcing_names,
-            forcing_packer=self.forcing_packer,
-            forcing_normalizer=self.forcing_normalizer,
-            loss_latitude_weighting=self.hparams.loss_latitude_weighting,
-        )
-        ds = get_dataset(params, requirements, dataset_class=XarrayDatasetSalva, **kwargs, **kwargs_final)
+        # Standard keyword arguments for XarrayDatasetSalva
+        kwargs_final = {
+            "forcing_names": self.hparams.forcing_names,
+            "forcing_packer": self.forcing_packer,
+            "forcing_normalizer": self.forcing_normalizer,
+            "loss_latitude_weighting": self.hparams.loss_latitude_weighting,
+            "min_idx_shift": min_idx_shift,
+            "dataset_class": XarrayDatasetSalva,
+            # Don't pass sub_paths here since we're handling them with multiple configs
+        }
+
+        # Combine all kwargs
+        kwargs_final.update(kwargs)
+
+        # Get dataset
+        ds, properties = get_dataset(configs, data_requirements, **kwargs_final)
+
+        # Propagate properties for backward compatibility with the old implementation
+        # This ensures that area_weights and other attributes are available to the rest of the code
+        if hasattr(ds, "properties"):
+            ds.area_weights = properties.horizontal_coordinates.area_weights
+            ds.metadata = properties.variable_metadata
+            ds.sigma_coordinates = properties.vertical_coordinate
+            ds.horizontal_coordinates = properties.horizontal_coordinates
+
+            # Add loss_weights_tensor directly if missing
+            if not hasattr(ds, "loss_weights_tensor") and self.hparams.loss_latitude_weighting:
+                ds.loss_weights_tensor = ds.area_weights
+
         return ds
 
     def setup(self, stage: Optional[str] = None):
@@ -232,7 +298,16 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
             split_horizon = self.get_horizon(split, dataloader_idx)
             horizon_range = range(1, split_horizon + 1)
 
-        area_weights = to_torch_and_device(split_ds.area_weights, device)
+        # Get area weights - handle both old and new dataset formats
+        if hasattr(split_ds, "area_weights"):
+            area_weights = to_torch_and_device(split_ds.area_weights, device)
+        elif hasattr(split_ds, "properties"):
+            area_weights = to_torch_and_device(split_ds.properties.horizontal_coordinates.area_weights, device)
+        else:
+            # Default to None if not found
+            log.warning("No area weights found in dataset")
+            area_weights = None
+
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
         aggregators = {}
         if use_full_rollout or "interpolation" in experiment_type.lower():

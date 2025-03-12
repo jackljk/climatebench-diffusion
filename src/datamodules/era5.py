@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
+from dask.distributed import Client, LocalCluster
 import numpy as np
 import pandas as pd
 import torch
@@ -30,9 +31,9 @@ from src.utilities.utils import (
     get_logger,
     raise_error_if_invalid_type,
     raise_error_if_invalid_value,
-    to_torch_and_device, subsample_preselected_indices,
+    to_torch_and_device,
+    subsample_preselected_indices,
 )
-
 
 log = get_logger(__name__)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,7 +101,8 @@ class ERA5DataModuleBase(BaseDataModule):
         text_history: int = 0,
         text_conditioning: str = "time",
         text_skip_missing_dates: bool = False,  # If false, use null embeddings for missing dates
-        return_future_date_for_training: bool = False,  # set to true if self.model.predict_non_spatial_condition=True
+        return_future_date_for_training: bool = False,
+        # set to true if self.model.predict_non_spatial_condition=True
         normalize_std_fname: str = "std",  # use std_rescaled for residual prediction, std for direct prediction
         use_dask: bool = False,
         num_dask_workers: int = 16,
@@ -180,6 +182,7 @@ class ERA5DataModuleBase(BaseDataModule):
             data_dir = join(data_dir, dataset)
         assert data_dir.endswith(".zarr"), f"Invalid data_dir: {data_dir}"
         self.zarr_path = data_dir
+        dataset = os.path.basename(data_dir)
         if isinstance(predict_slice, str) and "slice" in predict_slice:
             predict_slice = eval(predict_slice)
         super().__init__(data_dir=data_dir, **kwargs)
@@ -189,7 +192,7 @@ class ERA5DataModuleBase(BaseDataModule):
             self.hparams.train_slice = slice("2015-01-01", "2015-01-05")
             self.hparams.val_slice = slice("2015-02-01", "2015-02-10")
             self.hparams.subsample_valid = 6
-        if use_dask:
+        if use_dask and False:
             from dask.cache import Cache as dask_Cache
 
             # comment these the next two lines out to disable Dask's cache
@@ -201,6 +204,17 @@ class ERA5DataModuleBase(BaseDataModule):
             # Don't log metrics/images when only wanting to log target spectra
             self.hparams.log_metrics = self.hparams.log_images = False
 
+        # Infer hourly resolution of dataset
+        if "-6h-" in dataset:
+            hourly_resolution_dataset = 6
+            if hourly_resolution == 6:
+                hourly_resolution = 1
+            else:
+                raise ValueError(f"Invalid hourly resolution: {hourly_resolution} for dataset: {dataset}")
+        elif "-1h-" in dataset:
+            pass
+        else:
+            raise ValueError(f"Could not infer hourly resolution from dataset: {dataset}")
         # Set the temporal slices for the train, val, and test sets
         data_slices = dict(train=train_slice, val=val_slice, test=test_slice, predict=predict_slice)
         for split, slice_ in data_slices.items():
@@ -453,20 +467,54 @@ class ERA5DataModuleBase(BaseDataModule):
         # gs_path = f"gs://weatherbench2/datasets/era5/{os.path.basename(self.hparams.data_dir)}"
         # Open local dataset. chunks=None is important for speed
         if self.hparams.use_dask and self.hparams.num_dask_workers is not None:
-            dask_scheduler = self.hparams.dask_scheduler
-            # self.client = Client(scheduler=dask_scheduler, n_workers=self.hparams.num_dask_workers, threads_per_worker=1)
-            dask.config.set(scheduler=dask_scheduler, num_workers=self.hparams.num_dask_workers)
-            log.info(f"Using Dask with {self.hparams.num_dask_workers} workers and scheduler: ``{dask_scheduler}``")
+            # Configure a proper client for better resource management
+            if not hasattr(self, "client") or self.client.status != "running":
+                n_workers = min(self.hparams.num_dask_workers, os.cpu_count())
+                threads_per_worker = max(1, os.cpu_count() // n_workers)
+                n_workers, threads_per_worker = 2, 6
+                memory_limit = "32GB"  # "16GB"  # "4GB"  # Adjust based on your system
 
-        chunks = {
-            "time": 1,
-            "latitude": 121,  # 180 / 1.5 = 120 + 1 for the poles
-            "longitude": 240,  # 360 / 1.5 = 240
-            "level": 13,  # len(self.all_levels)
-        }
-        chunks = {} if self.hparams.use_dask else None  # chunks=("auto" if self.hparams.use_dask else None),
-        chunks = None
-        ds = xr.open_zarr(self.zarr_path, decode_times=True, chunks=chunks, mask_and_scale=False)
+                cluster = LocalCluster(
+                    n_workers=n_workers,
+                    threads_per_worker=threads_per_worker,
+                    memory_limit=memory_limit,
+                    processes=True,  # True for better isolation
+                    # scheduler_port=0  # Dynamically assigned port
+                )
+                self.client = Client(cluster)
+                log.info(f"Created Dask cluster with {n_workers=}, {threads_per_worker=}, {memory_limit=}")
+
+                # Set task scheduling parameters for better performance
+                dask.config.set(
+                    {
+                        # "distributed.scheduler.work-stealing": True,
+                        "distributed.scheduler.work-stealing": False,  # Disable work stealing for large chunks
+                        "distributed.worker.memory.target": 0.85,  # Target 85% memory utilization
+                        "distributed.worker.memory.spill": 0.9,  # Spill at 90% utilization
+                        "distributed.worker.memory.pause": 0.95,  # Pause at 95% utilization
+                    }
+                )
+            elif False:
+                dask_scheduler = self.hparams.dask_scheduler
+                # self.client = Client(scheduler=dask_scheduler, n_workers=self.hparams.num_dask_workers, threads_per_worker=1)
+                dask.config.set(scheduler=dask_scheduler, num_workers=self.hparams.num_dask_workers)
+                log.info(
+                    f"Using Dask with {self.hparams.num_dask_workers} workers and scheduler: ``{dask_scheduler}``"
+                )
+
+        if self.hparams.use_dask:
+            horizon = self.get_horizon(split, kwargs.get("dataloader_idx"))
+            chunks = {
+                "time": 8,  # horizon + self.hparams.window, # 12, #24, #48,  #min(32, horizon*2),
+                "latitude": -1,  # "auto",  #121,  # 180 / 1.5 = 120 + 1 for the poles
+                "longitude": -1,  # 240  # 360 / 1.5 = 240
+                "level": -1,  # 13,  # len(self.all_levels)
+            }
+            # chunks = {}  # "auto"
+            log.info(f"Using optimized Dask chunks: {chunks} for horizon={horizon}")
+        else:
+            chunks = None
+        ds = xr.open_zarr(self.zarr_path, decode_times=True, chunks=chunks, mask_and_scale=False, consolidated=True)
         ds = ds.sel(time=time_slice)
         if self.spatial_crop_inputs is not None:
             log.info(f"Applying spatial crop to inputs: {self.spatial_crop_inputs}")
@@ -774,7 +822,13 @@ class ERA5DatasetBase(torch.utils.data.Dataset):
             static_conditions = []
             for i, static_field_name in enumerate(static_fields):
                 if static_field_name in self.dataset.keys():
-                    static_field = getattr(self.dataset, static_field_name)  # .transpose(*lat_lon_format)
+                    try:
+                        static_field = self.dataset[static_field_name].compute().values
+                    except AttributeError as e:
+                        raise AttributeError(
+                            f"Error when loading {static_field_name=}, {self.dataset[static_field_name]=}"
+                        ) from e
+
                     assert np.all(np.isfinite(static_field)), f"Found NaNs in static_field: {static_field_name}"
                     static_conditions.append(static_field)
                 elif static_field_name == "lat_lon_embeddings":
@@ -968,7 +1022,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
             self.bgen = xbatcher.BatchGenerator(
                 ds,
                 input_dims=input_dims,
-                preload_batch=True,
+                preload_batch=False,
                 input_overlap={"time": self.window + self.horizon - 1},
                 # batch_dims={"time": 1},
             )
@@ -1172,7 +1226,7 @@ class ERA5Dataset2D(ERA5DatasetBase):
         idx_actual = int(self.ds_idxs[idx])
         # static conditions are time-independent variables such as land_sea_mask, altitude, etc.
         arrays = dict(static_condition=self.static_conditions) if self.static_conditions is not None else dict()
-
+        dynamics = {}
         # Output-only mask for training and evaluating on spatially cropped outputs
         if self.return_mask is not None:
             arrays["predictions_mask"] = self.return_mask
@@ -1208,15 +1262,15 @@ class ERA5Dataset2D(ERA5DatasetBase):
             # log.info(f"idx: {idx}, batch.dims: {batch.dims}") #batch_time: {batch_time}")
             # arrays["dynamics"] = self.get_variables_ds(batch, preprocess_to_tensor=True, use_tqdm=False)
             # Tensorfy all 2D variables
-            dynamics = {vr: torch.from_numpy(batch[vr].values) for vr in self.vars2d}
+            for vr in self.vars2d:
+                dynamics[vr] = torch.from_numpy(batch[vr].values)
+
             # Tensorfy all 3D variables
-            dynamics.update(
-                {
-                    f"{vr}_{level}": torch.from_numpy(batch[vr].sel(level=level).values)
-                    for vr, levels in self.var3d_to_levels.items()
-                    for level in levels
-                }
-            )
+            for vr, levels in self.var3d_to_levels.items():
+                var_ds = batch[vr]
+                for level in levels:
+                    dynamics[f"{vr}_{level}"] = torch.from_numpy(var_ds.sel(level=level).values)
+
             if len(self.input_only_vars) > 0:
                 # Return as separate key, "dynamical_condition"
                 dynamical_condition = {vr: dynamics.pop(vr) for vr in self.input_only_vars}

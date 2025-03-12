@@ -32,17 +32,12 @@ class HybridSigmaPressureCoordinate:
 
     def __post_init__(self):
         if len(self.ak.shape) != 1:
-            raise ValueError(
-                f"ak must be a 1-dimensional tensor. Got shape: {self.ak.shape}"
-            )
+            raise ValueError(f"ak must be a 1-dimensional tensor. Got shape: {self.ak.shape}")
         if len(self.bk.shape) != 1:
-            raise ValueError(
-                f"bk must be a 1-dimensional tensor. Got shape: {self.bk.shape}"
-            )
+            raise ValueError(f"bk must be a 1-dimensional tensor. Got shape: {self.bk.shape}")
         if len(self.ak) != len(self.bk):
             raise ValueError(
-                f"ak and bk must have the same length. Got len(ak)={len(self.ak)} and "
-                f"len(bk)={len(self.bk)}."
+                f"ak and bk must have the same length. Got len(ak)={len(self.ak)} and " f"len(bk)={len(self.bk)}."
             )
 
     def __len__(self):
@@ -83,9 +78,7 @@ class HybridSigmaPressureCoordinate:
             dim=-1,
         )
 
-    def vertical_integral(
-        self, integrand: torch.Tensor, surface_pressure: torch.Tensor
-    ) -> torch.Tensor:
+    def vertical_integral(self, integrand: torch.Tensor, surface_pressure: torch.Tensor) -> torch.Tensor:
         """
         Compute the mass-weighted vertical integral of the integrand.
 
@@ -252,9 +245,7 @@ class LatLonCoordinates(HorizontalCoordinates):
 
     @property
     def xyz(self) -> Tuple[float, float, float]:
-        lats, lons = np.broadcast_arrays(
-            self.coords["lat"][:, None], self.coords["lon"][None, :]
-        )
+        lats, lons = np.broadcast_arrays(self.coords["lat"][:, None], self.coords["lon"][None, :])
         return lon_lat_to_xyz(lons, lats)
 
     def get_lat(self) -> torch.Tensor:
@@ -341,10 +332,9 @@ class HEALPixCoordinates(HorizontalCoordinates):
     @property
     def xyz(self) -> Tuple[float, float, float]:
         from astropy_healpix import HEALPix
+
         hp = HEALPix(nside=len(self.height), order="ring")
-        return hp.healpix_to_xyz(
-            [self.coords["face"], self.coords["height"], self.coords["width"]]
-        )
+        return hp.healpix_to_xyz([self.coords["face"], self.coords["height"], self.coords["width"]])
 
     @property
     def dims(self) -> List[str]:
@@ -392,6 +382,4 @@ class HEALPixCoordinates(HorizontalCoordinates):
 
     @property
     def meshgrid(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError(
-            "meshgrid is not implemented yet for HEALPixCoordinates."
-        )
+        raise NotImplementedError("meshgrid is not implemented yet for HEALPixCoordinates.")

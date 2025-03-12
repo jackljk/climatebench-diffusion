@@ -33,17 +33,13 @@ class TimestampList:
 
     def as_indices(self, time_index: xr.CFTimeIndex) -> np.ndarray:
         datetimes = [
-            cftime.datetime.strptime(
-                t, self.timestamp_format, calendar=time_index.calendar
-            )
-            for t in self.times
+            cftime.datetime.strptime(t, self.timestamp_format, calendar=time_index.calendar) for t in self.times
         ]
         (indices,) = time_index.isin(datetimes).nonzero()
         if len(indices) != len(self.times):
             missing_times = set(datetimes) - set(time_index[indices])
             raise ValueError(
-                f"Inference initial condition timestamps {missing_times} "
-                "were not found in the dataset."
+                f"Inference initial condition timestamps {missing_times} " "were not found in the dataset."
             )
         return indices
 
@@ -120,9 +116,7 @@ class InferenceDataLoaderConfig:
     """
 
     dataset: XarrayDataConfig
-    start_indices: Union[
-        InferenceInitialConditionIndices, ExplicitIndices, TimestampList
-    ]
+    start_indices: Union[InferenceInitialConditionIndices, ExplicitIndices, TimestampList]
     num_data_workers: int = 0
     perturbations: Optional[SSTPerturbation] = None
     persistence_names: Optional[Sequence[str]] = None
@@ -214,9 +208,7 @@ class InferenceDataset(torch.utils.data.Dataset):
         self._persistence_data: Optional[BatchData] = None
         if config.persistence_names is not None:
             first_sample = self._get_batch_data(0)
-            self._persistence_data = first_sample.subset_names(
-                config.persistence_names
-            ).select_time_slice(slice(0, 1))
+            self._persistence_data = first_sample.subset_names(config.persistence_names).select_time_slice(slice(0, 1))
 
     def _get_batch_data(self, index) -> BatchData:
         dist = Distributed.get_instance()
@@ -228,19 +220,12 @@ class InferenceDataset(torch.utils.data.Dataset):
                 continue
             i_window_start = i_start + self._start_indices[i_member]
             i_window_end = i_window_start + self._forward_steps_in_memory + 1
-            if i_window_end > (
-                self._total_forward_steps + self._start_indices[i_member]
-            ):
-                i_window_end = (
-                    self._total_forward_steps + self._start_indices[i_member] + 1
-                )
+            if i_window_end > (self._total_forward_steps + self._start_indices[i_member]):
+                i_window_end = self._total_forward_steps + self._start_indices[i_member] + 1
             window_time_slice = slice(i_window_start, i_window_end)
             tensors, time = self._dataset.get_sample_by_time_slice(window_time_slice)
             if self._perturbations is not None:
-                if (
-                    self._surface_temperature_name is None
-                    or self._ocean_fraction_name is None
-                ):
+                if self._surface_temperature_name is None or self._ocean_fraction_name is None:
                     raise ValueError(
                         "Surface temperature and ocean fraction names must be provided \
                         to apply SST perturbations."

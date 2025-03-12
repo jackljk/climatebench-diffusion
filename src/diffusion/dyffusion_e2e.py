@@ -29,6 +29,7 @@ class BaseDYffusion2(BaseDiffusion):
         prediction_mode: str = "raw",
         sampling_type: str = "cold",  # 'cold' or 'naive'
         sampling_schedule: Union[List[float], str] = None,
+        use_cold_sampling_for_ipol_inputs: bool = True,
         use_cold_sampling_for_intermediate_steps: bool = False,
         use_cold_sampling_for_last_step: bool = True,
         use_cold_sampling_for_init_of_ar_step: Optional[bool] = None,
@@ -276,7 +277,9 @@ class BaseDYffusion2(BaseDiffusion):
 
         # enable dropout for prediction of last dynamics
         with self.model.inference_dropout_scope(condition=dropout_condition):
-            x_last_pred = self._predict_last_dynamics(x_t=x_t, forward_condition=forward_cond, t=time_of_input, **kwargs)
+            x_last_pred = self._predict_last_dynamics(
+                x_t=x_t, forward_condition=forward_cond, t=time_of_input, **kwargs
+            )
         return x_last_pred
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
@@ -309,10 +312,13 @@ class BaseDYffusion2(BaseDiffusion):
         initial_condition,
         log_every_t: Optional[Union[str, int]] = None,
         num_predictions: int = None,
+        x_prev=None,
         x0_ref=None,
         verbose=True,
         **kwargs,
     ):
+        # print(f"{initial_condition.shape=}, {x_prev.shape if x_prev is not None else None}")
+        x_prev = None if x_prev is None else x_prev.reshape(initial_condition.shape).squeeze(1)
         # assert num_predictions is None or num_predictions == 1, "num_predictions must not be provided"
         sampling_schedule = self.sampling_schedule
 
@@ -322,7 +328,7 @@ class BaseDYffusion2(BaseDiffusion):
             assert len(initial_condition.shape) == 4, f"x_ti.shape: {initial_condition.shape} (should be 4D)"
         intermediates, xhat_th = dict(), None
         last_s_plus_one = sampling_schedule[-1] + 1
-        is_cold_sampling = self.hparams.sampling_type in ["cold", "heun1", "heun2", "heun3"]
+        is_cold_sampling = self.hparams.sampling_type in ["cold"] or "heun" in self.hparams.sampling_type
         for sampling_round in range(0, self.hparams.refinement_rounds + 1):
             desc = f"Refinement round {sampling_round}" if sampling_round > 0 else "Sampling"
             s_and_snext = zip(
@@ -331,15 +337,14 @@ class BaseDYffusion2(BaseDiffusion):
                 sampling_schedule[2:] + [last_s_plus_one, last_s_plus_one + 1],
             )
             progress_bar = tqdm(s_and_snext, desc=desc, total=len(sampling_schedule), leave=False)
-            x_s = initial_condition
-            x_s_prev = None
-            for sampling_step, (s, s_next, s_nnext) in enumerate(progress_bar):
-                is_first_step = s == 0
-                is_last_step = s == self.num_timesteps - 1
+            x_cur = initial_condition
+            for sampling_step, (t_cur, t_next, t_nnext) in enumerate(progress_bar):
+                is_first_step = t_cur == 0
+                is_last_step = t_cur == self.num_timesteps - 1
 
                 if sampling_round == 0 or (self.hparams.refine_predictions == "all" and not is_first_step):
                     # Forecast x_{t+h} using x_{s} as input
-                    xhat_th = self.predict_x_last(x_t=x_s, time_of_input=s, **kwargs)
+                    xhat_th = self.predict_x_last(x_t=x_cur, time_of_input=t_cur, **kwargs)
                 else:
                     xhat_th = intermediates[f"t{self.num_timesteps}_preds"]
 
@@ -351,71 +356,85 @@ class BaseDYffusion2(BaseDiffusion):
                     iteration=sampling_step,
                     **kwargs,
                 )
-                if s_next <= self.num_timesteps - 1:
-                    x_interpolated_s_next = self.q_sample(x_ti=x_s, time_of_input=s, **q_sample_kwargs)
+                use_csamp_pred = self.hparams.use_cold_sampling_for_ipol_inputs
+                x_cur_for_q = x_cur if use_csamp_pred or is_first_step else intermediates[f"t{t_cur}_preds"]
+                x_prev_for_q = x_prev if use_csamp_pred or is_first_step else intermediates[f"t{t_cur - 1}_preds"]
+                if t_next <= self.num_timesteps - 1:
+                    x_next_ipol = self.q_sample(x_ti=x_cur_for_q, time_of_input=t_cur, **q_sample_kwargs)
                 else:
-                    x_interpolated_s_next = xhat_th  # for the last step, we use the final x0_hat prediction
+                    x_next_ipol = xhat_th  # for the last step, we use the final x0_hat prediction
 
                 if self.hparams.sampling_type == "naive" or (
                     is_cold_sampling
-                    and ((not self.hparams.use_cold_sampling_for_last_step and is_last_step) or is_first_step)
+                    and (
+                        (not self.hparams.use_cold_sampling_for_last_step and is_last_step)
+                        or (is_first_step and x_prev_for_q is None)
+                    )
                 ):
                     if is_last_step and is_cold_sampling and self.hparams.use_cold_sampling_for_init_of_ar_step:
-                        x_interpolated_s = self.q_sample(x_ti=x_s_prev, time_of_input=s - 1, **q_sample_kwargs)
-                        intermediates["preds_autoregressive_init"] = x_s - x_interpolated_s + xhat_th
-                    x_s_prev = x_s
-                    x_s = x_interpolated_s_next
+                        x_cur_ipol = self.q_sample(x_ti=x_prev_for_q, time_of_input=t_cur - 1, **q_sample_kwargs)
+                        intermediates["preds_autoregressive_init"] = x_cur - x_cur_ipol + xhat_th
+                    x_prev = x_cur
+                    x_cur = x_next_ipol
                 elif is_cold_sampling:
                     # Interpolate x_{s} using x_{s-1} and x_{t+h} as input
-                    x_interpolated_s = self.q_sample(x_ti=x_s_prev, time_of_input=s - 1, **q_sample_kwargs)
+                    x_cur_ipol = self.q_sample(x_ti=x_prev_for_q, time_of_input=t_cur - 1, **q_sample_kwargs)
                     # for s = 0, we have x_s_degraded = x_s, so we just directly return x_interpolated_s_next
-                    x_s_prev = x_s
-                    d_i1 = x_interpolated_s_next - x_interpolated_s  # x_s - x_interpolated_s
+                    x_prev = x_cur
+                    d_i1 = x_next_ipol - x_cur_ipol  # x_s - x_interpolated_s
                     if (
                         self.hparams.sampling_type == "cold"
-                        or s_nnext > self.num_timesteps - 1
+                        or t_nnext > self.num_timesteps - 1
                         or ("heun" in self.hparams.sampling_type and is_first_step)
                     ):
-                        x_s = x_s + d_i1  # x_s += x_interpolated_s_next - x_interpolated_s
+                        x_cur = x_cur + d_i1  # x_s += x_interpolated_s_next - x_interpolated_s
                     else:
                         assert "heun" in self.hparams.sampling_type
                         # Heun's method
-                        xs_tmp = x_s + d_i1
-                        x0_hat2 = self.predict_x_last(x_t=xs_tmp, time_of_input=s_next, **kwargs)
+                        xs_tmp = x_cur + d_i1
+                        x0_hat2 = self.predict_x_last(x_t=xs_tmp, time_of_input=t_next, **kwargs)
                         q_sample_kwargs["x_th"] = x0_hat2
-                        x_interpolated_s_nnext = self.q_sample(x_ti=xs_tmp, time_of_input=s_next, **q_sample_kwargs)
+                        x_next_for_q = xs_tmp if use_csamp_pred else x_next_ipol
+                        x_interpolated_s_nnext = self.q_sample(
+                            x_ti=x_next_for_q, time_of_input=t_next, **q_sample_kwargs
+                        )
                         if self.hparams.sampling_type == "heun1":
                             d_i2 = x_interpolated_s_nnext - xs_tmp  # Seems like the best option
                         elif self.hparams.sampling_type == "heun2":
                             x_interpolated_s_next2 = self.q_sample(
-                                x_ti=xs_tmp, time_of_input=s_next, **q_sample_kwargs
+                                x_ti=x_next_for_q, time_of_input=t_next, **q_sample_kwargs
                             )
                             d_i2 = x_interpolated_s_nnext - x_interpolated_s_next2
                         elif self.hparams.sampling_type == "heun3":
-                            d_i2 = x_interpolated_s_nnext - x_interpolated_s_next
-                        x_s = x_s + 0.5 * (d_i1 + d_i2)
+                            d_i2 = x_interpolated_s_nnext - x_next_ipol
+                        elif self.hparams.sampling_type == "heun4":
+                            x_next_ipol = self.q_sample(x_ti=x_cur_for_q, time_of_input=t_cur, **q_sample_kwargs)
+                            d_i2 = x_interpolated_s_nnext - x_next_ipol
+                        else:
+                            raise ValueError(f"unknown sampling type {self.hparams.sampling_type}")
+                        x_cur = x_cur + 0.5 * (d_i1 + d_i2)
 
                 else:
                     raise ValueError(f"unknown sampling type {self.hparams.sampling_type}")
 
                 if self.hparams.use_cold_sampling_for_intermediate_steps or is_last_step:
-                    preds_t = x_s
+                    preds_t = x_cur
                 else:
                     assert not self.hparams.use_cold_sampling_for_intermediate_steps and not is_last_step
-                    preds_t = x_interpolated_s_next
-                intermediates[f"t{s_next}_preds"] = preds_t
+                    preds_t = x_next_ipol
+                intermediates[f"t{t_next}_preds"] = preds_t
         if self.hparams.refine_intermediate_predictions:
             # Use last prediction of x0 for final prediction of intermediate steps (not the last timestep!)
             q_sample_kwargs["x_th"] = xhat_th
             q_sample_kwargs["random_mode"] = "fixed_global"  #  use the same dropout mask for all steps
             _ = q_sample_kwargs.pop("iteration", None)
-            x_s_prev = initial_condition
-            for s in range(1, self.num_timesteps):
-                x_interpolated_s = self.q_sample(x_ti=x_s_prev, time_of_input=s - 1, **q_sample_kwargs)
-                intermediates[f"t{s}_preds"] = x_s_prev = x_interpolated_s
+            x_prev = initial_condition
+            for t_cur in range(1, self.num_timesteps):
+                x_cur_ipol = self.q_sample(x_ti=x_prev, time_of_input=t_cur - 1, **q_sample_kwargs)
+                intermediates[f"t{t_cur}_preds"] = x_prev = x_cur_ipol
 
         if last_s_plus_one < self.num_timesteps:
-            return x_s, intermediates
+            return x_cur, intermediates
         return xhat_th, intermediates
 
     @torch.inference_mode()
@@ -499,9 +518,7 @@ class DYffusionMarkov(BaseDYffusion2):
         interpolator_inputs = torch.cat([x_ti, x_th], dim=1)
         with torch.inference_mode():
             with self.interpolator.ema_scope(condition=self.hparams.interpolator_use_ema):
-                x_ipolated = self.interpolator.predict_packed(
-                    interpolator_inputs, time=time, **kwargs
-                )
+                x_ipolated = self.interpolator.predict_packed(interpolator_inputs, time=time, **kwargs)
         return x_ipolated["preds"]
 
     def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor, **kwargs) -> Tensor:
@@ -509,12 +526,7 @@ class DYffusionMarkov(BaseDYffusion2):
         x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition, **kwargs)
         return x_last_pred
 
-    def p_losses(
-        self,
-        dynamics: Tensor,
-        verbose=False,
-        **kwargs
-    ):
+    def p_losses(self, dynamics: Tensor, verbose=False, **kwargs):
         B = dynamics.shape[0]
         assert (
             dynamics.shape[1] == self.num_timesteps + 1
@@ -556,11 +568,7 @@ class DYffusionMarkov(BaseDYffusion2):
                 xhat_th = xhat_th.detach()
 
             xhat_ti_next = self._q_sample(
-                x_ti=xtilde_t,
-                x_th=xhat_th,
-                time_of_input=t_abs,
-                batch_mask=t_not_last_mask,
-                **kwargs
+                x_ti=xtilde_t, x_th=xhat_th, time_of_input=t_abs, batch_mask=t_not_last_mask, **kwargs
             )  # \hat{x}_{t+1}
             # simulate one more step of the reverse diffusion process, i.e.
             # forecast x_{h} from \hat{x}_{t'} for 1 <= t' <= h-1, where t' = t+1
@@ -635,13 +643,7 @@ class DYffusionEndToEndBase(BaseDYffusion2):
             and self.trainer.global_step >= self.interpolator_freeze_start_step
         )
 
-    def _interpolate(
-        self,
-        x_ti: Tensor,
-        x_th: Tensor,
-        time: Tensor,
-        **kwargs
-    ):
+    def _interpolate(self, x_ti: Tensor, x_th: Tensor, time: Tensor, **kwargs):
         """Draw the intermediate degraded data (given the start/target data and the diffused data)"""
         interpolation_cond = self.get_condition("interpolate", x_th)
         with torch.set_grad_enabled(not self.interpolator_is_frozen):
@@ -736,11 +738,7 @@ class DYffusionEndToEndBase(BaseDYffusion2):
             if self.hparams.detach_interpolated_data2:
                 xtilde_t = xtilde_t.detach()
             xhat_ti_next = self._q_sample(
-                x_ti=xtilde_t,
-                x_th=xhat_th,
-                time_of_input=t_abs,
-                batch_mask=t_not_last_mask,
-                **kwargs
+                x_ti=xtilde_t, x_th=xhat_th, time_of_input=t_abs, batch_mask=t_not_last_mask, **kwargs
             )  # \hat{x}_{t+1}
 
         if compute_interpolation_loss2 and t_not_last_mask.any():
@@ -948,7 +946,7 @@ class DYffusionEnd2EndSeparateModels(DYffusionEndToEndBase):
             x_ipolated = self.interpolator(x_ti, time=time, condition=interpolation_condition, **kwargs)
         return x_ipolated
 
-    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor,  **kwargs) -> Tensor:
+    def _predict_last_dynamics(self, x_t: Tensor, forward_condition: Tensor, t: Tensor, **kwargs) -> Tensor:
         assert (0 < t).all() and (t <= self.num_timesteps).all(), f"Invalid lead time timestep: {t}"
         x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition, **kwargs)
         return x_last_pred

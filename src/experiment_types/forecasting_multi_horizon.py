@@ -1006,7 +1006,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         regression_model: Optional[torch.nn.Module] = None,
         regression_run_id: Optional[str] = None,
         regression_local_checkpoint_path: Optional[str] = True,  # automatic search in local dirs
-        regression_wandb_ckpt_filename: Optional[str] = "last.ckpt",
+        regression_ckpt_filename: Optional[str] = "last.ckpt",
         regression_use_ema: bool = False,
         regression_inference_dropout: bool = False,
         regression_overrides: Optional[List[str]] = None,  # a dot list, e.g. ["model.hidden_dims=128"]
@@ -1025,7 +1025,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                 run_id=regression_run_id,
                 local_checkpoint_path=regression_local_checkpoint_path,
                 epoch="last",
-                ckpt_filename=regression_wandb_ckpt_filename,
+                ckpt_filename=regression_ckpt_filename,
                 override_key_value=regression_overrides,
                 print_name="Init. window regression model",
             )

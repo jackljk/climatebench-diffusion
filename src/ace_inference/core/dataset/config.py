@@ -41,10 +41,7 @@ def _convert_interval_to_int(
 ):
     """Convert interval to integer number of timesteps."""
     if interval % timestep != timedelta(0):
-        raise ValueError(
-            f"Requested interval length {interval} is not a "
-            f"multiple of the timestep {timestep}."
-        )
+        raise ValueError(f"Requested interval length {interval} is not a " f"multiple of the timestep {timestep}.")
 
     return interval // timestep
 
@@ -87,8 +84,7 @@ class RepeatedInterval:
         types = {type(self.interval_length), type(self.block_length), type(self.start)}
         if len(types) > 1:
             raise ValueError(
-                "All attributes of RepeatedInterval must be of the "
-                "same type (either all int or all str)."
+                "All attributes of RepeatedInterval must be of the " "same type (either all int or all str)."
             )
 
         self._is_time_delta_str = isinstance(self.interval_length, str)
@@ -98,9 +94,7 @@ class RepeatedInterval:
             self.block_length = pd.Timedelta(self.block_length)
             self.start = pd.Timedelta(self.start)
 
-    def get_boolean_mask(
-        self, length: int, timestep: Optional[timedelta] = None
-    ) -> np.ndarray:
+    def get_boolean_mask(self, length: int, timestep: Optional[timedelta] = None) -> np.ndarray:
         """
         Return a boolean mask for the repeated interval.
 
@@ -110,10 +104,7 @@ class RepeatedInterval:
         """
         if self._is_time_delta_str:
             if timestep is None:
-                raise ValueError(
-                    "Timestep must be provided when using time deltas "
-                    "for RepeatedInterval."
-                )
+                raise ValueError("Timestep must be provided when using time deltas " "for RepeatedInterval.")
 
             interval_length = _convert_interval_to_int(self.interval_length, timestep)
             block_length = _convert_interval_to_int(self.block_length, timestep)
@@ -124,9 +115,7 @@ class RepeatedInterval:
             start = self.start
 
         if start + interval_length > block_length:
-            raise ValueError(
-                "The interval (with start point) must fit within the repeat block."
-            )
+            raise ValueError("The interval (with start point) must fit within the repeat block.")
 
         block = np.zeros(block_length, dtype=bool)
         block[start : start + interval_length] = True
@@ -151,21 +140,16 @@ class OverwriteConfig:
         key_overlap = set(self.constant.keys()) & set(self.multiply_scalar.keys())
         if key_overlap:
             raise ValueError(
-                "OverwriteConfig cannot have the same variable in both constant "
-                f"and multiply_scalar: {key_overlap}"
+                "OverwriteConfig cannot have the same variable in both constant " f"and multiply_scalar: {key_overlap}"
             )
 
     def apply(self, tensors: TensorDict) -> TensorDict:
         for var, fill_value in self.constant.items():
             data = tensors[var]
-            tensors[var] = torch.ones_like(data) * torch.tensor(
-                fill_value, dtype=data.dtype, device=data.device
-            )
+            tensors[var] = torch.ones_like(data) * torch.tensor(fill_value, dtype=data.dtype, device=data.device)
         for var, multiplier in self.multiply_scalar.items():
             data = tensors[var]
-            tensors[var] = data * torch.tensor(
-                multiplier, dtype=data.dtype, device=data.device
-            )
+            tensors[var] = data * torch.tensor(multiplier, dtype=data.dtype, device=data.device)
         return tensors
 
     @property
@@ -236,9 +220,7 @@ class XarrayDataConfig:
     n_repeats: int = 1
     engine: Literal["netcdf4", "h5netcdf", "zarr"] = "netcdf4"
     spatial_dimensions: Literal["healpix", "latlon"] = "latlon"
-    subset: Union[Slice, TimeSlice, RepeatedInterval] = dataclasses.field(
-        default_factory=Slice
-    )
+    subset: Union[Slice, TimeSlice, RepeatedInterval] = dataclasses.field(default_factory=Slice)
     infer_timestep: bool = True
     dtype: Optional[str] = "float32"
     overwrite: OverwriteConfig = dataclasses.field(default_factory=OverwriteConfig)
@@ -255,9 +237,7 @@ class XarrayDataConfig:
 
     def __post_init__(self):
         if self.n_repeats > 1 and not self.infer_timestep:
-            raise ValueError(
-                "infer_timestep must be True if n_repeats is greater than 1"
-            )
+            raise ValueError("infer_timestep must be True if n_repeats is greater than 1")
         if self.dtype is None:
             self.torch_dtype = None
         else:

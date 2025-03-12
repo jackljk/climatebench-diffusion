@@ -3,8 +3,13 @@ from typing import Dict, Mapping, Optional, Tuple
 import numpy as np
 import torch
 import xarray as xr
-from src.evaluation.torchmetrics import MeanSquaredError, MeanError, ContinuousRankedProbabilityScore, MeanAbsoluteError, \
-    SpreadSkillRatio
+from src.evaluation.torchmetrics import (
+    MeanSquaredError,
+    MeanError,
+    ContinuousRankedProbabilityScore,
+    MeanAbsoluteError,
+    SpreadSkillRatio,
+)
 
 from src.evaluation.aggregators._abstract_aggregator import AbstractAggregator
 from src.losses.losses import crps_ensemble
@@ -33,13 +38,13 @@ class TimeMeanAggregator(AbstractAggregator):
 
     @torch.inference_mode()
     def _record_batch(
-            self,
-            target_data: Mapping[str, torch.Tensor],
-            gen_data: Mapping[str, torch.Tensor],
+        self,
+        target_data: Mapping[str, torch.Tensor],
+        gen_data: Mapping[str, torch.Tensor],
     ):
         def add_or_initialize_time_mean(
-                maybe_dict: Optional[Dict[str, torch.Tensor]],
-                new_data: Mapping[str, torch.Tensor],
+            maybe_dict: Optional[Dict[str, torch.Tensor]],
+            new_data: Mapping[str, torch.Tensor],
         ) -> Mapping[str, torch.Tensor]:
             if maybe_dict is None:
                 d: Dict[str, torch.Tensor] = {name: tensor for name, tensor in new_data.items()}
@@ -57,8 +62,10 @@ class TimeMeanAggregator(AbstractAggregator):
         Returns logs as can be reported to WandB.
         """
         if self._n_batches == 0:
-            raise ValueError("No data recorded. This aggregator is only called for forecasting tasks. "
-                             "Did you mistakenly try to use it for a different task?")
+            raise ValueError(
+                "No data recorded. This aggregator is only called for forecasting tasks. "
+                "Did you mistakenly try to use it for a different task?"
+            )
         area_weights = self._area_weights
         logs = {}
         # dist = Distributed.get_instance()
@@ -95,7 +102,7 @@ class TimeMeanAggregator(AbstractAggregator):
             for key, metric in metric_aggs.items():
                 gen_here = gen if metric == "crps" else gen_ens_mean
                 metric.update(gen_here, target)
-                logs[key] = to_float(metric.compute())   # Should be corrctly synced across all processes
+                logs[key] = to_float(metric.compute())  # Should be corrctly synced across all processes
 
         return logs, {}, {}
 
@@ -107,6 +114,7 @@ class TimeMeanAggregator(AbstractAggregator):
         for key, value in logs.items():
             data_vars[key] = xr.DataArray(value)
         return xr.Dataset(data_vars=data_vars)
+
 
 def to_float(tensor: torch.Tensor) -> float:
     return tensor.cpu().numpy().item()

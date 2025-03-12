@@ -75,9 +75,7 @@ class CorrectorSelector:
         Create a CorrectorSelector from a dictionary containing all the information
         needed to build a CorrectorConfigProtocol.
         """
-        return dacite.from_dict(
-            data_class=cls, data=state, config=dacite.Config(strict=True)
-        )
+        return dacite.from_dict(data_class=cls, data=state, config=dacite.Config(strict=True))
 
     @classmethod
     def from_dict(cls, config: dict):

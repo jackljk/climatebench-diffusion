@@ -1,7 +1,7 @@
 import dataclasses
 from typing import Literal, Optional
 
-#todo: remove for config.py
+# todo: remove for config.py
 
 
 @dataclasses.dataclass

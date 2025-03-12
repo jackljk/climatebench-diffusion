@@ -9,18 +9,12 @@ from src.ace_inference.core.device import get_device
 
 class GriddedOperations(abc.ABC):
     @abc.abstractmethod
-    def area_weighted_mean(
-        self, data: torch.Tensor, keepdim: bool = False
-    ) -> torch.Tensor: ...
+    def area_weighted_mean(self, data: torch.Tensor, keepdim: bool = False) -> torch.Tensor: ...
 
-    def area_weighted_mean_bias(
-        self, truth: torch.Tensor, predicted: torch.Tensor
-    ) -> torch.Tensor:
+    def area_weighted_mean_bias(self, truth: torch.Tensor, predicted: torch.Tensor) -> torch.Tensor:
         return self.area_weighted_mean(predicted - truth)
 
-    def area_weighted_rmse(
-        self, truth: torch.Tensor, predicted: torch.Tensor
-    ) -> torch.Tensor:
+    def area_weighted_rmse(self, truth: torch.Tensor, predicted: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(self.area_weighted_mean((predicted - truth) ** 2))
 
     def area_weighted_std(self, data: torch.Tensor, keepdim: bool = False):
@@ -30,9 +24,7 @@ class GriddedOperations(abc.ABC):
         ).sqrt()
 
     @abc.abstractmethod
-    def area_weighted_gradient_magnitude_percent_diff(
-        self, truth: torch.Tensor, predicted: torch.Tensor
-    ): ...
+    def area_weighted_gradient_magnitude_percent_diff(self, truth: torch.Tensor, predicted: torch.Tensor): ...
 
     def to_state(self) -> Dict[str, Any]:
         return {
@@ -64,18 +56,12 @@ class GriddedOperations(abc.ABC):
             An instance of the subclass.
         """
         if cls is not GriddedOperations:
-            raise RuntimeError(
-                "This method should be called on GriddedOperations, "
-                "not on its subclasses."
-            )
+            raise RuntimeError("This method should be called on GriddedOperations, " "not on its subclasses.")
         subclasses = get_all_subclasses(cls)
         for subclass in subclasses:
             if subclass.__name__ == state["type"]:
                 return subclass(**state["state"])
-        raise ValueError(
-            f"Unknown subclass type: {state['type']}, "
-            f"available: {[s.__name__ for s in subclasses]}"
-        )
+        raise ValueError(f"Unknown subclass type: {state['type']}, " f"available: {[s.__name__ for s in subclasses]}")
 
 
 T = TypeVar("T")
@@ -99,20 +85,14 @@ class LatLonOperations(GriddedOperations):
         self._device_area = area_weights.to(get_device())
         self._cpu_area = area_weights.to("cpu")
 
-    def area_weighted_mean(
-        self, data: torch.Tensor, keepdim: bool = False
-    ) -> torch.Tensor:
+    def area_weighted_mean(self, data: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
         if data.device.type == "cpu":
             area_weights = self._cpu_area
         else:
             area_weights = self._device_area
-        return metrics.weighted_mean(
-            data, area_weights, dim=self.HORIZONTAL_DIMS, keepdim=keepdim
-        )
+        return metrics.weighted_mean(data, area_weights, dim=self.HORIZONTAL_DIMS, keepdim=keepdim)
 
-    def area_weighted_gradient_magnitude_percent_diff(
-        self, truth: torch.Tensor, predicted: torch.Tensor
-    ):
+    def area_weighted_gradient_magnitude_percent_diff(self, truth: torch.Tensor, predicted: torch.Tensor):
         if predicted.device.type == "cpu":
             area_weights = self._cpu_area
         else:
@@ -128,17 +108,11 @@ class LatLonOperations(GriddedOperations):
 class HEALPixOperations(GriddedOperations):
     HORIZONTAL_DIMS = (-3, -2, -1)
 
-    def area_weighted_mean(
-        self, data: torch.Tensor, keepdim: bool = False
-    ) -> torch.Tensor:
+    def area_weighted_mean(self, data: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
         return data.mean(dim=self.HORIZONTAL_DIMS, keepdim=keepdim)
 
-    def area_weighted_gradient_magnitude_percent_diff(
-        self, truth: torch.Tensor, predicted: torch.Tensor
-    ):
-        return metrics.gradient_magnitude_percent_diff(
-            truth, predicted, weights=None, dim=self.HORIZONTAL_DIMS
-        )
+    def area_weighted_gradient_magnitude_percent_diff(self, truth: torch.Tensor, predicted: torch.Tensor):
+        return metrics.gradient_magnitude_percent_diff(truth, predicted, weights=None, dim=self.HORIZONTAL_DIMS)
 
     def get_initialization_kwargs(self) -> Dict[str, Any]:
         return {}

@@ -60,10 +60,7 @@ class Registry(Generic[T]):
         else:
             type_name = config["type"]
         if type_name not in self._types:
-            raise ValueError(
-                f"Received unexpected type {type_name}, "
-                f"expected one of {self._types.keys()}"
-            )
+            raise ValueError(f"Received unexpected type {type_name}, " f"expected one of {self._types.keys()}")
         else:
             instance = dacite.from_dict(
                 data_class=self._types[type_name],

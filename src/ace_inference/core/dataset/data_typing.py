@@ -12,9 +12,7 @@ VariableMetadata = namedtuple("VariableMetadata", ["units", "long_name"])
 
 class Dataset(torch.utils.data.Dataset, abc.ABC):
     @abc.abstractmethod
-    def get_sample_by_time_slice(
-        self, time_slice: slice
-    ) -> Tuple[TensorDict, xr.DataArray]:
+    def get_sample_by_time_slice(self, time_slice: slice) -> Tuple[TensorDict, xr.DataArray]:
         """
         Returns a sample of data for the given time slice.
 

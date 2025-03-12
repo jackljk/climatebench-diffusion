@@ -161,6 +161,7 @@ class OneStepAggregator(AbstractAggregator):
         record_spectra: bool = False,
         spectra_var_names: list[str] = None,
         temporal_kwargs: dict = None,
+        coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         save_to_path: str = None,
         **kwargs,
     ):
@@ -199,6 +200,7 @@ class OneStepAggregator(AbstractAggregator):
                 var_names=snapshot_var_names,
                 metrics=temporal_kwargs.metrics,
                 temporal_scale=temporal_kwargs.temporal_scale,
+                coords=coords,
             )
 
         self._aggregators: Dict[str, _Aggregator] = {
