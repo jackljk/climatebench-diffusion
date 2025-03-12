@@ -113,7 +113,7 @@ class BaseExperiment(LightningModule):
         torch_compile: str = None,
         num_predictions: int = 1,
         num_predictions_in_memory: int = None,
-        allow_validation_size_indivisible_on_ddp: bool = False,  # Throw error if False, else only log warning
+        allow_validation_size_indivisible_on_ddp: bool = True,  # Throw error if False, else only log warning
         logging_infix: str = "",
         prediction_inputs_noise: float = 0.0,
         save_predictions_filename: Optional[str] = None,
