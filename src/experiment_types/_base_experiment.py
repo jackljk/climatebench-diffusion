@@ -113,7 +113,7 @@ class BaseExperiment(LightningModule):
         torch_compile: str = None,
         num_predictions: int = 1,
         num_predictions_in_memory: int = None,
-        allow_validation_size_indivisible_on_ddp: bool = True,  # Throw error if False, else only log warning
+        allow_validation_size_indivisible_on_ddp: bool = False,  # Throw error if False, else only log warning
         logging_infix: str = "",
         prediction_inputs_noise: float = 0.0,
         save_predictions_filename: Optional[str] = None,
@@ -880,10 +880,10 @@ class BaseExperiment(LightningModule):
                     self.log_text.warning(message)
                 else:
                     message += (
-                        f"Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
-                        f"If you prefer ignoring this warning for the validation dataloaders, "
-                        f"set `module.allow_validation_size_indivisible_on_ddp=True`."
-                        f"Alternatively, you may use a single GPU to get correct results. "
+                        "Please set `datamodule.eval_batch_size` to a value that divides the validation set size. "
+                        "If you prefer ignoring this warning for the validation dataloaders, "
+                        "set `module.allow_validation_size_indivisible_on_ddp=True`."
+                        "Alternatively, you may use a single GPU to get correct results. "
                     )
                     raise ValueError(message)
 
@@ -1390,7 +1390,7 @@ class BaseExperiment(LightningModule):
                         else:
                             raise ValueError(f"Unknown lead time format: {agg_name_substring}")
                         break
-                    elif agg_name_substring != "" and "loss" not in agg_name_substring:
+                    elif agg_name_substring != "" and all(k not in agg_name_substrings for k in ["loss", "time_mean"]):
                         print(f"agg_name_substring={agg_name_substring} does not start with 't' and is not a number.")
 
                 # if agg.name is None:  # does not work when using a listaggregator
@@ -1414,6 +1414,7 @@ class BaseExperiment(LightningModule):
                         # define our custom x axis metric
                         wandb.define_metric(x_axis)
                     for x_axis_value, values in values_list.items():
+                        assert not isinstance(x_axis_value, str), f"{type(x_axis_value)=}. Use a number or timestamp."
                         for value_i_k, values_i in values.items():
                             if value_i_k not in x_axes:
                                 for custom_x_axis in x_axes:
@@ -1880,6 +1881,10 @@ class BaseExperiment(LightningModule):
         script_path = os.environ.get("SCRIPT_NAME", None)
         if script_path is not None:
             checkpoint["script_path"] = script_path.split("/")[-1]  # get only the script name
+        
+        # Save the full class name with module path. This is useful to instantiating the correct class when loading
+        checkpoint["_target_"] = f"{self.__class__.__module__}.{self.__class__.__name__}"
+        
         # Save wandb run info, if available
         if self.logger is not None and hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "id"):
             checkpoint["wandb"] = {
@@ -1920,3 +1925,11 @@ class BaseExperiment(LightningModule):
         Recommended to use with 'empty_cache=True' to get the most accurate results during debugging.
         """
         print_gpu_memory_usage(prefix, tqdm_bar, add_description, keep_old, empty_cache, log_func=self.log_text.info)
+
+    def time_it(self, func: Callable, *args, **kwargs):
+        """Time a function call"""
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        duration = time.time() - start_time
+        # self.log_text.info(f"Function {func.__name__} took {duration:.2f} seconds.")
+        return result, duration

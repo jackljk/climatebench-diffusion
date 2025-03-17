@@ -29,6 +29,11 @@ DEBUG_dataset_size: null # Set to None to use the full dataset, value is the num
 comprehensive_validation:
   run: False
   n_epochs: 1 # Run every x epoch
-  temporal_scale: 'monthly' # 'monthly' or 'yearly'
-  metrics: ['rmse', 'crps', 'brier', 'ssr']
+  temporal_scale: 'yearly' # 'monthly' or 'yearly'
+  metrics: "all" #["rmse", "crps", "ssr", "rmse_member_avg"]  # to add: 'brier_score', 'rmsb'
+  val_years: null  # "[START_YEAR, END_YEAR]" # Set to None to use the full dataset
+  test_years: null  # "[START_YEAR, END_YEAR]" # Set to None to use the full dataset
+  save_to_disk: False # will save the results to disk
+  save_to_wandb: False # will only save 'yearly' temporal scale
+  wandb_path: "climatebench_daily" # wandb path to save the results
 

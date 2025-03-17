@@ -9,15 +9,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 import wandb
+import xarray as xr
+import cartopy.crs as ccrs
+from src.losses.losses import crps_ensemble
 from src.utilities.naming import (
     clean_metric_name,
     get_label_names_for_wandb_group_names,
     normalize_run_name,
 )
 from src.utilities.wandb_api import (
-    get_runs_for_group,
+    get_existing_wandb_group_runs,
     get_runs_for_group_with_any_metric,
     has_summary_metric,
     metrics_of_runs_to_arrays,
@@ -1301,6 +1305,178 @@ def beautify_plots_with_metrics(
         y = anchor_y + 0.035 if plot_legend_on_top else 0.93
         axes[0].figure.suptitle(title, y=y)
 
+def create_wandb_figures(target, gen, var_name, fig_shared_label, coords):
+    # Some plotting parameters
+    map_transform = ccrs.PlateCarree()
+    _plot_params = {
+        "pr": {"cmap": "BrBG", "add_colorbar": False, "transform": map_transform}, #, "cbar_kwargs": {"shrink": 0.9}
+        "tas": {"cmap": "inferno", "add_colorbar": False, "transform": map_transform},
+        "crps": {"cmap": "viridis", "transform": map_transform, "cbar_kwargs": {"shrink": 0.8}},
+        "error": {"cmap": "coolwarm", "add_colorbar": False, "transform": map_transform}, # , "cbar_kwargs": {"shrink": 0.5}
+    }
+    cbar_kwargs = {"fraction": 0.046, "pad": 0.04}
+
+    def to_xr_dataarray(data, is_ensemble=False):
+        if isinstance(data, dict):
+            return {k: to_xr_dataarray(v) for k, v in data.items()}
+        data = data.detach().cpu().numpy() if torch.is_tensor(data) else data
+        if is_ensemble:
+            dims = ["member", "batch"] if len(data.shape) == 4 else ["member"]
+        else:
+            dims = ["batch"] if len(data.shape) == 3 else []
+        dims += list(coords.keys()) if coords is not None else ["dim2", "dim3"]
+        return xr.DataArray(data, coords=coords, dims=dims)
+
+    def get_random_ensembles(data):
+        # get 2 random ensemble members
+        idxs = np.random.choice(np.arange(ensemble_size), 2, replace=False)
+        # get ens member and transform to xr dataarray
+        ens_1 = to_xr_dataarray(data[idxs[0]], is_ensemble=False)
+        ens_2 = to_xr_dataarray(data[idxs[1]], is_ensemble=False)
+        return ens_1, ens_2, idxs
+
+    gen = gen.cpu() if torch.is_tensor(gen) else gen[var_name].cpu()
+    target = target.cpu() if torch.is_tensor(target) else target[var_name].cpu()
+    any_gen_shape = gen.shape
+    any_target_shape = target.shape
+    is_ensemble = len(any_gen_shape) == len(any_target_shape) + 1
+    if is_ensemble:
+        crps = crps_ensemble(predicted=gen, truth=target, reduction="none")
+    else:
+        crps = None
+    ensemble_size = any_gen_shape[0] if is_ensemble else 1
+    gen_ens_1, gen_ens_2, ens_idxs = get_random_ensembles(gen)
+    gen_ens_mean = to_xr_dataarray(gen.mean(dim=0), is_ensemble=False)
+    target = to_xr_dataarray(target, is_ensemble=False)
+    snapshots = dict()
+    y = 0.85
+    # Handle Precipitation unique case
+    if var_name == "pr":
+        # get log version to make more visible
+        target_log = np.log(target + 1)
+        gen_log = np.log(gen_ens_mean + 1)
+        gen_ens_1_log = np.log(gen_ens_1 + 1)
+        gen_ens_2_log = np.log(gen_ens_2 + 1)
+
+        fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": map_transform})
+        fig.suptitle(f"log({var_name}) - {fig_shared_label}", y=y + 0.1)
+
+        # First row - target and generated mean
+        vmin = min(np.min(target_log), np.min(gen_log), np.min(gen_ens_1_log), np.min(gen_ens_2_log))
+        vmax = max(np.max(target_log), np.max(gen_log), np.max(gen_ens_1_log), np.max(gen_ens_2_log))
+        im1 = target_log.plot(ax=axs[0, 0], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+        axs[0, 0].set_title("Target")
+        im2 = gen_log.plot(ax=axs[0, 1], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+        axs[0, 1].set_title("Generated: Mean")
+
+        # Second row - sampled ensembles
+        im3 = gen_ens_1_log.plot(ax=axs[1, 0], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+        axs[1, 0].set_title(f"Generated: Ensemble {ens_idxs[0]}")
+        im4 = gen_ens_2_log.plot(ax=axs[1, 1], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+        axs[1, 1].set_title(f"Generated: Ensemble {ens_idxs[1]}")
+
+        # create cbar
+        cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", **cbar_kwargs)
+
+        # Add coastlines
+        for ax in axs.flat:
+            ax.coastlines()
+
+        snapshots[f"image-full-field-log/{fig_shared_label}/{var_name}"] = wandb.Image(fig)
+
+        # Handle Error plot
+        fig, axs = plt.subplots(1, 3, figsize=(12, 6), subplot_kw={"projection": map_transform})
+        fig.suptitle(f"Bias log({var_name}) - {fig_shared_label}", y=y)
+
+        # Calculate error in log scale # todo: Better/same to log after calculating error in general case?
+        error = gen_log - target_log
+        error_gen_ens_1 = gen_ens_1_log - target_log
+        error_gen_ens_2 = gen_ens_2_log - target_log
+        vmin = min(np.min(error), np.min(error_gen_ens_1), np.min(error_gen_ens_2))
+        vmax = max(np.max(error), np.max(error_gen_ens_1), np.max(error_gen_ens_2))
+        im1 = error.plot(ax=axs[0], vmin=vmin, vmax=vmax, **_plot_params["error"])
+        axs[0].set_title("Error - Generated Mean")
+        im2 = error_gen_ens_1.plot(ax=axs[1], vmin=vmin, vmax=vmax, **_plot_params["error"])
+        axs[1].set_title(f"Error - Generated Ensemble {ens_idxs[0]}")
+        im3 = error_gen_ens_2.plot(ax=axs[2], vmin=vmin, vmax=vmax, **_plot_params["error"])
+        axs[2].set_title(f"Error - Generated Ensemble {ens_idxs[1]}")
+
+        # create cbar
+        cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", **cbar_kwargs)
+
+        # Add coastlines
+        for ax in axs.flat:
+            ax.coastlines()
+
+        snapshots[f"image-error-log/{fig_shared_label}/{var_name}"] = wandb.Image(fig)
+
+    # Handle General plot
+    fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": map_transform})
+    fig.suptitle(f"{var_name}Full Field {var_name} - {fig_shared_label}", y=y + 0.1)
+
+    # First row Target and Generated Mean
+    vmin = min(np.min(target), np.min(gen_ens_mean), np.min(gen_ens_1), np.min(gen_ens_2))
+    vmax = max(np.max(target), np.max(gen_ens_mean), np.max(gen_ens_1), np.max(gen_ens_2))
+    im1 = target.plot(ax=axs[0, 0], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+    axs[0, 0].set_title("Target")
+    im2 = gen_ens_mean.plot(ax=axs[0, 1], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+    axs[0, 1].set_title("Generated: Mean")
+
+    # Second row - Sampled Ensembles
+    im3 = gen_ens_1.plot(ax=axs[1, 0], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+    axs[1, 0].set_title(f"Generated: Ensemble {ens_idxs[0]}")
+    im4 = gen_ens_2.plot(ax=axs[1, 1], vmin=vmin, vmax=vmax, **_plot_params[var_name])
+    axs[1, 1].set_title(f"Generated: Ensemble {ens_idxs[1]}")
+
+    # create cbar
+    cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", **cbar_kwargs)
+
+    # Add coastlines
+    for ax in axs.flat:
+        ax.coastlines()
+
+    snapshots[f"image-full-field/{fig_shared_label}/{var_name}"] = wandb.Image(fig)
+
+    # Handle Error plot
+    fig, axs = plt.subplots(1, 3, figsize=(16, 4), subplot_kw={"projection": map_transform})
+    fig.suptitle(f"{var_name}Error {var_name} - {fig_shared_label}", y=y)
+
+    # Calculate error
+    error = gen_ens_mean - target
+    error_gen_ens_1 = gen_ens_1 - target
+    error_gen_ens_2 = gen_ens_2 - target
+    vmin = min(np.min(error), np.min(error_gen_ens_1), np.min(error_gen_ens_2))
+    vmax = max(np.max(error), np.max(error_gen_ens_1), np.max(error_gen_ens_2))
+    im1 = error.plot(ax=axs[0], vmin=vmin, vmax=vmax, **_plot_params["error"])
+    axs[0].set_title("Error - Generated Mean")
+    im2 = error_gen_ens_1.plot(ax=axs[1], vmin=vmin, vmax=vmax, **_plot_params["error"])
+    axs[1].set_title(f"Error - Generated Ensemble {ens_idxs[0]}")
+    im3 = error_gen_ens_2.plot(ax=axs[2], vmin=vmin, vmax=vmax, **_plot_params["error"])
+    axs[2].set_title(f"Error - Generated Ensemble {ens_idxs[1]}")
+
+    # create cbar
+    cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", **cbar_kwargs)
+
+    # Add coastlines
+    for ax in axs.flat:
+        ax.coastlines()
+
+    snapshots[f"image-error/{fig_shared_label}/{var_name}"] = wandb.Image(fig)
+    if is_ensemble:
+        # Handle CRPS plot
+        fig, axs = plt.subplots(1, 1, figsize=(12, 6), subplot_kw={"projection": map_transform})
+
+        # convert to xr dataarray
+        crps = to_xr_dataarray(crps)
+
+        im1 = crps.plot(ax=axs, **_plot_params["crps"])
+        axs.set_title(f"{fig_shared_label} CRPS {var_name}")
+        axs.coastlines()
+
+        snapshots[f"image-crps-fair/{fig_shared_label}/{var_name}"] = wandb.Image(fig)
+    #
+    snapshots = {k.strip("/").replace("//", "/"): v for k, v in snapshots.items()}
+    return snapshots
 
 class RollingPlotFormats:
     def __init__(

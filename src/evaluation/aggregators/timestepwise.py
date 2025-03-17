@@ -164,7 +164,7 @@ class MetricAggregator(Metric):
             epoch: Current epoch number.
         """
         if self._variable_metrics is None:
-            raise ValueError(f"No batches have been recorded.")
+            raise ValueError("No batches have been recorded.")
         logs = {}
         label = label + "/" if label else ""
         for i, metric in enumerate(self._variable_metrics):

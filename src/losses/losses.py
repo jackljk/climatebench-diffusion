@@ -255,7 +255,10 @@ class AbstractWeightedLoss(torch.nn.Module):
             weights = self.weights
         else:
             assert (
-                add_weight is not None or multiply_weight is not None or batch_logvars is not None
+                add_weight is not None
+                or multiply_weight is not None
+                or batch_logvars is not None
+                or self.n_logvar_dims > 0
             ), "No weights given. Please provide/set - for example, as `loss_weights_tensor` in your training dataset."
             weights = torch.ones_like(loss)
 

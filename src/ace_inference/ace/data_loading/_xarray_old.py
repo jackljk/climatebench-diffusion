@@ -7,10 +7,10 @@ import numpy as np
 import torch
 import xarray as xr
 
-from src.ace_inference.core import metrics
 from src.ace_inference.ace.data_loading.config import XarrayDataConfig
 from src.ace_inference.ace.data_loading.requirements import DataRequirements
 from src.ace_inference.ace.data_loading.utils import get_lons_and_lats, get_times, load_series_data
+from src.ace_inference.core import metrics
 from src.ace_inference.core.device import get_device
 from src.ace_inference.core.winds import lon_lat_to_xyz
 from src.utilities.utils import get_logger
@@ -21,6 +21,7 @@ from .data_typing import (
     SigmaCoordinates,
     VariableMetadata,
 )
+
 
 log = get_logger(__name__)
 

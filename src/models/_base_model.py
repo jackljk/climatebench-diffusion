@@ -123,6 +123,7 @@ class BaseModel(LightningModule):
             elif isinstance(criterion, torch.nn.Module):
                 self.criterion = torch.nn.ModuleDict({"preds": criterion})
             else:
+                self.log_text.debug(f"Criterion is not a torch.nn.Module! This may cause issues if it contain weights.")
                 self.criterion = {"preds": criterion}
 
         self.ema_scope = None  # EMA scope for the model. May be set by the BaseExperiment instance

@@ -27,7 +27,7 @@ datamodule:
 diffusion:
   forward_conditioning: "none"
   interpolator_run_id: "4196091"  # Ipol-1h-6T-MH6_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_54lr_LC1:33_15Dr_LV-pCW_11seed_20h25mNov26_4196091
-  interpolator_wandb_ckpt_filename: "last.ckpt"  # "best-val_avg_crps.ckpt"
+  interpolator_wandb_ckpt_filename: "latest_epoch"  # last.ckpt"  # "best-val_avg_crps.ckpt"
   interpolator_use_ema: True
   use_cold_sampling_for_intermediate_steps: False
   use_cold_sampling_for_last_step: False

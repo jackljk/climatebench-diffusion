@@ -33,7 +33,9 @@ class ERDM(BaseDiffusion):
         same_schedule_per_batch: bool = True,  # If True, sample a different schedule for each batch
         # P_mean          = -1.2,             # Mean of the noise level distribution.
         # P_std           = 1.2,              # Standard deviation of the noise level distribution.
+        use_lambda_weighting: bool = True,  # Use standard lambda weighting from EDM for the loss
         variance_loss: bool = True,  # Use a Kendall&Gal style loss weighting with learned per-frame variance -- found to be beneficial
+        frame_weighting: bool = False,  # Use same (initial) weighting for all frames in the window
         # Use classical global mapping network based conditioning to inform network of fractional frame shift.
         # If False, the network will not be trained with randomly shifted noises, and will only handle the case offset=0! (XXX that mode is currently untested)
         use_map_noise: bool = True,
@@ -300,7 +302,7 @@ class ERDM(BaseDiffusion):
         c_out = self.sigma_data * noise_std / noisy_std
         sqrt_lambda = noisy_std / (self.sigma_data * noise_std)
         #           = (sigma_data ** 2 + noise_std ** 2)**0.5 / (sigma_data * noise_std)
-        #    weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        #           = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         return c_in, c_out, c_skip, sqrt_lambda
 
     def forward(
@@ -417,7 +419,8 @@ class ERDM(BaseDiffusion):
 
         # If we're training, compute the loss and return it, instead of returning the denoised clip
         if loss:
-            weight = 1  # Currently not using any noise level dependent gradient scaling (note, situation is different from MC sampling of training noise levels in EDM paper -- we are doing all of them at once). TODO think of what would be the right thing
+            multiply_weight = None
+            # multiply_weight = 1  # Currently not using any noise level dependent gradient scaling (note, situation is different from MC sampling of training noise levels in EDM paper -- we are doing all of them at once). TODO think of what would be the right thing
             # error = x - x_denoised
             # Old code:
             # error = error * sqrt_lambda  # Scale the per-frame gradient to unity (at init)
@@ -445,9 +448,16 @@ class ERDM(BaseDiffusion):
             # # Just the standard error averaged uniformly over frames
             # loss = (error * weight).mean() #.float()
             # return {"loss": loss}
-            weight = weight * (sqrt_lambda**2)
-            # Weight will be approriately multiplied or combined with other weights in the loss function
-            return self.criterion["preds"](preds=x_denoised, targets=x, multiply_weight=weight)
+            if self.hparams.use_lambda_weighting:
+                multiply_weight = sqrt_lambda**2  # Will be applied after squaring the error
+            if self.hparams.frame_weighting == "reverse":
+                # Assign higher loss weights to last frames
+                f_weight = torch.arange(1, self.seq_len + 1, device=x.device, dtype=x.dtype) / self.seq_len
+                f_weight = f_weight.reshape((1, *sqrt_lambda.shape[1:]))
+                multiply_weight = multiply_weight * f_weight if multiply_weight is not None else f_weight
+
+            # Weight will be appropriately multiplied or combined with other weights in the loss function
+            return self.criterion["preds"](preds=x_denoised, targets=x, multiply_weight=multiply_weight)
 
         elif return_debug:
             return dict(

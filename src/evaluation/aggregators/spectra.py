@@ -3,10 +3,10 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 import torch
 import xarray as xr
-from src.evaluation.torchmetrics import Metric
 
+from src.evaluation.torchmetrics import Metric
 from src.utilities.spectra import ZonalEnergySpectrum
-from src.utilities.utils import torch_to_numpy, extract_xarray_metadata, reconstruct_xarray
+from src.utilities.utils import extract_xarray_metadata, reconstruct_xarray, torch_to_numpy
 
 
 class SpectraAggregator(Metric):

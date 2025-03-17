@@ -21,10 +21,10 @@ from src.diffusion.dyffusion_e2e import (
     DYffusionMarkov,
 )
 from src.diffusion.pderefiner import PDERefiner
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.experiment_types._base_experiment import BaseExperiment
 from src.interface import NoTorchModuleWrapper
 from src.models.modules.ema import LitEma
-from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.utilities.checkpointing import reload_checkpoint_from_wandb
 from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.utils import (
@@ -637,9 +637,10 @@ class DYffusionE2E(MHDYffusionAbstract):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stack_window_to_channel_dim = False
-        assert isinstance(
-            self.model, DYffusionEnd2End
-        ), f"Model must be an instance of BaseDYffusion2, but got {type(self.model)}"
+        if self.hparams.torch_compile != "model":  # todo: add property that returns the model regardless of compile
+            assert isinstance(
+                self.model, DYffusionEnd2End
+            ), f"Model must be an instance of BaseDYffusion2, but got {type(self.model)}"
 
     @property
     def valid_time_range_for_backbone_model(self) -> List[int]:
@@ -654,9 +655,11 @@ class DYffusionE2E(MHDYffusionAbstract):
     def get_loss(self, batch: Any) -> Tensor:
         r"""Compute the loss for the given batch."""
         dynamics = batch["dynamics"]
+        x_th = self.pack_data(dynamics[:, -1, ...], input_or_output="output")
+        dynamics = self.pack_data(dynamics, input_or_output="input")
         split = "train" if self.training else "val"
         extra_kwargs = self.get_extra_model_kwargs(batch, split=split, ensemble=False, is_autoregressive=False)
-        return self.model.p_losses(dynamics=dynamics, **extra_kwargs)
+        return self.model.p_losses(dynamics=dynamics, x_th=x_th, **extra_kwargs)
 
 
 class DYffusionMarkovModule(MHDYffusionAbstract):
@@ -665,9 +668,10 @@ class DYffusionMarkovModule(MHDYffusionAbstract):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stack_window_to_channel_dim = False
-        assert isinstance(
-            self.model, DYffusionMarkov
-        ), f"Model must be an instance of BaseDYffusion2, but got {type(self.model)}"
+        if self.hparams.torch_compile != "model":  # todo: add property that returns the model regardless of compile
+            assert isinstance(
+                self.model, DYffusionMarkov
+            ), f"Model must be an instance of BaseDYffusion2, but got {type(self.model)}"
 
     @property
     def valid_time_range_for_backbone_model(self) -> List[int]:
@@ -676,6 +680,7 @@ class DYffusionMarkovModule(MHDYffusionAbstract):
     def get_loss(self, batch: Any) -> Tensor:
         r"""Compute the loss for the given batch."""
         dynamics = batch["dynamics"]
+        dynamics = self.pack_data(dynamics, input_or_output="output")
         split = "train" if self.training else "val"
         extra_kwargs = self.get_extra_model_kwargs(batch, split=split, ensemble=False, is_autoregressive=False)
         return self.model.p_losses(dynamics=dynamics, **extra_kwargs)
@@ -1028,6 +1033,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                 ckpt_filename=regression_ckpt_filename,
                 override_key_value=regression_overrides,
                 print_name="Init. window regression model",
+                also_datamodule=False,
             )
 
             self.skip_every_n_reg_step = 1

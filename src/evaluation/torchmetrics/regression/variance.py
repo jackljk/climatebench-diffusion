@@ -66,7 +66,7 @@ class StdDeviation(Metric):
         elif self.source == "target":
             data_to_use = target
         else:
-            raise ValueError("source must be either 'pred' or 'target'")
+            raise ValueError("self.source must be either 'pred' or 'target'. Or use `update_single_argument`.")
         self.update_single_argument(data_to_use)
 
     def update_single_argument(self, data: Tensor) -> None:

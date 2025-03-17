@@ -33,6 +33,7 @@ from src.ace_inference.core.typing_ import Slice
 
 from .utils import as_broadcasted_tensor, infer_horizontal_dimension_names
 
+
 SLICE_NONE = slice(None)
 MOCK_DATA_FREQ = "3h"
 MOCK_DATA_START_DATE = "2003-03"

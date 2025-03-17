@@ -1,25 +1,31 @@
+import datetime
 from typing import Any, Dict, List, Mapping, Optional
 
-import cartopy.crs as ccrs
-import cftime
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import xarray as xr
 from torch import Tensor
 
-import wandb
-from src.evaluation.metrics import root_mean_squared_error
+from src.evaluation.metrics import root_mean_squared_error, spread_skill_ratio, weighted_mean_bias, weighted_mean, \
+    compute_metric_on, weighted_std
 from src.losses.losses import crps_ensemble
-from src.utilities.utils import get_logger
-
+from src.utilities.utils import get_logger, rrearrange
+from src.utilities.plotting import create_wandb_figures
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 
 log = get_logger(__name__)
 
 metric_functions = {
+    "bias": weighted_mean_bias,
+    "bias_member_avg": weighted_mean_bias,
     "rmse": root_mean_squared_error,
-    "crps": crps_ensemble,
     "rmse_member_avg": root_mean_squared_error,
+    "ssr": spread_skill_ratio,
+    "crps": crps_ensemble,
+    "mean_target": compute_metric_on(source="target", metric=weighted_mean),
+    "mean_gen": compute_metric_on(source="gen", metric=weighted_mean),
+    "std_target": compute_metric_on(source="target", metric=weighted_std),
+    "std_gen": compute_metric_on(source="gen", metric=weighted_std),
 }
 
 
@@ -38,6 +44,7 @@ class TemporalMetricsAggregator:
         var_names: Optional[List[str]] = None,
         coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         save_data: bool = False,
+        save_to_wandb: bool = False,
     ):
         """
         Args:
@@ -50,30 +57,24 @@ class TemporalMetricsAggregator:
         self.var_names = var_names
         self.area_weights = None if area_weights is None else area_weights.cpu()
         self.save_data = save_data
+        self.save_to_wandb = save_to_wandb
+        if metrics == "all":
+            metrics = list(metric_functions.keys())
         self.metrics = metrics
-        
 
         # Build dictionarys to store the aggregated data (i.e, when record_batch is called we only get a batch of data, so we need to store it)
         self._aggregated_generated_data = {}
         self._aggregated_target_data = {}
         self._aggregated_generated_data_norm = {}
         self._aggregated_target_data_norm = {}
-        
+
         # log parameters
         self._log_dict = {
-            "date": {"x_axes": {'date': []}},
-        }
-
-        # Some plotting parameters
-        map_transform = ccrs.PlateCarree()
-        self._plot_params = {
-            "pr": {"cmap": "BrBG", "add_colorbar": False, "transform": map_transform},
-            "tas": {"cmap": "inferno", "add_colorbar": False, "transform": map_transform},
-            "crps": {"cmap": "viridis", "transform": map_transform},
-            "error": {"cmap": "coolwarm", "add_colorbar": False, "transform": map_transform},
+            "date": {"x_axes": {"date": []}},
         }
 
         self.coords = coords
+        self._device = None
 
     @torch.inference_mode()
     def update(
@@ -90,7 +91,8 @@ class TemporalMetricsAggregator:
         """
 
         def to_tensor(x):
-            return {k: v.cpu() for k, v in x.items()} if isinstance(x, dict) else x.cpu()
+            return x
+            # return {k: v.cpu() for k, v in x.items()} if isinstance(x, dict) else x.cpu()
 
         _target_data = to_tensor(target_data)
         _gen_data = to_tensor(gen_data)
@@ -101,185 +103,169 @@ class TemporalMetricsAggregator:
         self.var_names = list(_target_data.keys()) if self.var_names is None else self.var_names
 
         # get the size of the data (excluding the batch size)
-        target_shape = _target_data[self.var_names[0]].shape[1:]
-        gen_shape = _gen_data[self.var_names[0]].shape[0:1] + _gen_data[self.var_names[0]].shape[2:]
+        any_var_name = self.var_names[0]
+        any_target = _target_data[any_var_name]
+        target_shape = any_target.shape[1:]
+        gen_shape = _gen_data[any_var_name].shape[0:1] + _gen_data[any_var_name].shape[2:]
+        self._device = any_target.device
 
-        map_datetime_to_temporal_scale = self._get_time_formatting_function()
         for i in range(batch_size):
-            # get idx date
-            date = map_datetime_to_temporal_scale(_metadata["datetime"][i])
+            # get idx date for batch element
+            date = self._time_formatting_function(_metadata["datetime"][i])
 
-            # handle target data
-            target_data_collections = [
-                (self._aggregated_target_data, _target_data),
-                (self._aggregated_target_data_norm, _target_data_norm),
-            ]
-            for agg_dict, target in target_data_collections:
+            data_collections = {
+                "target": (self._aggregated_target_data, _target_data),
+                "target_norm": (self._aggregated_target_data_norm, _target_data_norm),
+                "generated": (self._aggregated_generated_data, _gen_data),
+                "generated_norm": (self._aggregated_generated_data_norm, _gen_data_norm),
+            }
+            for key, (agg_dict, data) in data_collections.items():
                 if date not in agg_dict:
-                    zero_tensor = torch.zeros(target_shape[0], target_shape[1])
-                    agg_dict[date] = {"data": {k: zero_tensor.clone() for k in target.keys()}, "count": 0}
-                for k, v in target.items():
-                    # loop for each output variable - only relevant when using output variables = ['tas', 'pr']
-                    agg_dict[date]["data"][k] += v[i, :, :]
+                    zero_tensor = (
+                        torch.zeros(target_shape[0], target_shape[1], device=self._device)
+                        if "target" in key
+                        else torch.zeros(gen_shape[0], gen_shape[1], gen_shape[2], device=self._device)
+                    )
+                    agg_dict[date] = {
+                        # "data_sum": {k: zero_tensor.clone() for k in data.keys()},
+                        # 'data_sum2': {k: zero_tensor.clone() for k in data.keys()},
+                        "data_mean": {k: zero_tensor.clone() for k in data.keys()},
+                        "data_sum2_difference": {k: zero_tensor.clone() for k in data.keys()},
+                        "count": 0,
+                    }
+
+                # update the count
                 agg_dict[date]["count"] += 1
 
-            # handle generated data
-            gen_data_collections = [
-                (self._aggregated_generated_data, _gen_data),
-                (self._aggregated_generated_data_norm, _gen_data_norm),
-            ]
-            for agg_dict, gen in gen_data_collections:
-                if date not in agg_dict:
-                    zero_tensor = torch.zeros(gen_shape[0], gen_shape[1], gen_shape[2])
-                    agg_dict[date] = {"data": {k: zero_tensor.clone() for k in gen.keys()}, "count": 0}
-                for k, v in gen.items():
+                # calculate mean and variance + sum data for each output variable
+                for k, v in data.items():
                     # loop for each output variable - only relevant when using output variables = ['tas', 'pr']
-                    batch_slice = v[:, i, :, :]
-                    agg_dict[date]["data"][k] += batch_slice
-                agg_dict[date]["count"] += 1
+                    batch_slice = v[i, :, :] if "target" in key else v[:, i, :, :]
+                    # temp to have old methods of calculating mean to compare results with welford's algorithm
+                    # agg_dict[date]["data_sum"][k] += batch_slice
+                    # agg_dict[date]["data_sum2"][k] += batch_slice * batch_slice
+
+                    # perform welford's algorithm to calculate mean and variance
+                    delta = batch_slice - agg_dict[date]["data_mean"][k]  # get delta
+                    agg_dict[date]["data_mean"][k] += delta / agg_dict[date]["count"]  # update mean
+                    delta2 = batch_slice - agg_dict[date]["data_mean"][k]  # get delta2
+                    agg_dict[date]["data_sum2_difference"][k] += delta * delta2  # update sum of squared differences
 
     @torch.inference_mode()
     def compute(self, label: str = "", epoch: int = None):
-
         log.info("Getting logs for temporal metrics(extended validation) --- May take a while")
         # asset data to ensure trustworthy evaluation
-        self._assert_data()
+        # self._assert_data()
 
         # mean the aggregated data
         data_dict = {
-            "generated": self._mean_aggregated_data(self._aggregated_generated_data),
-            "target": self._mean_aggregated_data(self._aggregated_target_data),
+            "generated_mean": {k: v["data_mean"] for k, v in self._aggregated_generated_data.items()},
+            "target_mean": {k: v["data_mean"] for k, v in self._aggregated_target_data.items()},
             # "generated_norm": self._mean_aggregated_data(self._aggregated_generated_data_norm),
             # "target_norm": self._mean_aggregated_data(self._aggregated_target_data_norm),
+            "generated_variance": self._variance_aggregated_data(self._aggregated_generated_data),
+            "target_variance": self._variance_aggregated_data(self._aggregated_target_data),
         }
         # calculate metrics for log
-        dates = list(data_dict["generated"].keys())
+        dates = list(data_dict["generated_mean"].keys())
 
         logs = self._log_dict.copy()
         image_logs = {}
         ssp = label if label else ""
         label = f"extended_{label}/" if label else ""
+        gen_ens_mean = None
         for date in dates:  # loop for each date separating metrics by the date
+            date_as_str = self._timestamp_to_str(date)
             # get date from date
-            gen = data_dict["generated"][date]
-            target = data_dict["target"][date]
+            gen = data_dict["generated_mean"][date]
+            target = data_dict["target_mean"][date]
             if self.is_ensemble:
                 # get ens means
                 gen_ens_mean = {k: v.mean(dim=0) for k, v in gen.items()}
-            
 
             ####
             # TODO: add more metrics?
             ####
             # get the values for the x-axis
-            logs['date']['x_axes']['date'].append(date)
+            logs["date"]["x_axes"]["date"].append(date)
             # get metrics for each date
-            logs['date'][date] = self._get_metrics(target, gen, gen_ens_mean, date, self.var_names, self.metrics)
-            
+            logs["date"][date] = self._get_metrics(
+                target, gen, gen_ens_mean, date, self.var_names, self.metrics, label=label
+            )
 
             image_logs.update(
                 {
                     f"{label}snapshots-{self.temporal_scale}-mean/{key}": val
                     for key, val in self._timeAggSnapshots(
-                        target, gen, gen_ens_mean, date, is_ensemble=self.is_ensemble, ssp=ssp
+                        target, gen, date_as_str, is_ensemble=self.is_ensemble, ssp=ssp
                     ).items()
                 }
             )
-            if self.is_ensemble:
-                image_logs.update(
-                    {
-                        f"{label}snapshots-crps/{key}": val
-                        for key, val in self._crpsSnapshots(target, gen, date, ssp=ssp).items()
-                    }
+
+        # if timescale is yearly save the data to wandb
+        if self.save_to_wandb and self.temporal_scale == "yearly":
+            to_save = ["mean", "variance"]
+            save_to_disk = SaveToDiskAggregator(
+                is_ensemble=self.is_ensemble,
+                final_dims_of_data=["latitude", "longitude"],
+                var_names=self.var_names,
+                max_ensemble_members=None,  # save all ensemble members
+                batch_dim_name="datetime",
+                save_to_wandb=self.save_to_wandb,
+                coords=self.coords,
+            )
+            for key in to_save:
+                # get the dates
+                dates_as_str = [self._timestamp_to_str(date) for date in data_dict[f"target_{key}"].keys()]
+                # call the record_batch method
+                target_tensor = {
+                    var: torch.stack([data_dict[f"target_{key}"][date][var] for date in dates])
+                    for var in self.var_names
+                }
+                gen_tensor = {
+                    var: torch.stack(
+                        [data_dict[f"generated_{key}"][date][var] for date in dates]
+                    )
+                    for var in self.var_names
+                }
+                # fix gen_tensor to have the same shape as what 'save_to_disk' expects
+                gen_tensor = rrearrange(gen_tensor, "date ensem lat lon -> ensem date lat lon")
+                # call the update method
+                save_to_disk.update(
+                    target_data=target_tensor, gen_data=gen_tensor, metadata={"datetime": dates_as_str}
                 )
-        # {
-        #     "date" : {
-        #         "x_axes": ["date"],
-        #         "2015-01": {
-        #             "rmse/tas": 0.1,
-        #             "crps/tas": 0.2,
-        #             "rmse/pr": 0.1,
-        #             "crps/pr": 0.2,
-        #             "date": "2015-01"
-        #         },
-        #         "2015-02": {
-        #             "rmse": 0.1,
-        #             "crps": 0.2,
-        #             "date": "2015-02"
-        #         }
-        #         # etc...
-        #     }
-        # }
+
+                # save the data to wandb
+                save_to_disk.compute(
+                    label=key,
+                )
 
         return {}, image_logs, logs
-    
-    def _get_metrics(self, target, pred, pred_ens_mean, date, vars, metrics):
+
+    def _get_metrics(self, target, pred, pred_ens_mean, date, vars, metrics, label=""):
         computed_metrics = {}
+        weights = self.area_weights.to(self._device)
         for var in vars:
             for metric in metrics:
-                label = metric + '/' + var
+                metric_key = f"{label}/{metric}/{var}".strip("/").replace("//", "/")
                 if "member_avg" in metric:
-                    computed_metrics[label] = np.mean(
-                            [
-                                metric_functions[metric](
-                                    predicted=pred[var][i], truth=target[var], weights=self.area_weights
-                                )
-                                for i in range(pred[var].shape[0])
-                            ]
-                        )
-                elif metric == "crps":
-                    computed_metrics[label] = float(
-                        metric_functions[metric](predicted=pred[var], truth=target[var], weights=self.area_weights)
+                    computed_metrics[metric_key] = np.mean(
+                        [
+                            metric_functions[metric](predicted=pred[var][i], truth=target[var], weights=weights).cpu()
+                            for i in range(pred[var].shape[0])
+                        ]
                     )
-                    continue
                 else:
-                    computed_metrics[label] = float(
-                        metric_functions[metric](
-                            predicted=pred_ens_mean[var], truth=target[var], weights=self.area_weights
-                        )
+                    # Do we use the full ensemble or the mean of the ensemble?
+                    pred_to_use = pred[var] if metric in ["crps", "ssr"] else pred_ens_mean[var]
+                    computed_metrics[metric_key] = float(
+                        metric_functions[metric](predicted=pred_to_use, truth=target[var], weights=weights).cpu()
                     )
-            
         # add date with key 'date' for wandb logging purposes
-        computed_metrics['date'] = date
-         
+        computed_metrics["date"] = date
         return computed_metrics
-            
-        
 
-    def _crpsSnapshots(self, target, gen, date, ssp=''):
-        """
-        For comparing at a Monthly time scale, get a large figure of all 12 months for a given year
-        Args:
-            data_dict: Dictionary with the aggregated data (e.g. self._aggregated_generated_data)
-            year: Year to get the comparison for
-        Returns:
-            fig: figure with all 12 months for the given year
-        """
-        snapshots = {}
-
-        def to_xr_dataarray(data):
-            return xr.DataArray(data, coords=self.coords)
-
-        for var in self.var_names:
-            # Handle CRPS plot
-            fig, axs = plt.subplots(1, 1, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-            fig.suptitle(f"{var} - {date} - CRPS FAIR")
-
-            # Calculate CRPS
-            crps = crps_ensemble(predicted=gen[var], truth=target[var], reduction="none")
-            # then convert to xr dataarray
-            crps = to_xr_dataarray(crps)
-
-            im1 = crps.plot(ax=axs, **self._plot_params["crps"])
-            axs.set_title(f"CRPS {var}")
-
-            # Add coastlines
-            axs.coastlines()
-
-            snapshots[f"image-crps-fair/{date}/{var}"] = wandb.Image(fig)
-        return snapshots
-
-    def _timeAggSnapshots(self, target, gen, gen_ens_mean, date, is_ensemble=True, ssp=''):
+    def _timeAggSnapshots(self, target, gen, date, is_ensemble=True, ssp=""):
         """
         Generate Snapshots of the data aggregated in time
         Args:
@@ -289,139 +275,13 @@ class TemporalMetricsAggregator:
         """
         if not is_ensemble:
             raise NotImplementedError("Only implemented for ensemble data")
-        
+
         ssp = ssp + "-" if ssp else ""
 
         snapshots = {}
-
-        def to_xr_dataarray(data):
-            return {k: xr.DataArray(v, coords=self.coords) for k, v in data.items()}
-
-        def get_random_ensembles(data):
-            # get 2 random ensemble members
-            idxs = np.random.choice(data[self.var_names[0]].shape[0], 2, replace=False)
-            # get ens member and transform to xr dataarray
-            ens_1 = to_xr_dataarray({k: v[idxs[0]] for k, v in data.items()})
-            ens_2 = to_xr_dataarray({k: v[idxs[1]] for k, v in data.items()})
-            return ens_1, ens_2, idxs
-
-        gen_ens_1, gen_ens_2, ens_idxs = get_random_ensembles(gen)
-        target = to_xr_dataarray(target)
-        gen = to_xr_dataarray(gen_ens_mean)
-
         for var in self.var_names:
-            # Handle Precipitation unique case
-            if var == "pr":
-                # get log version to make more visible
-                target_log = np.log(target[var] + 1)
-                gen_log = np.log(gen[var] + 1)
-                gen_ens_1_log = np.log(gen_ens_1[var] + 1)
-                gen_ens_2_log = np.log(gen_ens_2[var] + 1)
-
-                fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-                fig.suptitle(f"{var}image full field - {var} - log - {date}")
-
-                # First row - target and generated mean
-                vmin = min(np.min(target_log), np.min(gen_log), np.min(gen_ens_1_log), np.min(gen_ens_2_log))
-                vmax = max(np.max(target_log), np.max(gen_log), np.max(gen_ens_1_log), np.max(gen_ens_2_log))
-                im1 = target_log.plot(ax=axs[0, 0], vmin=vmin, vmax=vmax, **self._plot_params[var])
-                axs[0, 0].set_title("Target")
-                im2 = gen_log.plot(ax=axs[0, 1], vmin=vmin, vmax=vmax, **self._plot_params[var])
-                axs[0, 1].set_title("Generated - Mean")
-
-                # Second row - sampled ensembles
-                im3 = gen_ens_1_log.plot(ax=axs[1, 0], vmin=vmin, vmax=vmax, **self._plot_params[var])
-                axs[1, 0].set_title(f"Genrated - Ensemble {ens_idxs[0]}")
-                im4 = gen_ens_2.plot(ax=axs[1, 1], vmin=vmin, vmax=vmax, **self._plot_params[var])
-                axs[1, 1].set_title(f"Generated - Ensemble {ens_idxs[1]}")
-
-                # create cbar
-                cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", pad=0.05)
-
-                # Add coastlines
-                for ax in axs:
-                    ax.coastlines()
-
-                snapshots[f"image-full-field-log/{date}/{var}"] = wandb.Image(fig)
-
-                # Handle Error plot
-                fig, axs = plt.subplots(1, 3, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-                fig.suptitle(f"{var}Error - {var} - log - {date}")
-
-                # Calculate error
-                error = gen_log - target_log
-                error_gen_ens_1 = gen_ens_1_log - target_log
-                error_gen_ens_2 = gen_ens_2_log - target_log
-                vmin = min(np.min(error), np.min(error_gen_ens_1), np.min(error_gen_ens_2))
-                vmax = max(np.max(error), np.max(error_gen_ens_1), np.max(error_gen_ens_2))
-                im1 = error.plot(ax=axs[0], mvin=vmin, vmax=vmax, **self._plot_params["error"])
-                axs[0].set_title("Error - Generated Mean")
-                im2 = error_gen_ens_1.plot(ax=axs[1], mvin=vmin, vmax=vmax, **self._plot_params["error"])
-                axs[1].set_title(f"Error - Generated Ensemble {ens_idxs[0]}")
-                im3 = error_gen_ens_2.plot(ax=axs[2], mvin=vmin, vmax=vmax, **self._plot_params["error"])
-                axs[2].set_title(f"Error - Generated Ensemble {ens_idxs[1]}")
-
-                # create cbar
-                cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", pad=0.05)
-
-                # Add coastlines
-                for ax in axs:
-                    ax.coastlines()
-
-                snapshots[f"image-error-log/{date}/{var}"] = wandb.Image(fig)
-
-            # Handle General plot
-            fig, axs = plt.subplots(2, 2, figsize=(12, 6), subplot_kw={"projection": ccrs.PlateCarree()})
-            fig.suptitle(f"{var}Full Field {var} - {date}")
-
-            # First row Target and Generated Mean
-            vmin = min(np.min(target[var]), np.min(gen[var]), np.min(gen_ens_1[var]), np.min(gen_ens_2[var]))
-            vmax = max(np.max(target[var]), np.max(gen[var]), np.max(gen_ens_1[var]), np.max(gen_ens_2[var]))
-            im1 = target[var].plot(ax=axs[0, 0], vmin=vmin, vmax=vmax, **self._plot_params[var])
-            axs[0, 0].set_title("Target")
-            im2 = gen[var].plot(ax=axs[0, 1], vmin=vmin, vmax=vmax, **self._plot_params[var])
-            axs[0, 1].set_title("Generated - Mean")
-
-            # Second row - Sampled Ensembles
-            im3 = gen_ens_1[var].plot(ax=axs[1, 0], vmin=vmin, vmax=vmax, **self._plot_params[var])
-            axs[1, 0].set_title(f"Generated - Ensemble {ens_idxs[0]}")
-            im4 = gen_ens_2[var].plot(ax=axs[1, 1], vmin=vmin, vmax=vmax, **self._plot_params[var])
-            axs[1, 1].set_title(f"Generated - Ensemble {ens_idxs[1]}")
-
-            # create cbar
-            cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", pad=0.05)
-
-            # Add coastlines
-            for ax in axs.flat:
-                ax.coastlines()
-
-            snapshots[f"image-full-field/{date}/{var}"] = wandb.Image(fig)
-
-            # Handle Error plot
-            fig, axs = plt.subplots(1, 3, figsize=(16, 4), subplot_kw={"projection": ccrs.PlateCarree()})
-            fig.suptitle(f"{var}Error {var} - {date}")
-
-            # Calculate error
-            error = gen[var] - target[var]
-            error_gen_ens_1 = gen_ens_1[var] - target[var]
-            error_gen_ens_2 = gen_ens_2[var] - target[var]
-            vmin = min(np.min(error), np.min(error_gen_ens_1), np.min(error_gen_ens_2))
-            vmax = max(np.max(error), np.max(error_gen_ens_1), np.max(error_gen_ens_2))
-            im1 = error.plot(ax=axs[0], vmin=vmin, vmax=vmax, **self._plot_params["error"])
-            axs[0].set_title("Error - Generated Mean")
-            im2 = error_gen_ens_1.plot(ax=axs[1], vmin=vmin, vmax=vmax, **self._plot_params["error"])
-            axs[1].set_title(f"Error - Generated Ensemble {ens_idxs[0]}")
-            im3 = error_gen_ens_2.plot(ax=axs[2], vmin=vmin, vmax=vmax, **self._plot_params["error"])
-            axs[2].set_title(f"Error - Generated Ensemble {ens_idxs[1]}")
-
-            # create cbar
-            cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), orientation="vertical", pad=0.05)
-
-            # Add coastlines
-            for ax in axs.flat:
-                ax.coastlines()
-
-            snapshots[f"image-error/{date}/{var}"] = wandb.Image(fig)
+            snapshots_var = create_wandb_figures(target, gen, var, date, self.coords)
+            snapshots.update(snapshots_var)
 
         return snapshots
 
@@ -437,8 +297,31 @@ class TemporalMetricsAggregator:
         meaned_data = {}
         for date, agg_data in data_dict.items():
             count = agg_data["count"]
-            meaned_data[date] = {k: v / count for k, v in agg_data["data"].items()}
+            meaned_data[date] = {k: v / count for k, v in agg_data["data_sum"].items()}
         return meaned_data
+
+    def _variance_aggregated_data(self, data_dict):
+        """
+        Variance the aggregated data dictionary
+
+        Args:
+            data_dict: Dictionary with the aggregated data (e.g. self._aggregated_generated_data)
+        Returns:
+            Dictionary with the aggregated data variance (Keys: Dates, Values: Variance of the data)
+        """
+        variance_data = {}
+        for date, agg_data in data_dict.items():
+            count = agg_data["count"]
+
+            # loop for each output variable
+            for var in self.var_names:
+                # calculate the variance using welford's algorithm
+                variance_welford = agg_data["data_sum2_difference"][var] / count
+
+                # add to the variance data with the var key
+                variance_data.setdefault(date, {})[var] = variance_welford
+
+        return variance_data
 
     def _assert_data(self):
         # assert dates in generated and target data are the same
@@ -472,26 +355,31 @@ class TemporalMetricsAggregator:
         else:
             raise ValueError(f"Temporal scale {self.temporal_scale} is not supported!")
 
-    def _get_time_formatting_function(self):
+    def _time_formatting_function(self, datetime_obj):
         """
         Helper function to get the function to format datetime object to the desired temporal scale
             returns - Function
         """
+        # We use day 15 for monthly and yearly data to ensure the datetime object is in the middle of the month/year
+        if self.temporal_scale == "yearly":
+            datetime_obj = datetime.datetime(int(datetime_obj.split("-")[0]), 6, 15)
+            # datetime_obj = cftime.DatetimeNoLeap(int(datetime_obj.split("-")[0]), 6, 15)
+        elif self.temporal_scale == "monthly":
+            datetime_obj = datetime.datetime(*[int(i) for i in datetime_obj.split("-")[:2] + ["15"]])
+            # datetime_obj = cftime.DatetimeNoLeap(*[int(i) for i in datetime_obj.split("-")[:2] + ["15"]])
+        else:
+            raise ValueError(f"Temporal scale {self.temporal_scale} is not supported!")
 
-        def getMonthly(datetime_obj):
-            "Get YYYY-MM from datetime object"
-            # convert string to cftime object
-            datetime_obj = cftime.DatetimeNoLeap(*[int(i) for i in datetime_obj.split("-")])
-            return datetime_obj.strftime("%Y-%m")
+        # datetime_obj = datetime.datetime(datetime_obj.year, datetime_obj.month, datetime_obj.day)
+        # Map to timestamp for visualization on Weights&Biases with corresponding datetime format
+        datetime_obj = datetime_obj.timestamp()
+        return datetime_obj
 
-        def getYearly(datetime_obj):
-            "Get YYYY from datetime object"
-            datetime_obj = cftime.DatetimeNoLeap(*[int(i) for i in datetime_obj.split("-")])
+    def _timestamp_to_str(self, timestamp):
+        datetime_obj = datetime.datetime.fromtimestamp(timestamp)
+        if self.temporal_scale == "yearly":
             return datetime_obj.strftime("%Y")
-
-        if self.temporal_scale == "monthly":
-            return getMonthly
-        elif self.temporal_scale == "yearly":
-            return getYearly
+        elif self.temporal_scale == "monthly":
+            return datetime_obj.strftime("%Y-%m")
         else:
             raise ValueError(f"Temporal scale {self.temporal_scale} is not supported!")

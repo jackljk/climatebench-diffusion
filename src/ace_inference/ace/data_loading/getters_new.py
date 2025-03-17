@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Optional, Union
+from typing import Optional, Union
 
 import torch.utils.data
 from torch.utils.data.distributed import DistributedSampler
@@ -9,7 +9,7 @@ from src.ace_inference.ace.data_loading.batch_data import BatchData
 from src.ace_inference.ace.requirements import PrognosticStateDataRequirements
 from src.ace_inference.core.dataset.getters import get_dataset
 from src.ace_inference.core.dataset.requirements import DataRequirements
-from src.ace_inference.core.dataset.xarray import XarrayDataset, XarrayDatasetSalva
+from src.ace_inference.core.dataset.xarray import XarrayDataset
 from src.ace_inference.core.device import using_gpu
 from src.ace_inference.core.distributed import Distributed
 
@@ -21,6 +21,7 @@ from .inference import (
     InferenceDataLoaderConfig,
     InferenceDataset,
 )
+
 
 logger = logging.getLogger(__name__)
 

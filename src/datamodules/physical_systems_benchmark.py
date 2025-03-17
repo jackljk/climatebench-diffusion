@@ -9,12 +9,12 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 from einops import rearrange
-from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from torch import Tensor
 
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.datamodules.datasets.physical_systems_benchmark import TrajectoryDataset
 from src.datamodules.torch_datasets import MyTensorDataset
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.evaluation.aggregators.main import OneStepAggregator
 from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.utilities.utils import (

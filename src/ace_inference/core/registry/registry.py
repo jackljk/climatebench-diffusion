@@ -2,6 +2,7 @@ from typing import Any, Callable, Dict, Generic, Mapping, Optional, Type, TypeVa
 
 import dacite
 
+
 T = TypeVar("T")
 TT = TypeVar("TT", bound=Type)
 

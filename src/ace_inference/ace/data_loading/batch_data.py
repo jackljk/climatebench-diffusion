@@ -34,6 +34,7 @@ from src.ace_inference.core.generics.data import DataLoader, GriddedDataABC, Inf
 from src.ace_inference.core.gridded_ops import GriddedOperations
 from src.ace_inference.core.typing_ import TensorDict, TensorMapping
 
+
 SelfType = TypeVar("SelfType", bound="BatchData")
 
 

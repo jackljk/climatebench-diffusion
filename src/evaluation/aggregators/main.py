@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union, List
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-from src.evaluation.torchmetrics import Metric
+from torch.nn import Module
 
 from src.evaluation.aggregators._abstract_aggregator import AbstractAggregator, _Aggregator
 from src.evaluation.aggregators.snapshot import SnapshotAggregator
 from src.evaluation.aggregators.spectra import SpectraAggregator
 from src.evaluation.aggregators.temporal_metrics import TemporalMetricsAggregator
 from src.evaluation.aggregators.timestepwise import MetricAggregator
+from src.evaluation.torchmetrics import Metric
 from src.utilities.utils import get_logger
-from torch.nn import Module
+
 
 log = get_logger(__name__)
 
@@ -200,6 +201,7 @@ class OneStepAggregator(AbstractAggregator):
                 var_names=snapshot_var_names,
                 metrics=temporal_kwargs.metrics,
                 temporal_scale=temporal_kwargs.temporal_scale,
+                save_to_wandb=temporal_kwargs.save_to_wandb,
                 coords=coords,
             )
 

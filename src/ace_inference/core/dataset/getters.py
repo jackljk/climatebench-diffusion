@@ -1,14 +1,12 @@
 import os
 import warnings
-from typing import Callable, List, Optional, Sequence, Tuple, Type, Union
+from typing import List, Optional, Sequence, Tuple, Type
 
 import torch.utils.data
 
 from src.ace_inference.core.dataset.config import XarrayDataConfig
 from src.ace_inference.core.dataset.xarray import (
     DatasetProperties,
-    XarrayDataset,
-    XarrayDatasetSalva,
     get_xarray_dataset,
 )
 

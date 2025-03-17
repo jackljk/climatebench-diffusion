@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
-from dask.distributed import Client, LocalCluster
 import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
 import xbatcher
+from dask.distributed import Client, LocalCluster
 from torch import multiprocessing
 from tqdm.auto import tqdm
 
@@ -31,9 +31,10 @@ from src.utilities.utils import (
     get_logger,
     raise_error_if_invalid_type,
     raise_error_if_invalid_value,
-    to_torch_and_device,
     subsample_preselected_indices,
+    to_torch_and_device,
 )
+
 
 log = get_logger(__name__)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -206,7 +207,6 @@ class ERA5DataModuleBase(BaseDataModule):
 
         # Infer hourly resolution of dataset
         if "-6h-" in dataset:
-            hourly_resolution_dataset = 6
             if hourly_resolution == 6:
                 hourly_resolution = 1
             else:

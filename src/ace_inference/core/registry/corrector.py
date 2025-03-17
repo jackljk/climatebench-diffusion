@@ -10,6 +10,7 @@ from src.ace_inference.core.gridded_ops import GriddedOperations
 
 from .registry import Registry
 
+
 CT = TypeVar("CT", bound=Type[CorrectorConfigProtocol])
 
 

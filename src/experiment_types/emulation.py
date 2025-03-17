@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List
+import time
+from typing import Any, Dict, List
 
 import torch
-from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from torch import Tensor
 
+from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.experiment_types._base_experiment import BaseExperiment
 from src.utilities.utils import (
     rrearrange,
@@ -57,6 +58,7 @@ class EmulationExperiment(BaseExperiment):
         return_outputs: bool | str = None,
         aggregators: Dict[str, _Aggregator] = None,
     ):
+        start_time = time.time()
         return_dict = dict()
         return_outputs = return_outputs or self.hparams.return_outputs_at_evaluation
 
@@ -72,7 +74,7 @@ class EmulationExperiment(BaseExperiment):
         # Get predictions
         targets = self.get_target_variants(raw_targets, is_normalized=False)
         inputs = self.transform_inputs(batch.pop("inputs"), split=split, ensemble=True)
-        results = self.predict(inputs, **batch)
+        results, time_pred = self.time_it(self.predict, inputs, **batch)  # self.predict(inputs, **batch)
 
         # Return outputs and log metrics
         targets_raw, targets_normed = targets.pop("targets"), targets.pop("targets_normed")
@@ -89,16 +91,21 @@ class EmulationExperiment(BaseExperiment):
             return_dict.update({k: torch_to_numpy(v) for k, v in results.items()})
 
         # Compute metrics
+        start_time_agg = time.time()
         for agg_name, agg in aggregators.items():
             if agg_name == "diffusion_loss":
                 continue  # already logged above
-            agg.update(
+            _, time_agg = self.time_it(
+                agg.update,
                 target_data=targets_raw,
                 gen_data=preds_raw,
                 target_data_norm=targets_normed,
                 gen_data_norm=preds_normed,
                 metadata=metadata,
             )
+        duration_agg = time.time() - start_time_agg
+        duration_total = time.time() - start_time
+        self.log_text.debug(f"Durations: total={duration_total:.2f}s, aggs={duration_agg:.2f}s, pred={time_pred:.2f}s")
         return return_dict
 
     def transform_inputs(self, inputs: Tensor, ensemble: bool, **kwargs) -> Tensor:

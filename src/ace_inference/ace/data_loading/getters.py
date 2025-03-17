@@ -11,9 +11,9 @@ from src.ace_inference.core.device import using_gpu
 from src.ace_inference.core.distributed import Distributed
 
 from ._xarray_old import XarrayDataset
+from .config import DataLoaderConfig, XarrayDataConfig
 from .data_typing import Dataset, GriddedData
 from .inference import InferenceDataLoaderConfig, InferenceDataset
-from .config import DataLoaderConfig, XarrayDataConfig
 from .requirements import DataRequirements
 from .utils import BatchData
 

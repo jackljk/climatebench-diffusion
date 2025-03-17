@@ -1,0 +1,32 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=era5_dyffusion_markov
+
+defaults:
+  - era5_genie_ar_global.yaml
+  - override /module: forecasting_multi_horizon_dyffusion_markov.yaml
+  - override /model: adm.yaml
+  - override /diffusion: dyffusion_markov.yaml
+  - _self_
+
+name: "${datamodule.hourly_resolution}h-${datamodule.horizon}AR-DYMarkov"
+
+model:
+  with_time_emb: True
+
+module:
+  enable_inference_dropout: False
+
+datamodule:
+  horizon: 6
+  hourly_resolution: 6
+
+diffusion:
+  forward_conditioning: "none"
+  interpolator_run_id: "36714280"  # IpolMarkov-6h-6T_Attn23_ADM_EMA_192x1-2-3-4d_WMSE_54lr_LC5:200_15Dr_14wd_LV-pCH_11seed_21h49mMar09_36714280
+  interpolator_wandb_ckpt_filename: "latest_epoch"
+  interpolator_use_ema: True
+  use_cold_sampling_for_intermediate_steps: False
+  use_cold_sampling_for_last_step: False
+  loss_function: "wmse"

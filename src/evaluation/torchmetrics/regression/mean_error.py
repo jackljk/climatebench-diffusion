@@ -21,7 +21,9 @@ from src.evaluation.torchmetrics.functional.regression.mean_error import _mean_e
 from src.evaluation.torchmetrics.metric import Metric
 from src.evaluation.torchmetrics.utilities.imports import _MATPLOTLIB_AVAILABLE
 from src.evaluation.torchmetrics.utilities.plot import _AX_TYPE, _PLOT_OUT_TYPE
+from src.utilities.utils import get_logger
 
+log = get_logger(__name__)
 
 if not _MATPLOTLIB_AVAILABLE:
     __doctest_skip__ = ["MeanAbsoluteError.plot"]
@@ -69,12 +71,14 @@ class MeanError(Metric):
     def update(self, preds: Tensor, target: Tensor) -> None:
         """Update state with predictions and targets."""
         sum_error, num_obs = _mean_error_update(preds, target, flatten=self.weights is None)
-
         self.sum_error = sum_error if self.total == 0 else self.sum_error + sum_error
         self.total += num_obs
 
     def compute(self) -> Tensor:
         """Compute mean absolute error over state."""
+        if self.total == 0:
+            log.warning(f"Did not record any data. Returning {tensor(0.0)}. Is this expected?")
+            return tensor(0.0)
         sum_error = self.sum_error
         if self.weights is not None:
             sum_error = weighted_mean(sum_error, weights=self.weights)

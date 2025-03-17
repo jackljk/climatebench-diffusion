@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
+from src.evaluation.aggregators.time_mean import TimeMeanAggregator
 from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
@@ -234,10 +235,9 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         sim_val_Y = self.hparams.sim_validation["Y"]
 
         # Handle the val inputs set
-        if hasattr(self.hparams.comprehensive_validation, "val_years"):
+        if self.hparams.comprehensive_validation.val_years is not None:
             val_time_slice = slice(
-                self.hparams.comprehensive_validation.val_years[0],
-                self.hparams.comprehensive_validation.val_years[1]
+                self.hparams.comprehensive_validation.val_years[0], self.hparams.comprehensive_validation.val_years[1]
             )
             log.info(f"Only using the time period {val_time_slice} for validation")
             X_val = X_train[sim_val_X].sel(time=val_time_slice)
@@ -286,6 +286,19 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         """
         Setup Helper for test set (Does both getting and normalizing the test set)
         """
+        if self.hparams.comprehensive_validation.test_years is not None:
+            test_time_slice = slice(
+                self.hparams.comprehensive_validation.test_years[0], self.hparams.comprehensive_validation.test_years[1]
+            )
+            log.info(f"Only using the time period {test_time_slice} for testing")
+            new_X_test, new_Y_test = dict(), dict()
+            for k, ds in X_test.items():
+                new_X_test[k] = ds.sel(time=test_time_slice)
+                test_start_date = self._get_validation_start_date(new_X_test[k].time[0].item())
+                test_end_date = self._get_validation_end_date(new_X_test[k].time[-1].item())
+                new_Y_test[k] = Y_test[k].sel(time=slice(test_start_date, test_end_date))
+            X_test, Y_test = new_X_test, new_Y_test
+
         # Normalize the test set
         X_test = {k: normalize_data(x, self.var_to_meanstd) for k, x in X_test.items()}
         # Squeeze nbnd dim
@@ -360,7 +373,6 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
     def _get_validation_end_date(self, end_year: int) -> cftime.DatetimeNoLeap:
         return cftime.DatetimeNoLeap(end_year, 12, 31)
 
-
     def get_epoch_aggregators(
         self,
         split: str,
@@ -379,13 +391,12 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             "latitude": split_ds.ds_outputs[first_key].latitude,
             "longitude": split_ds.ds_outputs[first_key].longitude,
         }
-        
+
         if split == "val" and isinstance(split_ds, list):
             split_ds = split_ds[0]  # just need it for the area weights
-            
 
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
-        aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
+        aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble, coords=coords)
         aggregators = dict()
 
         aggregator = OneStepAggregator(
@@ -395,24 +406,26 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
             snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
             temporal_kwargs=self.hparams.comprehensive_validation,
-            coords=coords,
             **aggr_kwargs,
         )
         aggregators[""] = aggregator
-        
-        if self.hparams.comprehensive_validation.run and self.hparams.comprehensive_validation.save_to_disk:
-            save_to_disk_aggregator = SaveToDiskAggregator(
-                is_ensemble=is_ensemble,
-                final_dims_of_data=["latitude", "longitude"],
-                save_to_path=save_to_path,
-                max_ensemble_members=None, # save all ensemble members
-                batch_dim_name='datetime',
-                coords=coords,
+
+        if self.hparams.comprehensive_validation.run:
+            # Logs metrics on the mean over time
+            aggregators["time_mean"] = TimeMeanAggregator(
+                **aggr_kwargs, log_images=True, mean_over_batch_dim=True, name="time_mean"
             )
-            aggregators["save_to_disk"] = save_to_disk_aggregator
-    
-    
-        
+            if self.hparams.comprehensive_validation.save_to_disk:
+                save_to_disk_aggregator = SaveToDiskAggregator(
+                    is_ensemble=is_ensemble,
+                    final_dims_of_data=["latitude", "longitude"],
+                    save_to_path=save_to_path,
+                    max_ensemble_members=None,  # save all ensemble members
+                    batch_dim_name="datetime",
+                    coords=coords,
+                )
+                aggregators["save_to_disk"] = save_to_disk_aggregator
+
         return aggregators
 
 

@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import hydra
 import torch
-from src.ace_inference.core.typing_ import Slice
 from tensordict import TensorDict
 from torch import Tensor
 
@@ -15,6 +14,7 @@ from src.ace_inference.core.dataset.getters import get_dataset
 from src.ace_inference.core.dataset.requirements import DataRequirements
 from src.ace_inference.core.dataset.xarray import XarrayDatasetSalva
 from src.ace_inference.core.prescriber import Prescriber
+from src.ace_inference.core.typing_ import Slice
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
 from src.evaluation.aggregators.time_mean import TimeMeanAggregator

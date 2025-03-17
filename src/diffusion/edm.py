@@ -236,10 +236,9 @@ class EDMPrecond(BaseDiffusion):
         # if len(targets.shape) == 5:  # (B, T, C, H, W)
         #     targets = targets.squeeze(1)  # (B, C, H, W)
         if self.hparams.noise_distribution == "uniform":
-            # Sample noise levels uniformly from a discretization of the noise level range into 2000 steps.
-            sigmas = self.edm_discretization(steps=2000, sigma_min=self.sigma_min_train, sigma_max=self.sigma_max)
-            # Randomly sample noise levels from the discretization.
-            sigmas = sigmas[torch.randint(0, 2000, (inputs.shape[0],), device=inputs.device)]
+            # Sample noise levels by uniformly steps from 0 to 1 (sigma_min to sigma_max).
+            steps = torch.rand(inputs.shape[0], device=inputs.device)
+            sigmas = self.edm_discretization(steps=steps, sigma_min=self.sigma_min_train, sigma_max=self.sigma_max)
             kwargs["sigma"] = sigmas
 
         loss = self.criterion["preds"](self, images=targets, condition=inputs, **kwargs)

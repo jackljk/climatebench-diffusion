@@ -9,7 +9,6 @@ import pytorch_lightning as pl
 import torch
 import xarray as xr
 from omegaconf import DictConfig
-from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from tensordict import TensorDict
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset

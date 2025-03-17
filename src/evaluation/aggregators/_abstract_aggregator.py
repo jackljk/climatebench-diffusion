@@ -4,9 +4,9 @@ from abc import abstractmethod
 from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 import torch
-from src.evaluation.torchmetrics import Metric
 from tensordict import TensorDictBase
 
+from src.evaluation.torchmetrics import Metric
 from src.utilities.utils import ellipsis_torch_dict_boolean_tensor, get_logger, to_tensordict
 
 

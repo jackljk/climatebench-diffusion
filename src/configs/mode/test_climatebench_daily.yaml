@@ -1,0 +1,24 @@
+# @package _global_
+
+# example usage:
+# `python run.py mode=test_navier_stokes logger.wandb.id=SOME_WANDB_ID`
+
+defaults:
+  - test.yaml
+  - _self_
+
+datamodule:
+  comprehensive_validation:
+    run: True
+    save_to_disk: False
+    metrics: "all"  #["rmse", "rmse_member_avg", "crps", "ssr"]
+    temporal_scale: "yearly"
+
+logger:
+  wandb:
+    project: "ClimateBench"  # project in wandb of training runs
+    project_test: "ClimateBench-Eval"  # overrides logger.wandb.project (allows to use different project for test metrics)
+
+
+# Checkpoint path to be loaded from wandb cloud (see files tab of run page) or locally (use absolute path)
+ckpt_path: "latest_epoch"  # "last.ckpt" or "latest_epoch" or "earliest_epoch" or "path/to/checkpoint.ckpt"

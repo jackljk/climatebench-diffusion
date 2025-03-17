@@ -376,18 +376,73 @@ def load_hydra_config_from_wandb(
     # if not hydra_config_file.endswith("hydra_config.yaml"):
     #     log.info(f" Reloading from hydra config file: {hydra_config_file}")
 
+    # Check if we're in distributed mode
+    is_distributed = False
+    try:
+        import torch.distributed as dist
+        is_distributed = dist.is_initialized()
+    except ImportError:
+        pass
     # Download from wandb cloud
+    # First, try to use a barrier to synchronize processes
+    synchronized = False
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.barrier()
+            synchronized = True
+    except (ImportError, Exception):
+        pass
+        
     if is_local or (os.path.exists(hydra_config_file) and rank not in ["0", 0]):
         log.info(f"Loading local hydra config file: {hydra_config_file}")
     else:
-        log.info(f"[rank: {rank}] Downloading hydra config file: {hydra_config_file}")
-        wandb_restore_kwargs = dict(run_path=run_path, replace=True, root=os.getcwd())
+        # In DDP mode, only allow rank 0 to download, other ranks wait
+        download_file = rank in ["0", 0] or not synchronized
+        local_file_path = None
+        
+        if download_file:
+            log.info(f"[rank: {rank}] Downloading hydra config file: {hydra_config_file}")
+            wandb_restore_kwargs = dict(run_path=run_path, replace=True, root=os.getcwd())
+            try:
+                local_file = wandb.restore(hydra_config_file, **wandb_restore_kwargs)
+                local_file_path = local_file.name
+            except Exception as e:
+                log.warning(f"[rank: {rank}] Error when restoring hydra config file: {e}")
+                try:
+                    local_file = wandb.restore(hydra_config_file, run_path=run_path, replace=True)
+                    local_file_path = local_file.name
+                except Exception as e2:
+                    log.error(f"[rank: {rank}] Second error when restoring hydra config file: {e2}")
+                    
+            if local_file_path is not None:
+                hydra_config_file = local_file_path
+        
+    # Wait for rank 0 to download the file
+    if synchronized:
         try:
-            wandb.restore(hydra_config_file, **wandb_restore_kwargs)
-        except Exception as e:
-            # Errors sometimes occur in distributed multi-node training
-            log.warning(f"[rank: {rank}] Error when restoring hydra config file: {e}")
-            hydra_config_file = wandb.restore(hydra_config_file, run_path=run_path, replace=True).name
+            dist.barrier()
+        except Exception:
+            pass
+            
+        # If we're not rank 0 and using DDP, copy the file path from rank 0
+        if rank not in ["0", 0] and not os.path.exists(hydra_config_file):
+            # The path should be the same for all processes in the same node
+            # Wait a bit for file system to catch up
+            import time
+            max_retries = 5
+            for retry in range(max_retries):
+                if os.path.exists(hydra_config_file):
+                    break
+                log.info(f"[rank: {rank}] Waiting for file {hydra_config_file} to appear (attempt {retry+1}/{max_retries})")
+                time.sleep(1)
+        
+    assert os.path.exists(hydra_config_file), f"[{rank=}] Could not find {hydra_config_file=}"
+
+    try:
+        config = OmegaConf.load(hydra_config_file)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"[rank: {rank}] Could not find {hydra_config_file=}") from e
 
     # remove overrides of the form k=v, where k has no dot in it. We don't support this.
     overrides = [o for o in overrides if "=" in o and "." in o.split("=")[0]]
@@ -402,17 +457,6 @@ def load_hydra_config_from_wandb(
         f"logger.wandb.tags={run.tags}",
         f"logger.wandb.group={run.group}",
     ]
-    # Set barrier for multi-node training
-    try:
-        import torch.distributed as dist
-
-        dist.barrier()
-    except Exception:
-        pass
-    try:
-        config = OmegaConf.load(hydra_config_file)
-    except FileNotFoundError as e:
-        raise FileNotFoundError(f"[rank: {rank}] Could not find {hydra_config_file=}") from e
     overrides = OmegaConf.from_dotlist(overrides)
     config = OmegaConf.unsafe_merge(config, overrides)
 
@@ -425,21 +469,39 @@ def load_hydra_config_from_wandb(
         config = OmegaConf.unsafe_merge(config, override_config)  # unsafe_merge since override_config is not needed
 
     if not is_local:
-        # Remove hydra_config file from cloud. We use FileNotFound exception for multi-node training
-        try:
-            os.remove(hydra_config_file) if os.path.exists(hydra_config_file) else None
-        except FileNotFoundError:
-            pass
-        try:
-            os.remove(f"../../{hydra_config_file}") if os.path.exists(f"../../{hydra_config_file}") else None
-        except FileNotFoundError:
-            pass
+        # Ensure all processes have loaded the config before removing the file
+        if is_distributed:
+            try:
+                dist.barrier()
+
+                # Only rank 0 should remove the file to avoid race conditions
+                if rank in ["0", 0]:
+                    for path in [hydra_config_file, f"../../{hydra_config_file}"]:
+                        if os.path.exists(path):
+                            try:
+                                os.remove(path)
+                                log.debug(f"[rank: {rank}] Removed file: {path}")
+                            except (FileNotFoundError, PermissionError) as e:
+                                log.debug(f"[rank: {rank}] Could not remove {path}: {e}")
+
+                # Wait for rank 0 to finish cleanup before continuing
+                dist.barrier()
+            except Exception as e:
+                log.debug(f"[rank: {rank}] Error during distributed file cleanup: {e}")
+        else:
+            # Not in distributed mode, just remove the files
+            for path in [hydra_config_file, f"../../{hydra_config_file}"]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except (FileNotFoundError, PermissionError):
+                        pass
 
     if run.id != config.logger.wandb.id and run.id in config.logger.wandb.name:
         config.logger.wandb.id = run.id
     assert str(config.logger.wandb.id) == str(
         run.id
-    ), f"{config.logger.wandb.id=} != {run.id=}. \nFull Hydra config: {config}"
+    ), f"{config.logger.wandb.id=} != {run.id=}. {is_local=} \nFull Hydra config: {config}"
     if update_config_in_cloud:
         with open("hydra_config.yaml", "w") as fp:
             OmegaConf.save(config, f=fp.name, resolve=True)
@@ -475,12 +537,14 @@ def get_existing_wandb_group_runs(
     config: DictConfig, ckpt_must_exist: bool = False, **kwargs
 ) -> List[wandb.apis.public.Run]:
     if config.get("logger", None) is None or config.logger.get("wandb", None) is None:
+        log.warning("No logger.wandb config found in config. Without it, it's not possible to find existing runs..")
         return []
     wandb_cfg = config.logger.wandb
     runs_in_group = get_runs_for_filter(entity=wandb_cfg.entity, project=wandb_cfg.project, group=wandb_cfg.group)
     try:
         _ = len(runs_in_group)
-    except (ValueError, TypeError):  # happens if project does not exist or empty
+    except (ValueError, TypeError) as e:  # happens if project does not exist or empty
+        log.warning(f"Error when loading runs for {wandb_cfg=}: {e}")
         return []
     if ckpt_must_exist:
         local_dir = config.ckpt_dir

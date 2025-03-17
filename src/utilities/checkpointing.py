@@ -348,6 +348,11 @@ def get_local_ckpt_path(
     ]
     if os.environ.get("PSCRATCH", None) is not None:
         potential_dirs.append(os.path.join(os.environ["PSCRATCH"], "genie/output", wandb_run.id, "checkpoints"))
+        for script_dir in ["ns", "sm"]:
+            potential_dirs.append(
+                os.path.join(os.environ["PSCRATCH"], "results", script_dir, "checkpoints", wandb_run.id)
+            )
+
     for callback_k in config.get("callbacks", {}).keys():
         if "checkpoint" in callback_k and config.callbacks[callback_k] is not None:
             if config.callbacks[callback_k].get("dirpath", None) is not None:
@@ -403,6 +408,9 @@ def get_local_ckpt_path(
                 if "_any" in ckpt_filename:
                     filename = filename.replace("epochepoch=", "epoch")  # Fix for a bug in the filename
                 match = re.search(r"_epoch(\d+)_", filename)
+                if match is None:
+                    log.warning(f"Could not find epoch number in {filename=}. Skipping this file.")
+                    return -1
                 return int(match.group(1))
 
             # Find the ckpt file with the earliest epoch
@@ -417,7 +425,7 @@ def get_local_ckpt_path(
         else:
             log.warning(f"{local_dir} exists but could not find {ckpt_filename=}. Files in dir: {ckpt_files}.")
     if ckpt_filename in ["earliest_epoch", "latest_epoch", "earliest_epoch_any", "latest_epoch_any"]:
-        raise NotImplementedError("Not implemented")
+        raise NotImplementedError(f"Could not find {ckpt_filename=} in any of the potential dirs: {potential_dirs}")
     if throw_error_if_local_not_found:
         raise FileNotFoundError(
             f"Could not find ckpt file {ckpt_filename} in any of the potential dirs: {potential_dirs}"

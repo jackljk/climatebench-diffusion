@@ -20,6 +20,7 @@ from src.ace_inference.core.coordinates import (
 )
 from src.ace_inference.core.device import get_device
 from src.ace_inference.core.typing_ import Slice, TensorDict
+from src.utilities.utils import get_logger
 
 from .config import RepeatedInterval, TimeSlice, XarrayDataConfig
 from .data_typing import Dataset, VariableMetadata
@@ -30,7 +31,7 @@ from .utils import (
     infer_horizontal_dimension_names,
     load_series_data,
 )
-from src.utilities.utils import get_logger
+
 
 SLICE_NONE = slice(None)
 logger = get_logger(__name__)
@@ -220,7 +221,7 @@ def _open_xr_dataset(path: str, *args, **kwargs):
     is_local = not protocol or protocol == "file"
 
     # Determine engine - use optimal settings for each engine type
-    engine = kwargs.get("engine", "netcdf4")
+    # engine = kwargs.get("engine", "netcdf4")
 
     if is_local:
         # For local files, enable caching

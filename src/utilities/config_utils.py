@@ -308,8 +308,10 @@ def extras(
                 config.datamodule.pin_memory = True
             else:
                 if config.datamodule.pin_memory is True:
-                    log.info(f"Forcing pin_memory to False for multi-GPU training ({strategy_name=}). "
-                             f"Force True with `pin_memory=force_true`.")
+                    log.info(
+                        f"Forcing pin_memory to False for multi-GPU training ({strategy_name=}). "
+                        f"Force True with `pin_memory=force_true`."
+                    )
                 config.datamodule.pin_memory = False
 
     torch_matmul_precision = config.get("torch_matmul_precision", "highest")
@@ -717,11 +719,11 @@ def check_config_values(config: DictConfig):
                 calc_str = (
                     f"{effective_ebs}={bs_per_gpu} * {acc} * {world_size} (bs_per_gpu * n_acc_grads * world_size)"
                 )
-                bs_warn_suffix = f"to global batch size {batch_size}! (n_gpus={n_gpus}, n_nodes={n_nodes})"
+                bs_warn_suffix = f"global batch size {batch_size}! ({n_gpus=}, {n_nodes=}, {config.trainer.devices=})"
                 if abs(effective_ebs - batch_size) > 0.1 * batch_size:
-                    raise ValueError(f"effective batch size {calc_str} must be equal {bs_warn_suffix}")
+                    raise ValueError(f"Effective batch size {calc_str} must be equal to {bs_warn_suffix}")
                 else:
-                    log.warning(f"effective batch size {calc_str} is not equal {bs_warn_suffix}")
+                    log.warning(f"Effective batch size {calc_str} is not equal to {bs_warn_suffix}")
             config.n_gpus = n_gpus
             config.world_size = world_size
             config.effective_batch_size = effective_ebs  # * acc * n_gpus
@@ -784,7 +786,12 @@ def log_hyperparameters(
             return None
         new_dict = dict()
         for k in dictionary.keys():
-            if k not in keys_to_ignore:
+            if k in keys_to_ignore:
+                continue
+            if isinstance(dictionary[k], DictConfig):
+                # Convert DictConfig to dict for better readability on wandb dashboard
+                new_dict[k] = copy_and_ignore_keys(dictionary[k], *keys_to_ignore)
+            else:
                 new_dict[k] = dictionary[k]
         return new_dict
 

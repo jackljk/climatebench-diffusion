@@ -288,10 +288,10 @@ class BaseDYffusion2(BaseDiffusion):
             return self.l1_l2_mix_loss
         loss_func = super()._get_loss_callable_from_name_or_config(loss_function, **kwargs)
 
-        def loss_func_wrapper(preds, targets, time_of_input=None):
-            return loss_func(preds, targets)
+        # def loss_func_wrapper(preds, targets, time_of_input=None):
+        #     return loss_func(preds, targets)
 
-        return loss_func_wrapper
+        return loss_func
 
     def l1_l2_mix_loss(self, preds: Tensor, targets: Tensor, time_of_input: Tensor) -> Tensor:
         l1_loss = torch.nn.functional.l1_loss(preds, targets, reduction="none")
@@ -526,13 +526,14 @@ class DYffusionMarkov(BaseDYffusion2):
         x_last_pred = self.model.predict_forward(x_t, time=t, condition=forward_condition, **kwargs)
         return x_last_pred
 
-    def p_losses(self, dynamics: Tensor, verbose=False, **kwargs):
+    def p_losses(self, dynamics: Tensor, x_th=None, verbose=False, **kwargs):
         B = dynamics.shape[0]
         assert (
             dynamics.shape[1] == self.num_timesteps + 1
         ), f"dynamics.shape[1] != num_timesteps: {dynamics.shape}[1] != {self.num_timesteps + 1}"
         criterion = self.criterion["preds"]
-        x_th = dynamics[:, -1, ...]  # x_h
+        if x_th is None:
+            x_th = dynamics[:, -1, ...]  # x_h
         # Sample input time step
         t_abs = torch.randint(0, self.num_timesteps, (B,), device=self.device, dtype=self.dtype)
         t_nonzero_mask = t_abs > 0
@@ -560,7 +561,9 @@ class DYffusionMarkov(BaseDYffusion2):
 
         # Forecast x_{h} from \tilde{x}_{t} for 0 <= t <= h-1
         xhat_th = self.predict_x_last(x_t=xtilde_t, time_of_input=t_abs, **kwargs)
-        loss_forward = criterion(xhat_th, x_th, time_of_input=t_abs)
+        loss_forward = criterion(xhat_th, x_th) # for l1-l2mix:, time_of_input=t_abs)
+        loss_forward_dict = {"loss": loss_forward} if not isinstance(loss_forward, dict) else loss_forward
+        loss_forward = loss_forward_dict.pop("loss")
 
         if lam2 > 0 and t_not_last_mask.any():
             # Interpolate x_{t+1} from \tilde{x}_{t} and \hat{x}_{h} for 1 <= t <= h-1
@@ -574,9 +577,12 @@ class DYffusionMarkov(BaseDYffusion2):
             # forecast x_{h} from \hat{x}_{t'} for 1 <= t' <= h-1, where t' = t+1
             kwargs = {k: v[t_not_last_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()}
             xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, **kwargs)
-            loss_forward2 = criterion(xhat_th2, x_th[t_not_last_mask], time_of_input=t_abs_not_last + 1)
+            loss_forward2 = criterion(xhat_th2, x_th[t_not_last_mask]) # for l1-l2mix:, , time_of_input=t_abs_not_last + 1)
+            loss_forward2_dict = {"loss": loss_forward2} if not isinstance(loss_forward2, dict) else loss_forward2
+            loss_forward2 = loss_forward2_dict.pop("loss")
         else:
             loss_forward2 = 0.0
+            loss_forward2_dict = {}
 
         loss = lam1 * loss_forward + lam2 * loss_forward2
 
@@ -584,8 +590,14 @@ class DYffusionMarkov(BaseDYffusion2):
         loss_dict = {
             "loss": loss,
             f"{log_prefix}/loss_forward": loss_forward,
-            f"{log_prefix}/loss_forward2": loss_forward2,
         }
+        if loss_forward2 > 0:
+            loss_dict[f"{log_prefix}/loss_forward2"] = loss_forward2
+
+        for k, v in loss_forward_dict.items():
+            if k in loss_forward2_dict:
+                v = lam1 * v + lam2 * loss_forward2_dict.pop(k)
+            loss_dict[f"{log_prefix}/{k}"] = v
         return loss_dict
 
 
