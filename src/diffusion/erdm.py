@@ -2,12 +2,15 @@ import os
 import time
 from collections import defaultdict
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, Any
 
 import einops
+import numpy as np
 import torch
 from einops import rearrange, repeat
+from tqdm import tqdm
 
+from src.diffusion.edm import MPFourier, MPConv
 from src.diffusion._base_diffusion import BaseDiffusion
 from src.utilities.utils import get_logger, sample_random_real
 
@@ -16,6 +19,75 @@ log = get_logger(__name__)
 
 # ----------------------------------------------------------------------------
 
+import numpy as np
+from scipy.stats import norm
+import math
+
+def discretize_lognormal(P_mean, P_std, N, sigma_min, sigma_max, offset, batch_size):
+    """
+    Discretizes a lognormal distribution into N segments with denser segments
+    around the mode.
+
+    Args:
+        P_mean (float): Mean of the lognormal distribution.
+        P_std (float): Standard deviation of the lognormal distribution.
+        N (int): Number of segments.
+        sigma_min (float): Minimum value of the range.
+        sigma_max (float): Maximum value of the range.
+        offset (float): Offset value between 0 and 1 (inclusive).
+
+    Returns:
+        list: A list of N values representing the boundaries or interpolated
+              values for each segment based on the offset.
+    """
+    if P_mean <= 0:
+        raise ValueError("P_mean must be positive.")
+
+    if P_std < 0:
+        raise ValueError("P_std cannot be negative.")
+
+    if sigma_min >= sigma_max:
+        raise ValueError("sigma_min must be less than sigma_max.")
+
+    if not isinstance(N, int) or N < 1:
+        raise ValueError("N must be a positive integer.")
+
+    # 1. Calculate parameters of the underlying normal distribution
+    sigma_log = math.sqrt(math.log(1 + (P_std / P_mean)**2))
+    mu_log = math.log(P_mean) - 0.5 * sigma_log**2
+
+    # 2. Calculate log-transformed min and max
+    y_min = math.log(sigma_min)
+    y_max = math.log(sigma_max)
+
+    # 3. Calculate CDF values at y_min and y_max
+    p_min = norm.cdf((y_min - mu_log) / sigma_log)
+    p_max = norm.cdf((y_max - mu_log) / sigma_log)
+
+    # 4. Generate N+1 equally spaced CDF values
+    p_values = np.linspace(p_min, p_max, N + 1)
+
+    # 5. Find the corresponding log-transformed boundaries
+    y_boundaries = norm.ppf(p_values) * sigma_log + mu_log
+
+    # 6. Calculate the boundaries in the original space
+    x_boundaries = np.exp(y_boundaries)
+    if torch.is_tensor(offset):
+        assert offset.size(0) == batch_size
+        x_boundaries = torch.tensor(x_boundaries, dtype=offset.dtype, device=offset.device)
+        offset = offset.unsqueeze(1).repeat(1, N)
+    else:
+        x_boundaries = torch.tensor(x_boundaries, dtype=torch.float32, device=torch.device("cuda"))
+
+    x_boundaries = x_boundaries.unsqueeze(0).repeat(batch_size, 1)
+    left_ends = x_boundaries[:, :-1]
+    right_ends = x_boundaries[:, 1:]
+
+    # Vectorized parabolic interpolation
+    parabolic_offset = 2.3 * offset * (1 - offset)
+    linear_offset = offset * (2 * offset - 1)
+    result = right_ends * (1 - parabolic_offset - linear_offset) + left_ends * (parabolic_offset + linear_offset)
+    return result #torch.tensor(result, dtype=torch.float32)
 
 # @persistence.persistent_class
 class ERDM(BaseDiffusion):
@@ -25,6 +97,7 @@ class ERDM(BaseDiffusion):
         sigma_min=0.002,  # Minimum supported noise level. 0.002 in miikas's code
         sigma_max=None,  # Maximum supported noise level. 80.0 in miikas's code
         rho=7,  # Exponent of the time step discretization.
+        discretization: str = "uniform",  # lognormal | uniform | normal
         # Range of sigma_min/max/rho for training. If None, always use sigma_min
         sigma_min_training: Optional[Tuple[float, float]] = None,
         sigma_max_training: Optional[Tuple[float, float]] = None,
@@ -34,12 +107,16 @@ class ERDM(BaseDiffusion):
         # P_mean          = -1.2,             # Mean of the noise level distribution.
         # P_std           = 1.2,              # Standard deviation of the noise level distribution.
         use_lambda_weighting: bool = True,  # Use standard lambda weighting from EDM for the loss
+        use_noise_logvar: bool = False,
         variance_loss: bool = True,  # Use a Kendall&Gal style loss weighting with learned per-frame variance -- found to be beneficial
         frame_weighting: bool = False,  # Use same (initial) weighting for all frames in the window
+        compute_loss_per_sigma: bool = False,  # Compute loss for each sigma separately (for validation/debugging)
         # Use classical global mapping network based conditioning to inform network of fractional frame shift.
         # If False, the network will not be trained with randomly shifted noises, and will only handle the case offset=0! (XXX that mode is currently untested)
         use_map_noise: bool = True,
         force_pure_noise_last_frame: bool = False,  # If True, the last frame will be forced to be randn * sigma_max, instead of any potential initialization frame
+        noise_prior: str = "independent",  # independent | mixed | progressive
+        noise_prior_alpha: float = 0.0,  # Mixing parameter for the mixed noise prior. Not used if independent.
         # Use explicit learnable per-time per-channel weight and bias in network?
         # NOTE this is strictly different than the conditioning with frame shift above, but these could potentially just be unified under this mechanism?
         # The idea is to allow the network to learn a feature shift and scale based on the frame index.
@@ -78,7 +155,6 @@ class ERDM(BaseDiffusion):
         self.seq_len = seq_len or datamodule_config.get("horizon", 1)  # + self.datamodule_config.get("window", 1)
         self.time_dim = 2  # (batch, channels, time, height, width)  # if 1, need to fix bug in torch.nn.functional.pad
         # self.time_dim = -4  # (batch, time, channels, height, width)  # if 1, need to fix bug in torch.nn.functional.pad
-
         super().__init__(**kwargs, datamodule_config=datamodule_config)
         self._USE_SIGMA_DATA = True
         self.sigma_min = sigma_min
@@ -109,6 +185,17 @@ class ERDM(BaseDiffusion):
         self.b = b
         self.verbose = verbose
         self.time_conditioned = self.model.hparams.with_time_emb
+        self._noise_rand_cache = dict()
+        if noise_prior in ["mixed", "progressive"]:
+            # Common parameters for both methods
+            alpha_squared = noise_prior_alpha ** 2
+            scaling_factor = 1 / (1 + alpha_squared)
+            correlation_factor = alpha_squared * scaling_factor
+
+            # Precompute scaling constants
+            self._indep_scale = torch.sqrt(torch.tensor(scaling_factor))
+            self._corr_scale = torch.sqrt(torch.tensor(correlation_factor))
+
         if self.time_conditioned:
             self.log_text.info(f"Using time conditioned model (based on {'offset' if time_to_channels else 'sigma'})")
         if schedule == "exp_a_b":
@@ -126,15 +213,19 @@ class ERDM(BaseDiffusion):
             "corrected",
             "plus_data",
         ], f"force_pure_noise_last_frame must be True, False or 'corrected', got {force_pure_noise_last_frame}"
-        # if self.hparams.variance_loss:
-        # We implement the variance-weighted loss by simply learning a list of scalars, one per frame
-        # self.log_var = torch.nn.Parameter(torch.zeros(self.seq_len))
+        if use_noise_logvar:
+            logvar_channels = 128  # Intermediate dimensionality for uncertainty estimation.
+            log.info(f"Using log-variance with {logvar_channels} intermediate channels for noise weighting.")
+            self.logvar_fourier = MPFourier(logvar_channels)
+            # Zero init of MPConv does not seem to help, better to use randn init
+            self.logvar_linear = MPConv(logvar_channels, 1, kernel=[])
 
         assert (
             0 <= S_churn < 1
         ), "churn must be greater than 0 and less than 1 (churn = 1 indicates a sub-step infinitely far into the future)"
         log.info(f"Using {S_churn=}, {step=}, {heun=}. {use_map_noise=}, {time_to_channels=}")
-        assert 0 < sigma_min < sigma_max, "sigma_min must be greater than 0 and less than sigma_max"
+        if "edm" in schedule:
+            assert 0 < sigma_min < sigma_max, "sigma_min must be greater than 0 and less than sigma_max"
 
     def get_exp(self, **kwargs):
         if self.hparams.learnable_schedule:
@@ -222,18 +313,54 @@ class ERDM(BaseDiffusion):
 
                 return (tmax ** (1 / exp) + s * (tmin ** (1 / exp) - tmax ** (1 / exp))) ** exp
 
-            f = edm_reversed
             # assert torch.all((frames+1) / self.seq_len >= 0) and torch.all((frames+1) / (seq_len+1) <= 1)
-            noises = f(1 - (frame + 1) / self.seq_len)
+            normalized = (frame + 1) / self.seq_len
+            focus_point = 2
+            sharpness = 3
+            if self.hparams.discretization == "uniform":
+                normalized = 1 - normalized
+            elif self.hparams.discretization == "sine":
+                # Shift to center around target_point instead of 0.5
+                phase = np.pi * (1 - focus_point)
+                normalized = (1 - normalized) * (np.sin(normalized * np.pi + phase) / np.sin(phase))
+            elif self.hparams.discretization == "poly":
+                a = 2.0 * (1.0 - focus_point)
+                b = 2.0 * focus_point - 1.0
+                # This polynomial preserves endpoints and creates concentration around focus_point
+                t = normalized
+                normalized = (1 - normalized) * (1 + a * t * (1 - t) + b * t * t * (1 - t))
+            elif self.hparams.discretization == "poly2":
+                a = 2.0 * (1.0 - focus_point) - 0.5
+                b = 2.0 * focus_point - 1.0 + 1
+                # This polynomial preserves endpoints and creates concentration around focus_point
+                t = normalized
+                normalized = (1 - normalized) * (1 + a * t * (1 - t) + b * t * t * (1 - t))
+            elif self.hparams.discretization == "poly3":
+                a = 2.0 * (1.0 - focus_point)
+                b = 2.0 * focus_point - 1.0 +1
+                # This polynomial preserves endpoints and creates concentration around focus_point
+                t = normalized
+                normalized = (1 - normalized) * (1 + a * t * (1 - t) + b * t * t * (1 - t))
+            noises = edm_reversed(normalized)
             # frame+1 brings it to the non-negative range, and the division by seq_len brings it to [0,1], 1- reverses the schedule
 
         # A couple of experimental schedules. Note, these leave some visible noise in the generated video (can be removed by using the denoiser output; could this loosened requirement be beneficial for learning?)
         elif self.hparams.schedule == "poly1":
-            t = frame / (self.seq_len - 1)
-            noises = 0.15 + 1 * t + 1 * t**2 + 40 * t**16
+            func = lambda s: 0.1 + 1 * s + 4 * s**2 + 550 * s**16
+            # t = frame / (self.seq_len - 1)
+            t = (frame + 1) / self.seq_len
+            noises_raw = func(t)
+            noise_min = func(0)
+            noise_max = func(1)
+            noises = (noises_raw - noise_min) / (noise_max - noise_min) * (self.tmax - self.tmin) + self.tmin
         elif self.hparams.schedule == "poly2":
-            t = frame / (self.seq_len - 1)
-            noises = 0.1 + 1 * t + 4 * t**2 + 50 * t**16
+            # t = frame / (self.seq_len - 1)
+            t = (frame + 1) / self.seq_len
+            func = lambda s: 0.1 + 1 * s + 4 * s**3 + 300 * s**20
+            noises_raw = func(t)
+            noise_min = func(0)
+            noise_max = func(1)
+            noises = (noises_raw - noise_min) / (noise_max - noise_min) * (self.tmax - self.tmin) + self.tmin
 
         elif self.hparams.schedule == "exp_a_b":
             t = (frame + 1) / self.seq_len  # (self.seq_len - 1)
@@ -245,7 +372,7 @@ class ERDM(BaseDiffusion):
             # normalized_values = (raw_values - raw_min) / (raw_max - raw_min) * (self.tmax - self.tmin) + self.tmin
             # return normalized_values
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(f"Unknown schedule: {self.hparams.schedule}")
         # Ensure that the noise level is within the bounds, important when using padded sequences
         return torch.clamp(noises, max=self.tmax)
 
@@ -255,30 +382,29 @@ class ERDM(BaseDiffusion):
     def noise_coeff(self, x: torch.Tensor, offset=0) -> torch.Tensor:
         """Produce the tensor that modulates a randn addition on x"""
         B = x.shape[0]
-        D = len(x.shape)
+        T = x.shape[self.time_dim]
         # NOTE: supporting other sequence lengths than self.seq_dim also, for sampling convenience and unification
-        frames = einops.repeat(
-            torch.arange(x.shape[self.time_dim], dtype=x.dtype, device=x.device), "t -> t b", b=B
-        )  # Frame indices
-        if torch.is_tensor(offset):
-            if not self.hparams.use_map_noise:
+        frames = einops.repeat(torch.arange(T, dtype=x.dtype, device=x.device), "t -> t b", b=B) # Frame idxs
+        if not self.hparams.use_map_noise:
+            if torch.is_tensor(offset):
                 assert torch.all(offset == 0), f"Offset must be 0 if use_map_noise=False, got {offset}"
-            # elif self.hparams.S_churn == 0:
-            # assert (offset >= 0).all() and (offset <= 1).all(), f"Offset must be in [0,1], got {offset}"
-        else:
-            if not self.hparams.use_map_noise:
-                assert offset in [0, 1], f"Offset must be 0 if use_map_noise=False, got {offset}"
-            # elif self.hparams.S_churn == 0:
-            # assert 0 <= offset <= 1, f"Offset must be in [0,1], got {offset}"
-        frames = frames - offset  # ... pushed into future by offset (XXX sign convention confusing)
-        if self.hparams.clamp_frame_idx_to_0:
-            # Clamp frames to be >= -1
-            frames = torch.clamp(frames, min=-1)
-        # log.info(f"len(frames)={len(frames)}. Unique values={torch.unique(frames).cpu().numpy()}")
-        noise_std = self.noise_on_frame(frames, B=B)
+            else:
+                assert offset in [0, 1], (f"Offset must be 0 if usecccccbngkrfvcnurubeltvvjetgbujnhtllfkjubbftl"
+                                          f"_map_noise=False, got {offset}")
 
-        # Push the noisy dimension to the correct slot, e.g. 'b 1 t 1 1' if self.time_dim=2 and D = 5
-        dim_selection = "b 1 " + " ".join(["t" if self.time_dim == dim else "1" for dim in range(2, D)])
+        if self.hparams.schedule == "experimental":
+            noise_std = discretize_lognormal(1, 2.5, T, self.tmin, self.tmax, offset, B)
+            noise_std = rearrange(noise_std, "b t -> t b")
+        else:
+            frames = frames - offset  # ... pushed into future by offset (XXX sign convention confusing)
+            if self.hparams.clamp_frame_idx_to_0:
+                # Clamp frames to be >= -1
+                frames = torch.clamp(frames, min=-1)
+            # log.info(f"len(frames)={len(frames)}. Unique values={torch.unique(frames).cpu().numpy()}")
+            noise_std = self.noise_on_frame(frames, B=B)
+
+        # Push the noisy dimension to the correct slot, e.g. 'b 1 t 1 1' if self.time_dim=2 and ndim = 5
+        dim_selection = "b 1 " + " ".join(["t" if self.time_dim == dim else "1" for dim in range(2, x.ndim)])
         noise_std = einops.rearrange(noise_std, "t b -> " + dim_selection)
         return noise_std
 
@@ -305,10 +431,76 @@ class ERDM(BaseDiffusion):
         #           = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         return c_in, c_out, c_skip, sqrt_lambda
 
+    def sample_noise_tensor(self, x_like: torch.Tensor, rnd_gen=None, use_cache: bool = False) -> torch.Tensor:
+        """Sample noise for the given tensor, with the same shape."""
+        rndn_handle = torch.randn_like if rnd_gen is None else rnd_gen.randn_like
+        if self.hparams.noise_prior == "independent":
+            return rndn_handle(x_like)
+        elif self.hparams.noise_prior in ["mixed", "progressive"]:
+            # See "Preserve Your Own Correlation: A Noise Prior for Video Diffusion Models"
+            # Recommended alpha values from there: mixed=1 or progressive=2
+            assert self.time_dim == 2, f"Only time_dim=2 supported for {self.hparams.noise_prior} noise prior"
+            
+            # Get time dimension length and initialize noise tensor
+            time_len = x_like.shape[self.time_dim]
+            if self.hparams.noise_prior == "mixed":
+                # Sample shared noise from N(0, alpha**2/(1+alpha**2) I) and indep noise i from N(0, 1/(1+alpha**2) I)
+                # Noise for frame i = shared + indep_i
+
+                # Sample shared noise component common to all frames
+                shared_noise = rndn_handle(x_like[:, :, 0:1, ...])
+                if use_cache:
+                    self._noise_rand_cache["shared_noise"] = shared_noise
+
+                # Sample independent noise components for each frame
+                indep_noise = self._indep_scale * rndn_handle(x_like)
+                
+                # Combine shared and independent noise
+                noise = self._corr_scale * shared_noise.expand_as(x_like) + indep_noise
+            else:  # progressive
+                # Sample init noise from N(0,I) and indep noise i from N(0, 1/(1+alpha**2) I)
+                # Noise for frame i eps_i = alpha**2/(1+alpha**2) eps_{i-1} + indep_i
+                noise = torch.zeros_like(x_like)
+                # Sample initial noise for the first frame
+                noise[:, :, 0] = rndn_handle(x_like[:, :, 0])
+                
+                # Progressively generate noise for subsequent frames
+                for t in range(1, time_len):
+                    # Auto-regressive component from previous frame
+                    ar_noise = noise[:, :, t-1]
+                    
+                    # Independent noise component
+                    indep_noise = self._indep_scale * rndn_handle(x_like[:, :, t])
+                    
+                    # Combine for current frame
+                    noise[:, :, t] = self._corr_scale * ar_noise + indep_noise
+                if use_cache:
+                    self._noise_rand_cache["shared_noise"] = noise[:, :, -1:]
+                
+            return noise
+        else:
+            raise ValueError(f"Unknown noise_prior: {self.hparams.noise_prior}. Expected one of: independent, mixed, progressive")
+
+    def sample_additional_noise_frame(self, size, rnd=None, **kwargs):
+        rndn_handle = torch.randn if rnd is None else rnd.randn
+        if self.hparams.noise_prior == "independent":
+            return rndn_handle(size, **kwargs)
+        elif self.hparams.noise_prior in ["mixed", "progressive"]:
+            assert size[self.time_dim] == 1, f"Only support sampling a single frame, got {size}"
+            shared_noise: torch.Tensor = self._noise_rand_cache.get("shared_noise", None)
+            assert shared_noise is not None, "Shared noise must be cached for mixed or progressive noise prior"
+            new_noise = self._corr_scale * shared_noise + self._indep_scale * rndn_handle(size, **kwargs)
+            if self.hparams.noise_prior == "progressive":
+                # Update the shared noise cache
+                self._noise_rand_cache["shared_noise"] = new_noise
+            return new_noise
+        else:
+            raise ValueError(f"Unknown noise_prior: {self.hparams.noise_prior=}.")
+
+
     def forward(
         self,
         x: torch.Tensor,
-        augment_label: Optional[torch.Tensor] = None,  # unused, ignore
         loss: bool = False,
         # If True, calculate the training loss. Assume x is a clean video sample; noise will be added internally.
         offset=None,
@@ -317,17 +509,19 @@ class ERDM(BaseDiffusion):
         condition: Optional[torch.Tensor] = None,
         return_debug: bool = False,
         force_add_rolling_noise: bool = False,
+        loss_kwargs: Optional[Dict[str, Any]] = None,
         **forward_kwargs,
-    ) -> torch.Tensor:
-
+    ) -> Dict[str, Any]:
+        loss_kwargs = loss_kwargs or {}
         assert (
             x.shape[self.time_dim] == self.seq_len
         ), f"Expected sequence length {self.seq_len} at time dim{self.time_dim}, got {x.shape}"
 
         bs = x.size(0)  # batch size
 
-        # XXX unnecessarily messy and error prone
-        if offset is not None and not torch.is_tensor(offset):
+        is_manual_offset = offset is not None
+        if is_manual_offset:
+            assert not torch.is_tensor(offset) or offset.ndim == 0, f"Offset must be scalar, got {offset.ndim=}"
             # if a scalar is given, apply the same offset to all entries in the batch
             offset = offset * torch.ones([bs], device=x.device, dtype=x.dtype)
         if offset is None:
@@ -339,6 +533,8 @@ class ERDM(BaseDiffusion):
 
         # given the offset, these are the noise levels per frame (sigmas)
         noise_std = self.noise_coeff(x, offset=offset)
+        if is_manual_offset:
+            loss_kwargs["sigmas"] = noise_std
         if loss or force_add_rolling_noise:
             # Add the appropriate amount of noise if training
             if self.hparams.force_pure_noise_last_frame in [True, "corrected"]:
@@ -346,7 +542,7 @@ class ERDM(BaseDiffusion):
                 assert self.time_dim == 2, "Only time_dim=2 supported for force_pure_noise_last_frame"
                 # Set to zero, so that randn * sigma_max will be pure noise (since it'll be added to 0)
                 x[:, :, -1] = torch.zeros_like(x[:, :, -1])
-            x_noisy = x + torch.randn_like(x) * noise_std
+            x_noisy = x + self.sample_noise_tensor(x, use_cache=False) * noise_std
         else:
             # If not training, the data is already noise
             x_noisy = x
@@ -407,7 +603,6 @@ class ERDM(BaseDiffusion):
             if not self.time_conditioned
             else self.model(x_in, time_cond, **forward_kwargs).to(dtype)
         )
-        # Fx = self.net(x_in, offset_label, augment_label).to(torch.float64)
 
         if self.hparams.time_to_channels:
             # Revert the dimension shuffle from corresponding block above
@@ -448,16 +643,40 @@ class ERDM(BaseDiffusion):
             # # Just the standard error averaged uniformly over frames
             # loss = (error * weight).mean() #.float()
             # return {"loss": loss}
-            if self.hparams.use_lambda_weighting:
+            if self.hparams.use_lambda_weighting == "inverse":
+                multiply_weight = 1 / sqrt_lambda  #(sqrt_lambda ** 2)
+            elif self.hparams.use_lambda_weighting:
                 multiply_weight = sqrt_lambda**2  # Will be applied after squaring the error
             if self.hparams.frame_weighting == "reverse":
                 # Assign higher loss weights to last frames
                 f_weight = torch.arange(1, self.seq_len + 1, device=x.device, dtype=x.dtype) / self.seq_len
                 f_weight = f_weight.reshape((1, *sqrt_lambda.shape[1:]))
                 multiply_weight = multiply_weight * f_weight if multiply_weight is not None else f_weight
+            elif "lognormal" in self.hparams.frame_weighting:
+                P_mean, P_std = 0.5, 1.2
+                if "_" in self.hparams.frame_weighting:
+                    # Split P_mean (and optionally P_std) from the string depending on the number of underscores
+                    split = self.hparams.frame_weighting.split("_")
+                    assert len(split) in [2, 3], f"Expected 2 or 3 parts in {self.hparams.frame_weighting=}"
+                    P_mean, P_std = map(float, split[1:]) if len(split) == 3 else (float(split[1]), P_std)
+
+                f_weight = calculate_lognormal_weight(noise_std, P_mean, P_std)
+                multiply_weight = multiply_weight * f_weight if multiply_weight is not None else f_weight
+
+            if self.hparams.use_noise_logvar:
+                logvars = self.logvar_linear(self.logvar_fourier(noise_std.flatten().log() / 4))
+                assert self.time_dim == 2, "Only time_dim=2 supported for use_noise_logvar"
+                # Reshape back to (B, T) shape and specify the dimensions to apply logvars to
+                loss_kwargs["batch_logvars"] = (logvars.reshape(bs, -1), (0, self.time_dim))
 
             # Weight will be appropriately multiplied or combined with other weights in the loss function
-            return self.criterion["preds"](preds=x_denoised, targets=x, multiply_weight=multiply_weight)
+            loss = self.loss_wrapper(preds=x_denoised, targets=x, multiply_weight=multiply_weight, **loss_kwargs)
+            if not self.training and not self.hparams.use_lambda_weighting:
+                # Compute what lambda weighted loss would be, for comparison
+                loss_lambda = self.loss_wrapper(preds=x_denoised, targets=x, multiply_weight=sqrt_lambda**2, **loss_kwargs)
+                for k, v in loss_lambda.items():
+                    loss[k.replace("loss", "loss_lambda")] = v.detach().cpu() if torch.is_tensor(v) else v
+            return loss
 
         elif return_debug:
             return dict(
@@ -475,8 +694,79 @@ class ERDM(BaseDiffusion):
 
         return x_denoised
 
-    def get_loss(self, inputs, targets, return_predictions=False, predictions_post_process=None):
-        raise NotImplementedError()
+    def loss_wrapper(self, sigmas: torch.Tensor = None, **kwargs):
+        loss = self.criterion["preds"](**kwargs)
+        if kwargs.get("return_intermediate", False):
+            if sigmas is not None:
+                sigmas = sigmas.squeeze()
+                if sigmas.ndim > 1:
+                    assert torch.allclose(sigmas[0], sigmas[1]), f"{sigmas.shape=} {sigmas[0]=}, {sigmas[1]=}."
+                    sigmas = sigmas[0, :]
+            # Make sure the loss is a scalar:
+            #   keys: unweighted_loss, weighted_loss_before_vars, weighted_loss_after_vars
+            temp_losses_keys = ["unweighted_loss", "weighted_loss_before_vars", "weighted_loss_after_vars"]
+            for k in temp_losses_keys:
+                if k in loss.keys():
+                    loss_values = loss.pop(k)  # Vectorized across time dimension
+                    if isinstance(loss_values, float) or loss_values.numel() == 1:
+                        loss[k] = float(loss_values)
+                        continue  # Skip if it's a scalar
+                    elif self.hparams.use_noise_logvar:  # Vectorized across batch and time dimension
+                        loss_values = loss_values.mean(dim=0)  # Take mean over batch dimension
+                    elif not self.hparams.variance_loss:
+                        loss_values = loss_values.mean(dim=[i for i in range(0, loss_values.ndim) if i != self.time_dim])
+                    if sigmas is not None:
+                        assert loss_values.shape == sigmas.shape, f"{k=}, {sigmas.shape=}, got {loss_values.shape=}"
+                    for i, loss_value_i in enumerate(loss_values):
+                        if sigmas is not None:
+                            sigma = sigmas[i].item()
+                            n_decimals = 9 if sigma < 0.03 else 7 if sigma < 1 else 3
+                            key = f"{k}_per_noise_level/sigma{sigmas[i].item():.{n_decimals}f}"
+                        else:
+                            key = f"{k}/time_{i}"
+                        loss[key] = float(loss_value_i)
+            if sigmas is not None:
+                loss["x_axes"] = {"sigma": list(sigmas.cpu())}
+        return loss
+
+    def get_loss(self, inputs, targets, return_predictions=False, predictions_post_process=None, **kwargs):
+        assert inputs is None, f"Expected inputs to be None, got {inputs}"
+        loss = self.forward(targets, loss=True, **kwargs)
+        if self.hparams.compute_loss_per_sigma:
+            loss.update(self.get_loss_vs_sigmas(targets, **kwargs))
+        if return_predictions:
+            return loss, None
+        return loss
+
+
+    def get_loss_vs_sigmas(self, targets, **kwargs) -> Dict[str, float]:
+        """Calculate the loss as a function of noise levels."""
+        losses = dict()
+        offsets = torch.linspace(0, 1, 50, device=targets.device)
+        for i, offset in enumerate(tqdm(offsets, desc="Calculating loss vs sigmas")):
+            loss_offset = self.forward(targets, loss=True, offset=offset, **kwargs)
+            for k, v in loss_offset.items():
+                if "_per_noise_level" in k:
+                    if k in losses:
+                        print(f"Key {k} already in loss dict {v=}, {losses[k]=}")
+                        losses[k] = [losses[k], v] if isinstance(losses[k], float) else losses[k] + [v]
+                    else:
+                        losses[k] = v
+                elif k == "x_axes":
+                    if i == 0:
+                        losses[k] = v
+                    else:
+                        for x_axis_name, x_axis_subset in v.items():
+                            losses[k][x_axis_name] = losses[k][x_axis_name] + x_axis_subset
+                else:
+                    losses[k + f"/offset_{offset:.3f}"] = float(v)
+        # Take mean over any repeated losses
+        for k in list(losses.keys()):
+            if "_per_noise_level" in k and isinstance(losses[k], list):
+                losses[k] = np.mean(losses[k])
+        # Sort the sigma values, from smallest to largest
+        losses["x_axes"] = {k: sorted(v) for k, v in losses["x_axes"].items()}
+        return losses
 
     @torch.inference_mode()
     def sample(
@@ -487,7 +777,7 @@ class ERDM(BaseDiffusion):
         rnd_churn = StackedRandomGenerator(self.device, batch_seeds + 123) if self.hparams.S_churn > 0 else None
         # init_latents_shape = (prompt.shape[0], self.num_input_channels, self.spatial_shape[0], self.spatial_shape[1])
         # latents = rnd.randn(init_latents_shape, dtype=prompt.dtype, layout=prompt.layout, device=prompt.device)
-        nfe = 0
+        self.nfe = 0
 
         net = self
         step = self.hparams.step
@@ -552,13 +842,12 @@ class ERDM(BaseDiffusion):
             per_frame_noise_coeffs[0].squeeze() == per_frame_noise_coeffs[1].squeeze()
         ), f"per_frame_noise_coeffs.shape={per_frame_noise_coeffs.shape}. prompt.shape={prompt.shape}\nidx[0]={per_frame_noise_coeffs[0].squeeze()}, idx[1]={per_frame_noise_coeffs[1].squeeze()}"
         # noise = S_ar_noise * torch.randn(prompt.shape, dtype=dtype, generator=latent_rng, device=prompt.device)
-        noise = S_ar_noise * rnd.randn(prompt.shape, dtype=dtype, device=prompt.device)
+        noise = S_ar_noise * self.sample_noise_tensor(prompt, rnd, use_cache=True)
         x0 = prompt + per_frame_noise_coeffs * noise
         # self.log.info(f"NOISE ADDED TO PROMPT")
 
         # Denoiser (will be called twice if heun==True, so isolated here)
         def denoise(x, t, sigmas=None, cond=None, **denoise_kwargs):
-            nonlocal nfe
             # extract from the current integer offset into our frame window as the noisy sequence,
             # pass the fractional offset part as the offset, and denoise with network
             x_in_net = win(x, int(t))
@@ -610,7 +899,7 @@ class ERDM(BaseDiffusion):
             # For int(t)=0 ==> torch.allclose(Dx, dx_old) == True
             if denoiser_clip:
                 Dx = torch.clip(Dx, -denoiser_clip, denoiser_clip)
-            nfe += 1
+            self.nfe += 1
             return Dx
 
         curr_step = 0  # not used by algorithm, but just to keep track...
@@ -653,9 +942,8 @@ class ERDM(BaseDiffusion):
             # Call the network on the appropriate window
             # Denoised frame window. If you visualize this, you'll see a short video of increasingly blurry frames,
             # reflecting the uncertainty of the future evolution.
-            Dx0 = denoise(
-                x0, t0, sigmas=sigma_t0, cond=condition, **kwargs
-            )  # x0,Dx0.shape = [B, C, seq_len+padding, H, W]
+            # x0,Dx0.shape = [B, C, seq_len+padding, H, W]
+            Dx0 = denoise(x0, t0, sigmas=sigma_t0, cond=condition, **kwargs)
 
             # Mix between noisy and denoised frames in the exact per-frame proportion that
             # leaves us with noise levels in sigma_t1
@@ -825,9 +1113,8 @@ class ERDM(BaseDiffusion):
 
                 # The caller got their frames, we no longer need them -- clip them off
                 x0_next = select_range(x0_next, dim=net.time_dim, start=num_finished)
-                t0_next -= (
-                    num_finished  # update the offset into the window of frames to match dropping of num_finished
-                )
+                # update the offset into the window of frames to match dropping of num_finished
+                t0_next -= num_finished
 
                 # Our window has now become shorter by num_finished -- draw new noise to the right (with correct
                 # noise levels) to bring it to back to proper length
@@ -837,15 +1124,13 @@ class ERDM(BaseDiffusion):
                 # self.print(f"sigma_fresh.min;max={sigma_fresh.min():.4f};{sigma_fresh.max()}")
                 # Get a block of appropriately shaped white
                 xs = x0_next.shape
-                fresh_noise = (
-                    sigma_fresh
-                    * S_ar_noise
-                    * rnd.randn(
+                fresh_noise = self.sample_additional_noise_frame(
                         [num_finished if dim == net.time_dim else xs[dim] for dim in range(len(xs))],
                         dtype=dtype,
                         device=x0_next.device,
-                    )
-                )  # shape: [B, C, num_finished, H, W]
+                    rnd=rnd
+                )
+                fresh_noise = sigma_fresh * S_ar_noise * fresh_noise  # shape: [B, C, num_finished, H, W]
                 if self.hparams.force_pure_noise_last_frame == "plus_data":
                     fresh_noise = x_finished + fresh_noise
                 # Cat it onto the frame window, scaled by the sigmas found above
@@ -867,6 +1152,7 @@ class ERDM(BaseDiffusion):
             x0 = x0_next
 
             curr_step += 1
+
 
 
 class StackedRandomGenerator:
@@ -1042,3 +1328,39 @@ def sample_simple(self, prompt, dtype=torch.float32, batch_seeds=None, **kwargs)
         # Adopt the updated window and time offset for the next iteration
         t0 = t0_next
         x0 = x0_next
+
+def calculate_lognormal_weight(sigma, P_mean = 0.5, P_std = 1.2):
+    """
+    Calculate a weight proportional to the frequency of a noise level sigma
+    under a lognormal distribution.
+
+    Parameters:
+    -----------
+    sigma : float or tensor
+        The noise level to calculate weight for
+    P_mean : float
+        Mean parameter of the normal distribution before exponentiation
+    P_std : float
+        Standard deviation parameter of the normal distribution before exponentiation
+
+    Returns:
+    --------
+    weight : float or tensor
+        Weight proportional to the PDF of the lognormal distribution at sigma
+    """
+    # Calculate PDF of normal distribution in log space
+    # f(x) = (1/(σ√(2π))) * exp(-(x-μ)²/(2σ²))
+    exponent = -((torch.log(sigma) - P_mean) ** 2) / (2 * P_std ** 2)
+    coefficient = 1 / (P_std * np.sqrt(2 * np.pi))
+
+    # PDF of normal distribution in log space
+    normal_pdf = coefficient * torch.exp(exponent)
+
+    # Convert to lognormal PDF
+    # For lognormal, we need to divide by sigma
+    lognormal_pdf = normal_pdf / sigma
+
+    # The weight is directly proportional to the PDF value
+    weight = lognormal_pdf
+    return weight
+

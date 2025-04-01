@@ -77,12 +77,12 @@ class SnapshotAggregator:
             ), f"target_time={self.target_time}, time_in_batch={self.target_time_in_batch} is larger than the number of timesteps in the data={data_steps}!"
 
     @torch.inference_mode()
-    def compute(self, label: str = "", epoch: int = None):
+    def compute(self, prefix: str = "", epoch: int = None):
         """
         Returns logs as can be reported to WandB.
 
         Args:
-            label: Label to prepend to all log keys.
+            prefix: Label to prepend to all log keys.
             epoch: Current epoch number.
         """
         if self.every_nth_epoch > 1 and epoch >= 3 and epoch % self.every_nth_epoch != 0:
@@ -212,6 +212,6 @@ class SnapshotAggregator:
             #     wandb_image = wandb.Image(data, caption=caption)
             #     image_logs[f"image-{key}/{name}"] = wandb_image
 
-        label = label + "/" if label else ""
-        image_logs = {f"{label}{key}": image_logs[key] for key in image_logs}  # todo: use datetime as key?
+        prefix = prefix + "/" if prefix else ""
+        image_logs = {f"{prefix}{key}": image_logs[key] for key in image_logs}  # todo: use datetime as key?
         return {}, image_logs, {}

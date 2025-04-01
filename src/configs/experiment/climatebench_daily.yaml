@@ -17,3 +17,6 @@ datamodule:
 
 model:
   loss_function: "wmse"
+
+module:
+  allow_validation_size_indivisible_on_ddp: True

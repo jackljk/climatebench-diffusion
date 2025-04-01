@@ -223,7 +223,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         # dynamics = batch["dynamics"].clone()
         batch["dynamics"] = batch["dynamics"][:, : self.window + self.true_horizon, ...]
 
-        if self.is_diffusion_model and split == "val" and dataloader_idx in [0, None]:
+        if self.is_diffusion_model and dataloader_idx in [0, None] and not no_aggregators:
             # self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
             # log validation loss
             if dynamic_conds is not None:
@@ -1158,20 +1158,24 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                             f"Permuting {k} from (B, T, C, H, W) to (B, C, T, H, W). shape={v.shape}"
                         )
                     extra_kwargs[k] = rrearrange(v, "b t c ... -> b c t ...", t=self.horizon)
-        loss = self.model(targets, loss=True, **extra_kwargs)
+        extra_kwargs["loss_kwargs"] = {"return_intermediate": split == "val"}
+        loss = self.model.get_loss(inputs=None, targets=targets, **extra_kwargs)
         return loss
 
     def on_train_batch_end(self, *args, **kwargs):
+        to_log = {}
         if self.model.hparams.learnable_schedule:
-            self.log("model/rho_proxy", self.model.exp.detach().item())
-            self.log("model/rho", self.model.get_exp().detach().item())
+            to_log["model/rho_proxy"] = self.model.exp.detach().item()
+            to_log["model/rho"] = self.model.get_exp().detach().item()
             if self.model.hparams.learnable_schedule == "v2":
-                self.log("model/sigma_min", self.model.get_tmin().detach().item())
-                self.log("model/sigma_max", self.model.get_tmax().detach().item())
+                to_log["model/sigma_min"] = self.model.get_tmin().detach().item()
+                to_log["model/sigma_max"] = self.model.get_tmax().detach().item()
         if self.model.hparams.variance_loss:
             times_vars = self.get_logvar("times").exp().detach()
             times_vars = {f"train/learned_var/time_{i}": float(v) for i, v in enumerate(times_vars)}
-            self.log_dict(times_vars, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            to_log.update(times_vars)
+        if len(to_log) > 0:
+            self.log_dict(to_log, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         return super().on_train_batch_end(*args, **kwargs)
 
     def get_preds_at_t_for_batch(
@@ -1220,6 +1224,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                     init_window = rrearrange(init_window, "b t c ... -> b c t ...")
                 else:
                     assert self.model.time_dim == 1, f"Unexpected time_dim={self.model.time_dim}"
+                init_window = self.pack_data(init_window, input_or_output="output")
 
                 if ensemble:
                     init_window = self.get_ensemble_inputs(init_window, split=split, add_noise=False)
@@ -1357,6 +1362,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         return next(self.sampler)
 
     def on_autoregressive_loop_end(self, split: str, dataloader_idx: int = None, **kwargs):
+        self.log("diffusion/nfe", self.model.nfe)
         self.sampler.close()
         self.sampler = None
 

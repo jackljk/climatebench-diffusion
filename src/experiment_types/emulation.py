@@ -65,7 +65,7 @@ class EmulationExperiment(BaseExperiment):
         # pop metadata from batch since not needed for evaluation
         metadata = batch.pop("metadata", None)
         raw_targets = batch.pop("raw_targets", None)  # Unnormalized (raw scale) data, used to compute targets
-        if self.is_diffusion_model and split == "val":
+        if self.is_diffusion_model:
             # log validation loss
             loss = self.get_loss(batch)
             aggregators["diffusion_loss"].update(loss=loss)

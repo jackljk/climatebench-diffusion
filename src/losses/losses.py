@@ -250,7 +250,8 @@ class AbstractWeightedLoss(torch.nn.Module):
             # Take mean over non-dim_name dimensions
             return self.logvars.mean(dim=tuple([idx for idx in range(self.logvars.ndim) if idx not in dim_idxs]))
 
-    def weigh_loss(self, loss, add_weight=None, multiply_weight=None, batch_logvars=None) -> Dict[str, Tensor]:
+    def weigh_loss(self, loss, add_weight=None, multiply_weight=None, batch_logvars=None, return_intermediate: bool = False) -> Dict[str, Tensor]:
+        losses = dict()
         if self.weights is not None:
             weights = self.weights
         else:
@@ -296,16 +297,39 @@ class AbstractWeightedLoss(torch.nn.Module):
             except RuntimeError as e:
                 raise RuntimeError(f"Failed to compute {weights.shape=} * {multiply_weight.shape=}.") from e
 
+        if return_intermediate:
+            if self.n_logvar_dims == 0:
+                if batch_logvars is None or not isinstance(batch_logvars, tuple):
+                    losses["unweighted_loss"] = loss.detach().cpu()
+                else:
+                    # Special logvars on multiple dimensions
+                    dims = tuple([idx for idx in range(loss.ndim) if idx not in batch_logvars[1]])
+                    losses["unweighted_loss"] = loss.mean(dim=dims).detach().cpu()
+            else:
+                # Bring logvar dimensions to the front. note that the dims are sorted by index (increasing)
+                loss_temp = torch.movedim(loss, self._dim_idxs_from, self._dim_idxs_to)
+                # Take mean over non-logvar dimensions
+                loss_temp = loss_temp.mean(dim=tuple(range(self.n_logvar_dims, loss_temp.ndim)))
+                losses["unweighted_loss"] = loss_temp.detach().cpu()
+
         try:
             loss = weights * loss
         except RuntimeError as e:
             raise RuntimeError(f"Failed to multiply {weights.shape=} by {loss.shape=}.") from e
 
-        losses = dict(raw_loss=float(loss.mean().detach()))
+        losses["raw_loss"] = float(loss.mean().detach().cpu())
         if self.n_logvar_dims == 0:
             if batch_logvars is not None:
-                loss = loss.mean(dim=tuple(range(1, loss.ndim)))  # Take mean over non-batch dimensions
-                loss = loss / torch.exp(batch_logvars) + batch_logvars
+                if isinstance(batch_logvars, tuple):
+                    # Special logvars on multiple dimensions
+                    dims = tuple([idx for idx in range(loss.ndim) if idx not in batch_logvars[1]])
+                    batch_logvars = batch_logvars[0]
+                else:
+                    dims = tuple(range(1, loss.ndim))
+                loss = loss.mean(dim=dims)  # Take mean over non-batch dimensions
+                loss_final = loss / torch.exp(batch_logvars) + batch_logvars
+            else:
+                loss_final = loss
         else:
             assert batch_logvars is None, "todo: implement batch logvars here too"
             # Bring logvar dimensions to the front. note that the dims are sorted by index (increasing)
@@ -329,15 +353,18 @@ class AbstractWeightedLoss(torch.nn.Module):
             #   rather than correctly applying on a per-dimension basis.
             assert loss.shape == log_vars.shape, f"{loss.shape=}, {log_vars.shape=}, {weights.shape=}"
             # Apply the learned variance to the loss
-            loss = loss / torch.exp(log_vars) + log_vars
+            loss_final = loss / torch.exp(log_vars) + log_vars
+        if return_intermediate:
+            losses["weighted_loss_before_vars"] = loss.detach().cpu()
+            losses["weighted_loss_after_vars"] = loss_final.detach().cpu()
 
         if self.reduction == "mean":
-            loss = loss.mean()
+            loss_final = loss_final.mean()
         elif self.reduction == "sum":
-            loss = loss.sum()
+            loss_final = loss_final.sum()
         else:
             raise ValueError(f"Unknown reduction {self.reduction}")
-        losses["loss"] = loss
+        losses["loss"] = loss_final
         return losses
 
     def forward(self, preds, targets):

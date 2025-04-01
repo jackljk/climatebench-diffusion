@@ -98,6 +98,10 @@ class LossAggregator(Metric):
     def compute(self, prefix: str = "", epoch: Optional[int] = None) -> Dict[str, float]:
         prefix = prefix + "/" if prefix else ""
         logs = {f"{prefix}{k}": float(self.__dict__[f"_{k}_sum"] / self._n_batches) for k in self._losses}
+        # for k, v in logs.items():
+        #     if v < 0 and "after" not in k and k != "val/loss":
+        #         kk = k.replace(prefix, '')
+        #         raise ValueError(f"LossAggregator: {k=}, {v=}, {self.__dict__[f'_{kk}_sum']=}, {self._n_batches=}")
         logs_own_xaxis = {}
         # If x-axes, log them separately too
         if self._x_axes is not None:
@@ -247,9 +251,6 @@ class OneStepAggregator(AbstractAggregator):
     def _get_logs(self, **kwargs) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
         """
         Returns logs as can be reported to WandB.
-
-        Args:
-            label: Label to prepend to all log keys.
         """
         logs, logs_media, logs_own_xaxis = {}, {}, {}
         for agg_type, agg in self._aggregators.items():

@@ -6,8 +6,15 @@ import torch
 import xarray as xr
 from torch import Tensor
 
-from src.evaluation.metrics import root_mean_squared_error, spread_skill_ratio, weighted_mean_bias, weighted_mean, \
-    compute_metric_on, weighted_std
+from src.evaluation.metrics import (
+    root_mean_squared_error,
+    spread_skill_ratio,
+    weighted_mean_bias,
+    weighted_mean,
+    compute_metric_on,
+    weighted_std,
+    mean_absolute_error,
+)
 from src.losses.losses import crps_ensemble
 from src.utilities.utils import get_logger, rrearrange
 from src.utilities.plotting import create_wandb_figures
@@ -22,10 +29,18 @@ metric_functions = {
     "rmse_member_avg": root_mean_squared_error,
     "ssr": spread_skill_ratio,
     "crps": crps_ensemble,
+    #
+    "mae_variance": mean_absolute_error,
+    "mean_variance_target": compute_metric_on(source="target", metric=weighted_mean),
+    "mean_variance_gen": compute_metric_on(source="gen", metric=weighted_mean),
+    #
     "mean_target": compute_metric_on(source="target", metric=weighted_mean),
     "mean_gen": compute_metric_on(source="gen", metric=weighted_mean),
+    "mean_gen_member_avg": compute_metric_on(source="gen", metric=weighted_mean),
+    #
     "std_target": compute_metric_on(source="target", metric=weighted_std),
     "std_gen": compute_metric_on(source="gen", metric=weighted_std),
+    "std_gen_member_avg": compute_metric_on(source="gen", metric=weighted_std),
 }
 
 
@@ -152,7 +167,7 @@ class TemporalMetricsAggregator:
                     agg_dict[date]["data_sum2_difference"][k] += delta * delta2  # update sum of squared differences
 
     @torch.inference_mode()
-    def compute(self, label: str = "", epoch: int = None):
+    def compute(self, prefix: str = "", epoch: int = None):
         log.info("Getting logs for temporal metrics(extended validation) --- May take a while")
         # asset data to ensure trustworthy evaluation
         # self._assert_data()
@@ -171,36 +186,59 @@ class TemporalMetricsAggregator:
 
         logs = self._log_dict.copy()
         image_logs = {}
-        ssp = label if label else ""
-        label = f"extended_{label}/" if label else ""
+        ssp = prefix if prefix else ""
+        prefix = f"extended_{prefix}/" if prefix else ""
         gen_ens_mean = None
         for date in dates:  # loop for each date separating metrics by the date
             date_as_str = self._timestamp_to_str(date)
             # get date from date
             gen = data_dict["generated_mean"][date]
             target = data_dict["target_mean"][date]
+            gen_variance = data_dict["generated_variance"][date]
+            target_variance = data_dict["target_variance"][date]
             if self.is_ensemble:
                 # get ens means
                 gen_ens_mean = {k: v.mean(dim=0) for k, v in gen.items()}
 
-            ####
-            # TODO: add more metrics?
-            ####
             # get the values for the x-axis
             logs["date"]["x_axes"]["date"].append(date)
             # get metrics for each date
             logs["date"][date] = self._get_metrics(
-                target, gen, gen_ens_mean, date, self.var_names, self.metrics, label=label
+                target,
+                gen,
+                gen_ens_mean,
+                target_variance,
+                gen_variance,
+                date,
+                self.var_names,
+                self.metrics,
+                label=prefix,
             )
 
-            image_logs.update(
-                {
-                    f"{label}snapshots-{self.temporal_scale}-mean/{key}": val
-                    for key, val in self._timeAggSnapshots(
-                        target, gen, date_as_str, is_ensemble=self.is_ensemble, ssp=ssp
-                    ).items()
-                }
-            )
+            # Don't save snapshots for daily data (too many)
+            if self.temporal_scale != "daily":
+                # get mean snapshots
+                image_logs.update(
+                    {
+                        f"{prefix}snapshots-{self.temporal_scale}-mean/{key}": val
+                        for key, val in self._timeAggSnapshots(
+                            target, gen, date_as_str, is_ensemble=self.is_ensemble, ssp=ssp
+                        ).items()
+                    }
+                )
+                # get variance snapshots
+                image_logs.update(
+                    {
+                        f"{prefix}snapshots-{self.temporal_scale}-variance/{key}": val
+                        for key, val in self._timeAggSnapshots(
+                            target_variance,
+                            gen_variance,
+                            date_as_str,
+                            is_ensemble=self.is_ensemble,
+                            ssp=ssp, show_log_precip=False
+                        ).items()
+                    }
+                )
 
         # if timescale is yearly save the data to wandb
         if self.save_to_wandb and self.temporal_scale == "yearly":
@@ -223,9 +261,7 @@ class TemporalMetricsAggregator:
                     for var in self.var_names
                 }
                 gen_tensor = {
-                    var: torch.stack(
-                        [data_dict[f"generated_{key}"][date][var] for date in dates]
-                    )
+                    var: torch.stack([data_dict[f"generated_{key}"][date][var] for date in dates])
                     for var in self.var_names
                 }
                 # fix gen_tensor to have the same shape as what 'save_to_disk' expects
@@ -242,7 +278,7 @@ class TemporalMetricsAggregator:
 
         return {}, image_logs, logs
 
-    def _get_metrics(self, target, pred, pred_ens_mean, date, vars, metrics, label=""):
+    def _get_metrics(self, target, pred, pred_ens_mean, target_variance, pred_variance, date, vars, metrics, label=""):
         computed_metrics = {}
         weights = self.area_weights.to(self._device)
         for var in vars:
@@ -255,6 +291,12 @@ class TemporalMetricsAggregator:
                             for i in range(pred[var].shape[0])
                         ]
                     )
+                elif "variance" in metric:
+                    computed_metrics[metric_key] = float(
+                        metric_functions[metric](
+                            predicted=pred_variance[var], truth=target_variance[var], weights=weights
+                        ).cpu()
+                    )
                 else:
                     # Do we use the full ensemble or the mean of the ensemble?
                     pred_to_use = pred[var] if metric in ["crps", "ssr"] else pred_ens_mean[var]
@@ -265,7 +307,7 @@ class TemporalMetricsAggregator:
         computed_metrics["date"] = date
         return computed_metrics
 
-    def _timeAggSnapshots(self, target, gen, date, is_ensemble=True, ssp=""):
+    def _timeAggSnapshots(self, target, gen, date, is_ensemble=True, ssp="", **kwargs):
         """
         Generate Snapshots of the data aggregated in time
         Args:
@@ -280,7 +322,7 @@ class TemporalMetricsAggregator:
 
         snapshots = {}
         for var in self.var_names:
-            snapshots_var = create_wandb_figures(target, gen, var, date, self.coords)
+            snapshots_var = create_wandb_figures(target, gen, var, date, self.coords, **kwargs)
             snapshots.update(snapshots_var)
 
         return snapshots
@@ -367,6 +409,8 @@ class TemporalMetricsAggregator:
         elif self.temporal_scale == "monthly":
             datetime_obj = datetime.datetime(*[int(i) for i in datetime_obj.split("-")[:2] + ["15"]])
             # datetime_obj = cftime.DatetimeNoLeap(*[int(i) for i in datetime_obj.split("-")[:2] + ["15"]])
+        elif self.temporal_scale == "daily":
+            datetime_obj = datetime.datetime(*[int(i) for i in datetime_obj.split("-")])
         else:
             raise ValueError(f"Temporal scale {self.temporal_scale} is not supported!")
 
@@ -381,5 +425,7 @@ class TemporalMetricsAggregator:
             return datetime_obj.strftime("%Y")
         elif self.temporal_scale == "monthly":
             return datetime_obj.strftime("%Y-%m")
+        elif self.temporal_scale == "daily":
+            return datetime_obj.strftime("%Y-%m-%d")
         else:
             raise ValueError(f"Temporal scale {self.temporal_scale} is not supported!")

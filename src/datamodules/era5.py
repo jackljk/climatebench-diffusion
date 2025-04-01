@@ -112,6 +112,7 @@ class ERA5DataModuleBase(BaseDataModule):
         lat_lon_format: str = "lon_lat",
         text_type: str = "tf-idf",  # can be tf-idf, bert, bow
         log_metrics: bool = True,
+        log_normed: bool = True,
         log_images: bool = True,
         log_spectra: bool = False,
         every_nth_epoch_snapshot: int = 8,
@@ -618,7 +619,7 @@ class ERA5DataModuleBase(BaseDataModule):
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
         aggr_kwargs["coords"] = {"latitude": self._latitude, "longitude": self._longitude}
-        record_normed = True if split_horizon <= 80 else False  # save logging space for huge horizons
+        record_normed = self.hparams.log_normed and split_horizon <= 80  # save logging space for huge horizons
         record_abs_values = True if split_horizon <= 80 else False
         record_rmse = True
         if split_ds.mask is not None:

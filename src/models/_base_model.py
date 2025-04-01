@@ -44,7 +44,7 @@ class BaseModel(LightningModule):
     Read the docs regarding LightningModule for more information:
         https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html
     """
-
+    is_3d = False
     def __init__(
         self,
         num_input_channels: int = None,
@@ -88,7 +88,7 @@ class BaseModel(LightningModule):
         self.num_conditional_channels = num_conditional_channels
         self.num_conditional_channels_non_spatial = num_conditional_channels_non_spatial
         self.spatial_shape_in = spatial_shape_in
-        self.spatial_shape_out = spatial_shape_out
+        self.spatial_shape_out = spatial_shape_out or spatial_shape_in
         self.datamodule_config = datamodule_config
         self.predict_non_spatial_condition = predict_non_spatial_condition
 

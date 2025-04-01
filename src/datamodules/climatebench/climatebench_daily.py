@@ -31,6 +31,22 @@ from src.utilities.utils import get_logger, to_torch_and_device
 
 log = get_logger(__name__)
 
+statistics = {
+    'tas_mean': {'weighted': 289.83469702468193, 'unweighted': 280.41241455078125},
+    'tas_std': {'weighted': 15.114547332402394, 'unweighted': 21.20634651184082},
+    'pr_mean': {'weighted': 3.5318931751025825e-05, 'unweighted': 2.9361413908191025e-05},
+    'pr_std': {'weighted': 8.351846484899611e-05, 'unweighted': 7.215367804747075e-05},
+    'log_1_pr_mean': {'weighted': 3.531428776456019e-05, 'unweighted': 2.935781958512962e-05},
+    'log_1_pr_std': {'weighted': 8.348880039616833e-05, 'unweighted': 7.21298492862843e-05},
+    # Try these:
+    'log_1e-8_pr_mean': {'weighted': -12.47100560750103, 'unweighted': -12.584796905517578},
+    'log_1e-8_pr_std': {'weighted': 2.8926291719896695, 'unweighted': 2.76674485206604},
+    'log_mm_day_1_pr_mean': {'weighted': 0.8233942575117554, 'unweighted': 0.7447913885116577},
+    'log_mm_day_1_pr_std': {'weighted': 0.9123542090854786, 'unweighted': 0.851499617099762},
+    'log_mm_day_001_pr_mean': {'weighted': -0.7521765418647202, 'unweighted': -0.8860650062561035},
+    'log_mm_day_001_pr_std': {'weighted': 2.2917330972570222, 'unweighted': 2.208401918411255},
+}
+
 
 class ClimateBenchDailyDataModule(ClimateBenchDataModule):
     def __init__(
@@ -45,6 +61,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         simulations_raw: Sequence[str] = None,
         simulations_anom_type: str = "piControl",
         normalization_type: str = None,  # "standard",
+        precip_transform: str = None,   # how to transform precipitation data
         window: int = 10,  # == slider
         output_vars: Sequence[str] | str = "tas",
         mean_over_ensemble: bool = True,
@@ -170,24 +187,52 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             #  1a. Compute the standard deviation of the training targets for each output variable, use them separately in EDM (for each channel)
             #  1b. To use multiple output_vars, a first step could simply set sigma_data to the avg of the std of the output_vars
             #  2. Compute it over all training simulations, not one.
-            if self.hparams.normalization_type == "standard":
-                # Compute the mean and std of the output variables
-                if len(self.output_vars) == 1 and self.output_vars[0] == "tas":
-                    data_mean_act = {"tas": torch.tensor(279.7749)}
-                    data_std_act = {"tas": torch.tensor(29.7625)}
-                elif self.output_vars == ["tas", "pr"]:
-                    data_mean_act = {"tas": torch.tensor(279.7749), "pr": torch.tensor(2.8494e-05)}
-                    data_std_act = {"tas": torch.tensor(29.7625), "pr": torch.tensor(5.3200e-05)}
-                else:
-                    log.info("Computing mean and std of the output variables")
-                    data_mean = Y_train[sim_val["Y"]].mean()
-                    data_std = Y_train[sim_val["Y"]].std()
+            var_to_transform_name = dict()
+            if "standard" in self.hparams.normalization_type:
+                if self.hparams.normalization_type == "standard":
+                    assert self.hparams.precip_transform is None
+                    # Compute the mean and std of the output variables
+                    if len(self.output_vars) == 1 and self.output_vars[0] == "tas":
+                        data_mean_act = {"tas": torch.tensor(279.7749)}
+                        data_std_act = {"tas": torch.tensor(29.7625)}
+                    elif self.output_vars == ["tas", "pr"]:
+                        data_mean_act = {"tas": torch.tensor(279.7749), "pr": torch.tensor(2.8494e-05)}
+                        data_std_act = {"tas": torch.tensor(29.7625), "pr": torch.tensor(5.3200e-05)}
+                    else:
+                        log.info("Computing mean and std of the output variables")
+                        data_mean = Y_train[sim_val["Y"]].mean()
+                        data_std = Y_train[sim_val["Y"]].std()
+                        data_mean_act, data_std_act = dict(), dict()
+                        for ovar in self.output_vars:
+                            data_mean_act[ovar] = torch.tensor(data_mean[self.ovar_to_var_id[ovar]].item())
+                            data_std_act[ovar] = torch.tensor(data_std[self.ovar_to_var_id[ovar]].item())
+                elif self.hparams.normalization_type == "standard_new":
                     data_mean_act, data_std_act = dict(), dict()
                     for ovar in self.output_vars:
-                        data_mean_act[ovar] = torch.tensor(data_mean[self.ovar_to_var_id[ovar]].item())
-                        data_std_act[ovar] = torch.tensor(data_std[self.ovar_to_var_id[ovar]].item())
+                        if ovar == "pr" and self.hparams.precip_transform is not None:
+                            pr_transform = self.hparams.precip_transform
+                            if "only" in pr_transform:
+                                # Only transform the precipitation data but do not standardize it
+                                log.info(f"Only transforming the precipitation data with {pr_transform}")
+                                pr_transform = pr_transform.replace("_only", "")
+                                mean_pr, std_pr = 0.0, 1.0
+                            else:
+                                mean_pr = statistics[f"{pr_transform}_pr_mean"]["weighted"]
+                                std_pr = statistics[f"{pr_transform}_pr_std"]["weighted"]
+                            var_to_transform_name[ovar] = pr_transform
+                        else:
+                            mean_pr = statistics[f"{ovar}_mean"]["weighted"]
+                            std_pr = statistics[f"{ovar}_std"]["weighted"]
+                        data_mean_act[ovar] = torch.tensor(mean_pr)
+                        data_std_act[ovar] = torch.tensor(std_pr)
+                else:
+                    raise ValueError(f"Invalid value for normalization_type: {self.hparams.normalization_type}")
                 log.info(f"Standardizing data with mean: {data_mean_act}, std: {data_std_act}")
-                self.normalizer_targets = StandardNormalizer(means=data_mean_act, stds=data_std_act)
+                self.normalizer_targets = StandardNormalizer(
+                    means=data_mean_act,
+                    stds=data_std_act,
+                    var_to_transform_name=var_to_transform_name,
+                )
                 self._sigma_data = 1.0
             else:
                 assert (

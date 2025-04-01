@@ -112,7 +112,7 @@ def extras(
         run_api = None
         os.environ["WANDB_HTTP_TIMEOUT"] = "200"  # Increase timeout for slow connections
         wandb_cfg = config.logger.wandb
-        wandb_api.PROJECT = wandb_cfg.get("project", wandb_api.PROJECT)
+        wandb_api.PROJECT = config.logger.wandb.project = wandb_cfg.get("project", wandb_api.PROJECT)
         wandb_api._ENTITY = config.logger.wandb.entity = wandb_api.get_entity(wandb_cfg.get("entity"))
 
         if wandb_cfg.get("id") or wandb_cfg.get("resume_run_id"):
@@ -129,7 +129,7 @@ def extras(
                     "id"
                 ), "Both wandb.id and wandb.resume_run_id are set. Only one should be set."
                 resume_run_id = str(wandb_cfg.resume_run_id)
-                config.logger.wandb.id = wandb_api.get_wandb_id_for_run()
+                config.logger.wandb.id = wandb_api.get_wandb_id_for_run(config.logger.wandb)
                 log.info(
                     f"Resuming experiment with wandb run ID = {resume_run_id} on NEW run: ``{config.logger.wandb.id}``"
                 )
@@ -216,7 +216,7 @@ def extras(
 
             if config.logger.wandb.get("id") is None:
                 # no wandb id has been assigned yet
-                config.logger.wandb.id = wandb_api.get_wandb_id_for_run()
+                config.logger.wandb.id = wandb_api.get_wandb_id_for_run(config.logger.wandb)
 
     elif if_wandb_run_already_exists in ["abort", "resume"]:
         wandb_status = "not_used"
@@ -263,6 +263,7 @@ def extras(
             if allow_permission_error:
                 log.warning(f"PermissionError: {e}")
             else:
+                log.info(f"Please set ``work_dir`` to a valid path for which you have write permissions. Current: {config.work_dir}")
                 raise e
 
     # disable python warnings if <config.ignore_warnings=True>
@@ -426,7 +427,8 @@ def extras(
                     config.logger.wandb.project = wandb_api.PROJECT = config.logger.wandb.pop("project_test")
                     config.effective_batch_size = train_run.config.get("effective_batch_size")
 
-                config.logger.wandb.id = wandb_api.get_wandb_id_for_run()  # Set a new run ID (!= training run ID)
+                # Set a new run ID (!= training run ID)
+                config.logger.wandb.id = wandb_api.get_wandb_id_for_run(config.logger.wandb)
                 # Check if a test run already exists
                 try:
                     runs_in_group = get_existing_wandb_group_runs(
@@ -607,7 +609,7 @@ def check_config_values(config: DictConfig):
             config.logger.wandb.id = str(config.logger.wandb.id)  # convert to string
             if not config.get("eval_mode"):
                 if config.logger.wandb.get("project_test") is not None:
-                    raise ValueError("You are trying to override the wandb project, but you are not in test mode!")
+                    raise ValueError(f"You are trying to override the wandb project, but {config.get('eval_mode')=}!")
 
             if "callbacks" in config and not config.get("eval_mode"):
                 # Add wandb run ID to model checkpoint dir as a subfolder
@@ -692,6 +694,14 @@ def check_config_values(config: DictConfig):
             else:
                 log.warning("Setting datamodule.num_workers to 0. This might not be optimal for CPU training!")
                 config.datamodule.num_workers = 0
+        if config.datamodule.num_workers == 0 and config.datamodule.get("prefetch_factor") is not None:
+            # Not using workers, so prefetch_factor will be ignored
+            log.warning(f"{config.datamodule.prefetch_factor=} will be ignored since num_workers=0! Set to None.")
+            config.datamodule.prefetch_factor = None
+        if config.datamodule.num_workers == 0 and config.datamodule.get("persistent_workers") is True:
+            # Not using workers, so persistent_workers will be ignored
+            log.warning(f"datamodule.persistent_workers=True will be ignored since num_workers=0! Set to False.")
+            config.datamodule.persistent_workers = False
 
         if config.get("eval_mode"):
             if config.datamodule.get("batch_size_per_gpu") is not None:

@@ -17,7 +17,7 @@ def test_labels_exist():
     target_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     gen_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     agg.update(loss, target_data, gen_data, target_data_norm, gen_data_norm)
-    logs = agg.compute(label="test")
+    logs = agg.compute(prefix="test")
     assert "test/mean/loss" in logs
     assert "test/mean/l1/a" in logs
     assert "test/mean/weighted_rmse/a" in logs
@@ -52,7 +52,7 @@ def test_loss():
         target_data_norm=example_data,
         gen_data_norm=example_data,
     )
-    logs = aggregator.compute(label="metrics")
+    logs = aggregator.compute(prefix="metrics")
     assert logs["metrics/mean/loss"] == 1.5
     aggregator.update(
         loss=3.0,
@@ -61,7 +61,7 @@ def test_loss():
         target_data_norm=example_data,
         gen_data_norm=example_data,
     )
-    logs = aggregator.compute(label="metrics")
+    logs = aggregator.compute(prefix="metrics")
     assert logs["metrics/mean/loss"] == 2.0
 
 

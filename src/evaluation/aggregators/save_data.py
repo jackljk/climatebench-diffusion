@@ -64,14 +64,14 @@ class SaveToDiskAggregator(AbstractAggregator):
 
         if torch.is_tensor(target_data):  # add dummy key
             data = {"targets": target_data, "preds": gen_data}
+            batch_size = target_data.shape[:1]
         else:
             data = {
                 **{f"{k}_targets": v for k, v in target_data.items()},
                 **{f"{k}_preds": v for k, v in gen_data.items()},
             }
-            
-        batch_size = gen_data.shape[:1] if isinstance(gen_data, TensorDict) else gen_data[self.var_names[0]].shape[:1]
-                                                        
+            batch_size = target_data[self.var_names[0]].shape[:1]
+
         data = to_tensordict(data, device="cpu", batch_size=batch_size).to("cpu")
         if concat_dim_key is None:
             if self._running_data is None:
@@ -95,7 +95,7 @@ class SaveToDiskAggregator(AbstractAggregator):
             self._metadatas.append(torch_to_numpy(metadata))
 
     @torch.inference_mode()
-    def _get_logs(self, label: str = "", epoch: Optional[int] = None, metadata=None) -> Dict[str, float]:
+    def _get_logs(self, prefix: str = "", epoch: Optional[int] = None, metadata=None) -> Dict[str, float]:
         """Converts running data to xarray dataset."""
         if self._running_data is None:
             log.warning("No data to log.")
@@ -135,7 +135,7 @@ class SaveToDiskAggregator(AbstractAggregator):
             # Direct conversion for data without concat dimensions
             final_ds = self._tensordict_to_dataset(self._running_data)
 
-        final_ds.attrs["label"] = label
+        final_ds.attrs["label"] = prefix
         # Add metadata if available
         if self._metadatas:
             for key, value in self._metadatas[0].items():
@@ -155,9 +155,9 @@ class SaveToDiskAggregator(AbstractAggregator):
 
         # Save to file if path is provided
         save_to_path = (
-            self.save_to_path + f"{label}-epoch{epoch}-results.nc"
+            self.save_to_path + f"{prefix}-epoch{epoch}-results.nc"
             if self.save_to_path
-            else f"{label}-epoch{epoch}-results.nc"
+            else f"{prefix}-epoch{epoch}-results.nc"
         )
         log.info(f"Saving results to {save_to_path}")
         # predictions/6h-1AR_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_54lr_LC5:200_15wd_fLV_11seed_19h03mOct18_3423514-5214396-hor30-TAG-ENS=5-max_val_samples=1-val_slice=20210329_20210430-possible_initial_times=12-prediction_horizon=30-TAG-epoch199.nc

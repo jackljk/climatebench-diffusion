@@ -150,11 +150,19 @@ def get_run_apis(
         return get_runs_for_filter(group=group, **kwargs)
 
 
-def get_wandb_id_for_run() -> str:
+def get_wandb_id_for_run(wandb_config: Dict[str, Any]) -> str:
     """Get a unique id for the current run. If on a Slurm cluster, use the job ID, otherwise generate a random id."""
     if "SLURM_JOB_ID" in os.environ:
         # we are on a Slurm cluster... using the job ID helps when requeuing jobs to resume the same run
-        return str(os.environ["SLURM_JOB_ID"])
+        maybe_id = maybe_id_base = str(os.environ["SLURM_JOB_ID"])
+        # Check if the wandb ID already exists on wandb
+        try:
+            for trial in range(1000):
+                maybe_id = f"{maybe_id_base}v{trial}" if trial > 0 else maybe_id_base
+                r = get_run_api(run_id=maybe_id, entity=wandb_config["entity"], project=wandb_config["project"])
+            return wandb.sdk.lib.runid.generate_id()  # we've tried 1000 times, so just generate a random id
+        except Exception as e:
+            return maybe_id  # the run does not exist yet
     else:
         # we are not on a Slurm cluster, so just generate a random id
         return wandb.sdk.lib.runid.generate_id()

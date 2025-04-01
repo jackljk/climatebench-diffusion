@@ -1305,7 +1305,7 @@ def beautify_plots_with_metrics(
         y = anchor_y + 0.035 if plot_legend_on_top else 0.93
         axes[0].figure.suptitle(title, y=y)
 
-def create_wandb_figures(target, gen, var_name, fig_shared_label, coords):
+def create_wandb_figures(target, gen, var_name, fig_shared_label, coords, show_log_precip=True):
     # Some plotting parameters
     map_transform = ccrs.PlateCarree()
     _plot_params = {
@@ -1351,7 +1351,7 @@ def create_wandb_figures(target, gen, var_name, fig_shared_label, coords):
     snapshots = dict()
     y = 0.85
     # Handle Precipitation unique case
-    if var_name == "pr":
+    if var_name == "pr" and show_log_precip:
         # get log version to make more visible
         target_log = np.log(target + 1)
         gen_log = np.log(gen_ens_mean + 1)

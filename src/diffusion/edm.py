@@ -451,10 +451,13 @@ class MPFourier(torch.nn.Module):
 
 
 class MPConv(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel):
+    def __init__(self, in_channels, out_channels, kernel, zero_init=False):
         super().__init__()
         self.out_channels = out_channels
-        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
+        if zero_init:
+            self.weight = torch.nn.Parameter(torch.zeros(out_channels, in_channels, *kernel))
+        else:
+            self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
 
     def forward(self, x, gain=1):
         w = self.weight.to(torch.float32)

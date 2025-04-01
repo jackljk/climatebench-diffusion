@@ -163,6 +163,31 @@ def root_mean_squared_error(
     mse = mean_squared_error(truth, predicted, weights=weights, dim=dim)
     return torch.sqrt(mse)
 
+def mean_absolute_error(
+    truth: Tensor,
+    predicted: Tensor,
+    weights: Optional[Tensor] = None,
+    dim: Dimension = (),
+) -> Tensor:
+    """
+    Computes the weighted global MAE over all variables. Namely, for each variable:
+
+        sqrt((weights * (abs(xhat - x))).mean(dims))
+
+    If you want to compute the MAE over the time dimension, then pass in
+    `truth.mean(time_dim)` and `predicted.mean(time_dim)` and specify `dims=space_dims`.
+
+    Args:
+        truth: Tensor whose last dimensions are to be weighted
+        predicted: Tensor whose last dimensions are to be weighted
+        weights: Tensor to apply to the absolute bias.
+        dim: Dimensions to average over.
+
+    Returns a tensor of shape (variable,) of weighted MAEs.
+    """
+    abs_bias = torch.abs(predicted - truth)
+    return weighted_mean(abs_bias, weights=weights, dim=dim)
+
 
 def ensemble_spread(predicted: Tensor, weights: Optional[Tensor] = None, dim: Dimension = ()) -> Tensor:
     """Compute the spread of the ensemble members.

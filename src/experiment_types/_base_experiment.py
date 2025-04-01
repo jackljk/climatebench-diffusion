@@ -453,7 +453,7 @@ class BaseExperiment(LightningModule):
             verbose=self.current_epoch == 0,
             save_to_path=self.prediction_outputs_filepath,
         )
-        if self.is_diffusion_model and split == "val" and dataloader_idx in [0, None]:
+        if self.is_diffusion_model and dataloader_idx in [0, None]:
             # Add aggregator for loss aggregated over batches of validation dataloader
             self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
             aggregators["diffusion_loss"] = LossAggregator()
@@ -1390,7 +1390,7 @@ class BaseExperiment(LightningModule):
                         else:
                             raise ValueError(f"Unknown lead time format: {agg_name_substring}")
                         break
-                    elif agg_name_substring != "" and all(k not in agg_name_substrings for k in ["loss", "time_mean"]):
+                    elif agg_name_substring != "" and all(k not in agg_name_substring for k in ["loss", "time_mean"]):
                         print(f"agg_name_substring={agg_name_substring} does not start with 't' and is not a number.")
 
                 # if agg.name is None:  # does not work when using a listaggregator
@@ -1468,7 +1468,11 @@ class BaseExperiment(LightningModule):
             val_stats.update(total_mean_metrics)
             total_mean_metrics_all += list(total_mean_metrics.keys())
         # print(f"Total mean metrics: {total_mean_metrics_all}, 10 values: {dict(list(val_stats.items())[:10])}")
-        self.log_dict(val_stats, sync_dist=True, prog_bar=False)
+        # NOTE: Sync_dist is False because we assume that aggregators are correctly synchronized across devices
+        #  This is true if you use the torchmetrics.Metric class or our own aggregators that base off it
+        #  If you do not, sync_dist=True will synchronize the metrics across devices
+        #  We set it to False because some weird issues occur when syncronizing the loss aggregator
+        self.log_dict(val_stats, sync_dist=False, prog_bar=False)
         # log to experiment
         if self.logger is not None and hasattr(self.logger.experiment, "log"):
             self.logger.experiment.log(val_media)
@@ -1508,7 +1512,7 @@ class BaseExperiment(LightningModule):
             data_split_names=self.test_set_names,
             aggregators=self.aggregators_test,
         )
-        self.log_dict({"TESTED": True}, prog_bar=False, sync_dist=True)
+        self.log_dict({"TESTED": True}, prog_bar=False, sync_dist=False)
 
     # ---------------------------------------------------------------------- Inference
     def on_predict_start(self) -> None:
@@ -1577,22 +1581,24 @@ class BaseExperiment(LightningModule):
                     "save_prediction",
                     "num_predictions_in_memory",
                     "batch_size",
-                    "regression_wandb_ckpt_filename",
                     "force_pure_noise_last_frame",
+                    "compute_loss_per_sigma",
                     "val_slice",
                     "max_val_samples",
                     "data_dir",
                 ]
-                skip_tags_with_value = ["initialize_window=regression"]
+                skip_tags_with_value = ["initialize_window=regression", "regression_ckpt_filename=latest_epoch"]
                 tags = [
                     t
                     for t in tags
                     if "=" in t
+                    and not "=null" in t
                     and not any([st in t for st in skip_tags])
                     and not any([st in t for st in skip_tags_with_value])
                 ]
                 tags_to_short = dict(
                     regression_run_id="rID",
+                    regression_ckpt_filename="rCfname",
                     S_churn="ch",
                     shift_test_times_by="shift",
                     test_filename="fn",
@@ -1607,6 +1613,7 @@ class BaseExperiment(LightningModule):
                     use_cold_sampling_for_intermediate_steps="cI",
                     use_cold_sampling_for_last_step="cL",
                     use_cold_sampling_for_init_of_ar_step="cIAR",
+                    refine_intermediate_predictions="rip",
                 )
                 tags_to_short["True"] = "T"
                 tags_to_short["False"] = "F"
@@ -1871,8 +1878,14 @@ class BaseExperiment(LightningModule):
         try:
             super().load_state_dict(state_dict, strict=strict)
         except Exception:
+            if self.model.is_3d or (self.is_diffusion_model and self.model.model.is_3d):
+                # Unsqueeze third dimension for 3D models
+                keys_to_unsqueeze = ["conv", "skip", "qkv", "proj"]
+                for k in state_dict.keys():
+                    if any(ku in k for ku in keys_to_unsqueeze) and ("weight" in k or "resample_filter" in k):
+                        state_dict[k] = state_dict[k].unsqueeze(2)
             # try adding 2 singleton dims to criterion.preds.channels_logvar key
-            if self.model.hparams.log_vars_learn_per_dim:
+            if self.model.hparams.log_vars_learn_per_dim and logvar_c_key is not None:
                 state_dict[logvar_c_key] = state_dict[logvar_c_key].unsqueeze(-1).unsqueeze(-1)
             super().load_state_dict(state_dict, strict=strict)
 

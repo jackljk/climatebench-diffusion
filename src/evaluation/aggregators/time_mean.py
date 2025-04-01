@@ -68,7 +68,7 @@ class TimeMeanAggregator(AbstractAggregator):
         self._gen_data = add_or_initialize_time_mean(self._gen_data, gen_data)
 
     @torch.inference_mode()
-    def _get_logs(self, label: str = "", **kwargs):
+    def _get_logs(self, prefix: str = "", **kwargs):
         """
         Returns logs as can be reported to WandB.
         """
@@ -120,9 +120,9 @@ class TimeMeanAggregator(AbstractAggregator):
             snapshots_var = create_wandb_figures(target, gen, name, fig_shared_label="", coords=self.coords)
             log_snapshots.update(snapshots_var)
 
-        label = label + "/" if label else ""
-        logs = {f"{label}{key}": logs[key] for key in logs}
-        log_snapshots = {f"{label}{key}": log_snapshots[key] for key in log_snapshots}
+        prefix = prefix + "/" if prefix else ""
+        logs = {f"{prefix}{key}": logs[key] for key in logs}
+        log_snapshots = {f"{prefix}{key}": log_snapshots[key] for key in log_snapshots}
         return logs, log_snapshots, {}
 
     @torch.inference_mode()

@@ -19,6 +19,7 @@ module:
   torch_compile: null             # compile the model using torch.compile for faster execution (requires >=2.0). If None, don't compile. If "model", compile only the model. If "module", compile LightningModule (and model).
   num_predictions: 20             # number of predictions/samples/ensemble members to make for each batch element
   prediction_inputs_noise: 0.0    # perturbation noise to add to the inputs before predicting
+  allow_validation_size_indivisible_on_ddp: False
   logging_infix: ""               # infix to add to the metric keys when logging to wandb
   verbose: ${verbose}
   seed: ${seed}

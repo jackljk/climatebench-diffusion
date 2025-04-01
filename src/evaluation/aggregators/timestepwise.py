@@ -155,24 +155,24 @@ class MetricAggregator(Metric):
                     # print(f"Time taken for {metric} {name} in s: {time_taken:.5f}")
 
     @torch.inference_mode()
-    def compute(self, label: str = "", epoch: Optional[int] = None) -> Dict[str, float]:
+    def compute(self, prefix: str = "", epoch: Optional[int] = None) -> Dict[str, float]:
         """
         Returns logs as can be reported to WandB.
 
         Args:
-            label: Label to prepend to all log keys.
+            prefix: Label to prepend to all log keys.
             epoch: Current epoch number.
         """
         if self._variable_metrics is None:
             raise ValueError("No batches have been recorded.")
         logs = {}
-        label = label + "/" if label else ""
+        prefix = prefix + "/" if prefix else ""
         for i, metric in enumerate(self._variable_metrics):
             for variable, metric_value in self._variable_metrics[metric].items():
                 metric_value = metric_value.compute()
                 if metric_value is None:
-                    raise ValueError(f"{metric=} hasn't been computed for {variable=}. ({label=},  {i=})")
-                log_key = f"{label}{metric}/{variable}".rstrip("/")
+                    raise ValueError(f"{metric=} hasn't been computed for {variable=}. ({prefix=},  {i=})")
+                log_key = f"{prefix}{metric}/{variable}".rstrip("/")
                 logs[log_key] = float(metric_value.detach().item())
 
         # for key in sorted(logs.keys()):
@@ -182,7 +182,7 @@ class MetricAggregator(Metric):
 
     @torch.inference_mode()
     def get_dataset(self, label: str) -> xr.Dataset:
-        logs = self.compute(label=label)
+        logs = self.compute(prefix=label)
         logs = {key.replace("/", "-"): logs[key] for key in logs}
         data_vars = {}
         for key, value in logs.items():

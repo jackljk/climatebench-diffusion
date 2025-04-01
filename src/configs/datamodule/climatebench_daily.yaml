@@ -29,7 +29,7 @@ DEBUG_dataset_size: null # Set to None to use the full dataset, value is the num
 comprehensive_validation:
   run: False
   n_epochs: 1 # Run every x epoch
-  temporal_scale: 'yearly' # 'monthly' or 'yearly'
+  temporal_scale: 'yearly' # 'daily', 'monthly' or 'yearly'  (Note if 'daily' is selected, there will be no visualizations)
   metrics: "all" #["rmse", "crps", "ssr", "rmse_member_avg"]  # to add: 'brier_score', 'rmsb'
   val_years: null  # "[START_YEAR, END_YEAR]" # Set to None to use the full dataset
   test_years: null  # "[START_YEAR, END_YEAR]" # Set to None to use the full dataset

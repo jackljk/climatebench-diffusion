@@ -30,7 +30,7 @@ def test_logs_labels_exist():
     target_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     gen_data_norm = {"a": torch.randn(n_sample, n_time, nx, ny, device=get_device())}
     agg.update(loss, target_data, gen_data, target_data_norm, gen_data_norm)
-    logs = agg.compute(label="test")
+    logs = agg.compute(prefix="test")
     assert "test/mean/series" in logs
     assert "test/mean_norm/series" in logs
     assert "test/mean_step_20/l1/a" in logs
@@ -127,7 +127,7 @@ def test_i_time_start_gets_correct_time_longer_windows(window_len: int, n_window
             i_time_start=i_start,
         )
         i_start += window_len - overlap  # subtract 1 for overlapping windows
-    logs = agg.compute(label="metrics")
+    logs = agg.compute(prefix="metrics")
     table = logs["metrics/mean/series"]
     # get the weighted_bias column
     bias = table.get_column("weighted_bias/a")

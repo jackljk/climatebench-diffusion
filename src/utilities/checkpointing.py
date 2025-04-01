@@ -289,15 +289,16 @@ def reload_checkpoint_from_wandb(
 
     assert os.path.isfile(ckpt_path), f"Could not find {ckpt_path=} in {os.getcwd()}"
     assert str(config.logger.wandb.id) == str(run_id), f"{config.logger.wandb.id=} != {run_id=}."
-    try:
-        reloaded_model_data = reload_model_from_config_and_ckpt(config, ckpt_path, **reload_kwargs)
-    except RuntimeError as e:
-        rank = os.environ.get("RANK", None) or os.environ.get("LOCAL_RANK", 0)
-        raise RuntimeError(
-            f"[rank: {rank}] You may have changed the model code, making it incompatible with older model "
-            f"versions. Tried to reload the model ckpt for run.id={run_id} from {ckpt_path}.\n"
-            f"config.model={config.model}"
-        ) from e
+    reloaded_model_data = reload_model_from_config_and_ckpt(config, ckpt_path, **reload_kwargs)
+    # try:
+    #     reloaded_model_data = reload_model_from_config_and_ckpt(config, ckpt_path, **reload_kwargs)
+    # except RuntimeError as e:
+    #     rank = os.environ.get("RANK", None) or os.environ.get("LOCAL_RANK", 0)
+    #     raise RuntimeError(
+    #         f"[rank: {rank}] You may have changed the model code, making it incompatible with older model "
+    #         f"versions. Tried to reload the model ckpt for run.id={run_id} from {ckpt_path}.\n"
+    #         f"config.model={config.model}"
+    #     ) from e
     if reloaded_model_data.get("wandb") is not None:
         if reloaded_model_data["wandb"].get("id") != run_id:
             raise ValueError(f"run_id={run_id} != state_dict['wandb']['id']={reloaded_model_data['wandb']['id']}")
@@ -348,7 +349,7 @@ def get_local_ckpt_path(
     ]
     if os.environ.get("PSCRATCH", None) is not None:
         potential_dirs.append(os.path.join(os.environ["PSCRATCH"], "genie/output", wandb_run.id, "checkpoints"))
-        for script_dir in ["ns", "sm"]:
+        for script_dir in ["ns", "sm", ""]:
             potential_dirs.append(
                 os.path.join(os.environ["PSCRATCH"], "results", script_dir, "checkpoints", wandb_run.id)
             )

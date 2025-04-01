@@ -71,12 +71,12 @@ class AbstractAggregator(Metric):
         if self.prefix_name is not None and self.prefix_name not in prefix:
             prefix = f"{prefix}/{self.prefix_name}"
         prefix = prefix.replace("//", "/").rstrip("/").lstrip("/")
-        logs_values, logs_media, logs_own_xaxis = self._get_logs(label=prefix, **kwargs)
+        logs_values, logs_media, logs_own_xaxis = self._get_logs(prefix=prefix, **kwargs)
         return logs_values, logs_media, logs_own_xaxis
 
     @abstractmethod
     def _get_logs(
-        self, label: str = "", epoch: Optional[int] = None
+        self, prefix: str = "", epoch: Optional[int] = None
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: ...
 
 
