@@ -16,7 +16,7 @@ python run.py "$@" \
     ++datamodule.precip_transform="log_mm_day_001_only" \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-Tas+lgPr-pCW" \
     'datamodule.output_vars=[tas, pr]' \
-    datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard" \
+    datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type=standard_new \
     datamodule.additional_vars=["rsdt"] trainer.num_sanity_val_steps=0 \
     module.num_predictions=5 module.prediction_inputs_noise=0.0 \
     module.enable_inference_dropout=False callbacks.early_stopping=null \
