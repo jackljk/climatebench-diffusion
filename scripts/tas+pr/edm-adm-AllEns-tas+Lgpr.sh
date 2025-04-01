@@ -13,7 +13,7 @@ python run.py "$@" \
     datamodule.batch_size=512 \
     datamodule.eval_batch_size=3 \
     datamodule.batch_size_per_gpu=8 \
-    datamodule.precip_transform="log_mm_day_001_only" \
+    +datamodule.precip_transform="log_mm_day_001_only" \
     'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-Tas+lgPr-pCW" \
     'datamodule.output_vars=[tas, pr]' \
     datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard" \
