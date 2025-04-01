@@ -30,6 +30,7 @@ python run.py "$@" \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
     suffix="raw_stdized+rsdt-Pm-1Ps1.2-ebs512" \
+    "+module.allow_validation_size_indivisible_on_ddp=True" \
     "$@"
 
 #     log transform of pr (precipitation) with mm_day_001_only (log_mm_day_001_only) 
