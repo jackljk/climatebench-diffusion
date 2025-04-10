@@ -1,7 +1,7 @@
 #!/bin/bash
 
-cd "$(dirname "$0")"/../..
-# export name of file as environment variable (to know which script created the run)
+cd "$(dirname "$0")"/..
+# export name of file as environment variable (to know which script created the run
 export SCRIPT_NAME=$(basename "$0")
 
 # "$@" makes sure to use any extra command line arguments supplied here with bash <script>.sh <args>
