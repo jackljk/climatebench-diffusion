@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd "$(dirname "$0")"/..
+cd "$(dirname "$0")"/../..
 # export name of file as environment variable (to know which script created the run)
 export SCRIPT_NAME=$(basename "$0")
 
