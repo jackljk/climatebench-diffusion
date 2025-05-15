@@ -32,7 +32,7 @@ defaults:
 # ${hydra:runtime.cwd} is the path to original working directory
 # hydra hijacks working directory by changing it to the new log directory so it's useful to have this path as a special variable
 # https://hydra.cc/docs/next/tutorials/basic/running_your_app/working_directory
-work_dir: ./results       # ${hydra:runtime.cwd}  # oc.env allows to get environment variable
+work_dir: /results       # ${hydra:runtime.cwd}  # oc.env allows to get environment variable
 
 # path to checkpoints
 ckpt_dir: ${work_dir}/checkpoints/
