@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from functools import partial
 from os.path import join
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -41,6 +42,7 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         test_out_of_distribution: bool = False,
         max_val_samples: int = None,
         num_trajectories: int = None,  # None means all trajectories for training
+        log_spectra: bool = True,
         **kwargs,
     ):
         raise_error_if_invalid_value(num_test_obstacles, possible_values=[1], name="num_test_obstacles")
@@ -358,13 +360,8 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         verbose: bool = True,
         save_to_path: str = None,
     ) -> Dict[str, _Aggregator]:
-        aggr_kwargs = dict(is_ensemble=is_ensemble)
-        one_step_kwargs = {
-            **aggr_kwargs,
-            "record_rmse": False,
-            "use_snapshot_aggregator": False,
-            "record_normed": False,
-        }
+        channel_dim = -3
+        channel_names = ["vel_x", "vel_y", "pressure"]
         horizon = self.get_horizon(split, dataloader_idx)
         if "interpolation" in experiment_type.lower():
             horizon_range = range(1, horizon)
@@ -374,14 +371,51 @@ class PhysicalSystemsBenchmarkDataModule(BaseDataModule):
         if split == "val" and dataloader_idx == 1:
             assert len(self._data_val) > 1, "Full rollout is only supported for inference"
 
-        aggregators = {f"t{h}": OneStepAggregator(**one_step_kwargs, name=f"t{h}") for h in horizon_range}
+        def unpack_and_derived_vars(data: torch.Tensor, keep_full_tensor: bool) -> Dict[str, torch.Tensor]:
+            """Unpack and derive variables from the data tensor."""
+            Ly, Lx = 0.22, 0.41
+            dy = Ly / data.shape[-2]
+            dx = Lx / data.shape[-1]
+            # Unpack the data tensor
+            data_dict = {"": data} if keep_full_tensor else {}
+            for i, n in enumerate(channel_names):
+                data_dict[n] = data.select(channel_dim, index=i)
+
+            # Compute derived variables
+            data_dict["velocity"] = torch.sqrt(data_dict["vel_x"] ** 2 + data_dict["vel_y"] ** 2)
+            grad_u = torch.gradient(data_dict["vel_x"], spacing=(dy, dx), dim=(-2, -1), edge_order=1)
+            grad_v = torch.gradient(data_dict["vel_y"], spacing=(dy, dx), dim=(-2, -1), edge_order=1)
+            data_dict["vorticity"] = grad_v[1] - grad_u[0]
+            return data_dict
+
+        spectra_kwargs = {
+            "spectra_type": "basic",
+            "spatial_dims": ["x", "y"],
+            "preprocess_fn": partial(unpack_and_derived_vars, keep_full_tensor=False),
+        }
+        metrics_kwargs = {"record_ssr_square_dist": True}
+        if "test" in split:
+            metrics_kwargs["preprocess_fn"] = partial(unpack_and_derived_vars, keep_full_tensor=True)
+
+        aggregators = dict()
+        for h in horizon_range:
+            aggregators[f"t{h}"] = OneStepAggregator(
+                name=f"t{h}",
+                is_ensemble=is_ensemble,
+                record_rmse=False,
+                use_snapshot_aggregator=False,
+                record_normed=False,
+                record_spectra=self.hparams.log_spectra,
+                metrics_kwargs=metrics_kwargs,
+                spectra_kwargs=spectra_kwargs,
+            )
 
         if save_to_path is not None:
             # Specify ++module.save_predictions_filename="xarray" to save the predictions in xarray format
             aggregators["save_to_disk"] = SaveToDiskAggregator(
                 final_dims_of_data=["channel", "x", "y"],
                 is_ensemble=is_ensemble,
-                coords={"channel": ["vel_x", "vel_y", "pressure"]},
+                coords={"channel": channel_names},
                 concat_dim_name="lead_time",
                 save_to_path=save_to_path,
             )

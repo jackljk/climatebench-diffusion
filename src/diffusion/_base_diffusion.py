@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 
@@ -23,7 +23,9 @@ class BaseDiffusion(BaseModel):
         sampling_schedule=None,
         guidance: float = 1,  # Guidance strength for the sampling loop. Default: 1 (no guidance).
         guidance_run_id: str = None,  # Run ID for the guidance model.
-        guidance_ckpt_filename: str = "latest",  # Checkpoint filename for the guidance model.
+        guidance_ckpt_filename: str = "latest_epoch",  # Checkpoint filename for the guidance model.
+        guidance_overrides: Sequence[str] = None,  # Overrides for the guidance model.
+        guidance_interval: Tuple[int, int] = None,  # Interval where to apply the guidance model.
         **kwargs,
     ):
         signature = inspect.signature(BaseModel.__init__).parameters
@@ -58,15 +60,20 @@ class BaseDiffusion(BaseModel):
                 pass
                 # self._guidance_model = self
             else:
+                guidance_overrides = list(guidance_overrides) if guidance_overrides is not None else []
                 guidance_model = reload_checkpoint_from_wandb(
                     run_id=guidance_run_id,
                     local_checkpoint_path=True,
                     ckpt_filename=guidance_ckpt_filename,
+                    override_key_value=guidance_overrides,
+                    use_ema_weights_only=False,  # EMA scope is used anyways
                     also_datamodule=False,
                     print_name="Guidance model",
                 )["model"]
                 self._guidance_model = NoTorchModuleWrapper(guidance_model.cpu())
                 freeze_model(self.guidance_model)
+        else:
+            assert guidance_run_id is None, "Guidance model run ID must be None if guidance is 1."
 
     @property
     def short_description(self) -> str:

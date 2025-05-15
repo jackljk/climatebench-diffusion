@@ -159,9 +159,9 @@ def get_wandb_id_for_run(wandb_config: Dict[str, Any]) -> str:
         try:
             for trial in range(1000):
                 maybe_id = f"{maybe_id_base}v{trial}" if trial > 0 else maybe_id_base
-                r = get_run_api(run_id=maybe_id, entity=wandb_config["entity"], project=wandb_config["project"])
+                _ = get_run_api(run_id=maybe_id, entity=wandb_config["entity"], project=wandb_config["project"])
             return wandb.sdk.lib.runid.generate_id()  # we've tried 1000 times, so just generate a random id
-        except Exception as e:
+        except Exception:
             return maybe_id  # the run does not exist yet
     else:
         # we are not on a Slurm cluster, so just generate a random id
@@ -336,11 +336,12 @@ def load_hydra_config_from_wandb(
     rank = os.environ.get("RANK", None) or os.environ.get("LOCAL_RANK", 0)
 
     # Check if hydra_config file exists locally
-    work_dir = run.config.get("dirs/work_dir", run.config.get("dirs.work_dir", None))
-    if work_dir is not None and run.id not in work_dir:
-        work_dir = os.path.join(os.path.dirname(work_dir), run.id)
+    work_dir = run.config.get("dirs/work_dir", run.config.get("dirs", {}).get("work_dir", None))
+    if work_dir is not None:
+        if run.id not in work_dir:
+            work_dir = os.path.join(os.path.dirname(work_dir), run.id)
+        possible_cfg_dirs = [os.path.join(work_dir, "wandb")]
     is_local = False
-    possible_cfg_dirs = [os.path.join(work_dir, "wandb")]
     if isinstance(local_dir, str):
         if run.id not in local_dir and os.path.exists(os.path.join(local_dir, run.id)):
             local_dir = os.path.join(local_dir, run.id)
@@ -388,6 +389,7 @@ def load_hydra_config_from_wandb(
     is_distributed = False
     try:
         import torch.distributed as dist
+
         is_distributed = dist.is_initialized()
     except ImportError:
         pass
@@ -396,19 +398,20 @@ def load_hydra_config_from_wandb(
     synchronized = False
     try:
         import torch.distributed as dist
+
         if dist.is_initialized():
             dist.barrier()
             synchronized = True
     except (ImportError, Exception):
         pass
-        
+
     if is_local or (os.path.exists(hydra_config_file) and rank not in ["0", 0]):
         log.info(f"Loading local hydra config file: {hydra_config_file}")
     else:
         # In DDP mode, only allow rank 0 to download, other ranks wait
         download_file = rank in ["0", 0] or not synchronized
         local_file_path = None
-        
+
         if download_file:
             log.info(f"[rank: {rank}] Downloading hydra config file: {hydra_config_file}")
             wandb_restore_kwargs = dict(run_path=run_path, replace=True, root=os.getcwd())
@@ -422,29 +425,32 @@ def load_hydra_config_from_wandb(
                     local_file_path = local_file.name
                 except Exception as e2:
                     log.error(f"[rank: {rank}] Second error when restoring hydra config file: {e2}")
-                    
+
             if local_file_path is not None:
                 hydra_config_file = local_file_path
-        
+
     # Wait for rank 0 to download the file
     if synchronized:
         try:
             dist.barrier()
         except Exception:
             pass
-            
+
         # If we're not rank 0 and using DDP, copy the file path from rank 0
         if rank not in ["0", 0] and not os.path.exists(hydra_config_file):
             # The path should be the same for all processes in the same node
             # Wait a bit for file system to catch up
             import time
+
             max_retries = 5
             for retry in range(max_retries):
                 if os.path.exists(hydra_config_file):
                     break
-                log.info(f"[rank: {rank}] Waiting for file {hydra_config_file} to appear (attempt {retry+1}/{max_retries})")
+                log.info(
+                    f"[rank: {rank}] Waiting for file {hydra_config_file} to appear (attempt {retry+1}/{max_retries})"
+                )
                 time.sleep(1)
-        
+
     assert os.path.exists(hydra_config_file), f"[{rank=}] Could not find {hydra_config_file=}"
 
     try:
@@ -527,10 +533,12 @@ def does_any_ckpt_file_exist(wandb_run: wandb.apis.public.Run, only_best_and_las
                 Setting to true may speed up the check, since it will stop as soon as it finds one of the two files.
     """
     if local_dir is not None:
-        if wandb_run.id not in local_dir:
-            local_dir = os.path.join(local_dir, wandb_run.id)
-        if os.path.exists(local_dir):
-            ckpt_files = [f for f in os.listdir(local_dir) if f.endswith(".ckpt")]
+        local_dirs = [local_dir, os.path.dirname(local_dir.rstrip("/"))]
+        for local_dir in local_dirs:
+            if wandb_run.id not in local_dir:
+                local_dir = os.path.join(local_dir, wandb_run.id)
+            # Find with glob
+            ckpt_files = glob.glob(f"{local_dir}/**/*.ckpt", recursive=True)
             if len(ckpt_files) > 0:
                 return True
 
@@ -550,13 +558,20 @@ def get_existing_wandb_group_runs(
     wandb_cfg = config.logger.wandb
     runs_in_group = get_runs_for_filter(entity=wandb_cfg.entity, project=wandb_cfg.project, group=wandb_cfg.group)
     try:
-        _ = len(runs_in_group)
+        n_runs = len(runs_in_group)
     except (ValueError, TypeError) as e:  # happens if project does not exist or empty
         log.warning(f"Error when loading runs for {wandb_cfg=}: {e}")
         return []
     if ckpt_must_exist:
         local_dir = config.ckpt_dir
         runs_in_group = [run for run in runs_in_group if does_any_ckpt_file_exist(run, **kwargs, local_dir=local_dir)]
+        if len(runs_in_group) == 0 and n_runs > 0:
+            runs_with_epoch_1plus = [run for run in runs_in_group if run.summary.get("epoch", 0) > 1]
+            log.warning(
+                f"No runs found for group {wandb_cfg.group} with checkpoints. "
+                f"However, {n_runs} runs in group exist ({len(runs_with_epoch_1plus)} with epoch > 1). "
+                f"{config.ckpt_dir=}."
+            )
     return runs_in_group
     # other_seeds = [run.config.get('seed') for run in other_runs]
     # if config.seed in other_seeds:

@@ -1,7 +1,6 @@
 from functools import partial
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List
 
-import numpy as np
 import torch
 import xarray as xr
 
@@ -11,14 +10,18 @@ class StandardNormalizer(torch.nn.Module):
     Responsible for normalizing tensors.
     """
 
-    def __init__(self, means: Dict[str, torch.Tensor], stds: Dict[str, torch.Tensor], names=None, var_to_transform_name=None):
+    def __init__(
+        self, means: Dict[str, torch.Tensor], stds: Dict[str, torch.Tensor], names=None, var_to_transform_name=None
+    ):
         super().__init__()
         self.means = means
         self.stds = stds
         self.var_to_transform_name = var_to_transform_name
 
         if torch.is_tensor(means) or isinstance(means, float):
-            assert var_to_transform_name is None, f"{var_to_transform_name=} must be None if means and stds are floats!"
+            assert (
+                var_to_transform_name is None
+            ), f"{var_to_transform_name=} must be None if means and stds are floats!"
             assert names is None, f"{names=} must be None if means and stds are floats!"
             self.names = None
             self._normalize = _normalize
@@ -75,12 +78,13 @@ def _normalize_dict(
 ) -> Dict[str, torch.Tensor]:
     return {k: (t - means[k]) / stds[k] for k, t in tensors.items()}
 
+
 # @torch.jit.script
 def _normalize_dict_with_transform(
     tensors: Dict[str, torch.Tensor],
     means: Dict[str, torch.Tensor],
     stds: Dict[str, torch.Tensor],
-    transforms,   # e.g. precip: lambda x: torch.log(x + 1), temperature: lambda x: x
+    transforms,  # e.g. precip: lambda x: torch.log(x + 1), temperature: lambda x: x
 ) -> Dict[str, torch.Tensor]:
     return {k: (transforms[k](t) - means[k]) / stds[k] for k, t in tensors.items()}
 
@@ -93,6 +97,7 @@ def _denormalize_dict(
 ) -> Dict[str, torch.Tensor]:
     return {k: t * stds[k] + means[k] for k, t in tensors.items()}
 
+
 # @torch.jit.script
 def _denormalize_dict_with_transform(
     tensors: Dict[str, torch.Tensor],
@@ -101,6 +106,7 @@ def _denormalize_dict_with_transform(
     inverse_transforms,  # e.g. precip: lambda x: torch.exp(x) - 1, temperature: lambda x: x
 ) -> Dict[str, torch.Tensor]:
     return {k: inverse_transforms[k](t * stds[k] + means[k]) for k, t in tensors.items()}
+
 
 @torch.jit.script
 def _normalize(tensor: torch.Tensor, means: torch.Tensor, stds: torch.Tensor) -> torch.Tensor:
@@ -153,31 +159,43 @@ def get_normalizer(
 def log1p_transform(x):
     return torch.log(x + 1)
 
+
 @torch.jit.script
 def log1p_transform_inverse(x):
     return torch.exp(x) - 1
+
 
 @torch.jit.script
 def log_transform(x):
     return torch.log(x + 1e-8)
 
+
 @torch.jit.script
 def log_transform_inverse(x):
     return torch.exp(x) - 1e-8
+
 
 @torch.jit.script
 def log_transform_general(x, factor: float, offset: float):
     return torch.log(x * factor + offset)
 
+
 @torch.jit.script
 def log_transform_general_inverse(x, factor: float, offset: float):
     return (torch.exp(x) - offset) / factor
 
+
 TRANSFORMS = {
     "log1p": {"transform": log1p_transform, "inverse": log1p_transform_inverse},
     "log": {"transform": log_transform, "inverse": log_transform_inverse},
-    "log_mm_day_1": {"transform": partial(log_transform_general, factor=86400, offset=1), "inverse": partial(log_transform_general_inverse, factor=86400, offset=1)},
-    "log_mm_day_001": {"transform": partial(log_transform_general, factor=86400, offset=0.01), "inverse": partial(log_transform_general_inverse, factor=86400, offset=0.01)},
+    "log_mm_day_1": {
+        "transform": partial(log_transform_general, factor=86400, offset=1),
+        "inverse": partial(log_transform_general_inverse, factor=86400, offset=1),
+    },
+    "log_mm_day_001": {
+        "transform": partial(log_transform_general, factor=86400, offset=0.01),
+        "inverse": partial(log_transform_general_inverse, factor=86400, offset=0.01),
+    },
     "null": {"transform": lambda x: x, "inverse": lambda x: x},
 }
 TRANSFORMS["log_1"] = TRANSFORMS["log1p"]

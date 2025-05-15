@@ -13,8 +13,8 @@ from torch.utils.data import Dataset
 
 from src.datamodules.climatebench.climatebench_original import ClimateBenchDataModule
 from src.evaluation.aggregators.main import OneStepAggregator
-from src.evaluation.aggregators.time_mean import TimeMeanAggregator
 from src.evaluation.aggregators.save_data import SaveToDiskAggregator
+from src.evaluation.aggregators.time_mean import TimeMeanAggregator
 from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
     get_mean_std_of_variables,
@@ -32,19 +32,19 @@ from src.utilities.utils import get_logger, to_torch_and_device
 log = get_logger(__name__)
 
 statistics = {
-    'tas_mean': {'weighted': 289.83469702468193, 'unweighted': 280.41241455078125},
-    'tas_std': {'weighted': 15.114547332402394, 'unweighted': 21.20634651184082},
-    'pr_mean': {'weighted': 3.5318931751025825e-05, 'unweighted': 2.9361413908191025e-05},
-    'pr_std': {'weighted': 8.351846484899611e-05, 'unweighted': 7.215367804747075e-05},
-    'log_1_pr_mean': {'weighted': 3.531428776456019e-05, 'unweighted': 2.935781958512962e-05},
-    'log_1_pr_std': {'weighted': 8.348880039616833e-05, 'unweighted': 7.21298492862843e-05},
+    "tas_mean": {"weighted": 289.83469702468193, "unweighted": 280.41241455078125},
+    "tas_std": {"weighted": 15.114547332402394, "unweighted": 21.20634651184082},
+    "pr_mean": {"weighted": 3.5318931751025825e-05, "unweighted": 2.9361413908191025e-05},
+    "pr_std": {"weighted": 8.351846484899611e-05, "unweighted": 7.215367804747075e-05},
+    "log_1_pr_mean": {"weighted": 3.531428776456019e-05, "unweighted": 2.935781958512962e-05},
+    "log_1_pr_std": {"weighted": 8.348880039616833e-05, "unweighted": 7.21298492862843e-05},
     # Try these:
-    'log_1e-8_pr_mean': {'weighted': -12.47100560750103, 'unweighted': -12.584796905517578},
-    'log_1e-8_pr_std': {'weighted': 2.8926291719896695, 'unweighted': 2.76674485206604},
-    'log_mm_day_1_pr_mean': {'weighted': 0.8233942575117554, 'unweighted': 0.7447913885116577},
-    'log_mm_day_1_pr_std': {'weighted': 0.9123542090854786, 'unweighted': 0.851499617099762},
-    'log_mm_day_001_pr_mean': {'weighted': -0.7521765418647202, 'unweighted': -0.8860650062561035},
-    'log_mm_day_001_pr_std': {'weighted': 2.2917330972570222, 'unweighted': 2.208401918411255},
+    "log_1e-8_pr_mean": {"weighted": -12.47100560750103, "unweighted": -12.584796905517578},
+    "log_1e-8_pr_std": {"weighted": 2.8926291719896695, "unweighted": 2.76674485206604},
+    "log_mm_day_1_pr_mean": {"weighted": 0.8233942575117554, "unweighted": 0.7447913885116577},
+    "log_mm_day_1_pr_std": {"weighted": 0.9123542090854786, "unweighted": 0.851499617099762},
+    "log_mm_day_001_pr_mean": {"weighted": -0.7521765418647202, "unweighted": -0.8860650062561035},
+    "log_mm_day_001_pr_std": {"weighted": 2.2917330972570222, "unweighted": 2.208401918411255},
 }
 
 
@@ -61,7 +61,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         simulations_raw: Sequence[str] = None,
         simulations_anom_type: str = "piControl",
         normalization_type: str = None,  # "standard",
-        precip_transform: str = None,   # how to transform precipitation data
+        precip_transform: str = None,  # how to transform precipitation data
         window: int = 10,  # == slider
         output_vars: Sequence[str] | str = "tas",
         mean_over_ensemble: bool = True,
@@ -82,8 +82,14 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             mean_over_ensemble,
             **kwargs,
         )
+        # For special experiments
+        self.experiments = {"G6Solar": "outputs_daily_CESM2_WACCM_G6solar.nc"}
+        self.is_experiment = (
+            False if sim_validation not in self.experiments else True
+        )  # Experiment name contained in sim_validation
+
         self.hparams.additional_vars = additional_vars if additional_vars is not None else []
-        self.TEST_SIM = "ssp245"
+        self.TEST_SIM = "ssp245" if not self.is_experiment else sim_validation  # Use TEST sim to store experiment name
         self._sigma_data = None
 
         if isinstance(self.hparams.output_vars, str):
@@ -121,7 +127,13 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             # Read in the data
             input_name = os.path.join(self.hparams.data_dir, "inputs_" + simu + ".nc")
             simulations_raw = self.hparams.simulations_raw
-            if simulations_raw is not None and (simulations_raw == "all" or simu in simulations_raw):
+            if self.is_experiment and self.TEST_SIM == "G6Solar":
+                # Handle Special case for G6Solar experiment, only need to handle output as the input should already be ssp585
+                input_name = os.path.join(self.hparams.data_dir, "inputs_ssp585.nc")
+                output_name = os.path.join(self.hparams.data_dir, self.experiments[self.TEST_SIM])
+                is_raw = True
+                log.info(f"Loading raw data for {self.TEST_SIM} experiment")
+            elif simulations_raw is not None and (simulations_raw == "all" or simu in simulations_raw):
                 # If the raw data is used for different normalizations
                 output_name = os.path.join(self.hparams.data_dir, "outputs_" + simu + "_daily_raw.nc")
                 is_raw = True
@@ -141,23 +153,35 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
                 # Debugging mode
                 input_xr = input_xr.isel(time=slice(0, self.hparams.DEBUG_dataset_size)).compute()
                 output_xr = output_xr.isel(time=slice(0, self.hparams.DEBUG_dataset_size * 365)).compute()
+                log.info(f"DEBUGGING MODE: Using {self.hparams.DEBUG_dataset_size} days of data for {simu}")
 
-            # Handle output data ensemble members
-            output_xr = handle_ensemble(output_xr, mean_over_ensemble, simu, self.hparams.num_ensemble_members)
+            if not self.is_experiment:
+                # Handle output data ensemble members
+                output_xr = handle_ensemble(output_xr, mean_over_ensemble, simu, self.hparams.num_ensemble_members)
 
             # Standardize the output xr dataset by dropping the lat_bounds, lon_bounds and nbnd variables and renaming the
             # daily variables to be consistent with the yearly data.
             output_xr = standardize_output_xr(output_xr, simu, self.hparams.output_vars)
 
-            # input has no members
-            X_train[simu] = input_xr
-            # Add the data to the training set
-            if isinstance(output_xr, dict):
-                Y_train.update(output_xr)
+            if self.is_experiment:
+                X_train[self.TEST_SIM] = input_xr
             else:
-                Y_train[simu] = output_xr
+                # input has no members
+                X_train[simu] = input_xr
+            # Add the data to the training set
 
-        log.info(f"Finished pre-processing data for {simulations}")
+            if self.is_experiment:
+                Y_train[self.TEST_SIM] = output_xr
+            else:
+                if isinstance(output_xr, dict):
+                    Y_train.update(output_xr)
+                else:
+                    Y_train[simu] = output_xr
+
+        if self.hparams.sim_validation["X"] == "G6Solar":
+            log.info("Finished pre-processing data for G6Solar")
+        else:
+            log.info(f"Finished pre-processing data for {simulations}")
         return X_train, Y_train
 
     def setup(self, stage: Optional[str] = None):
@@ -190,7 +214,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             var_to_transform_name = dict()
             if "standard" in self.hparams.normalization_type:
                 if self.hparams.normalization_type == "standard":
-                    assert self.hparams.precip_transform is None
+                    assert self.hparams.precip_transform is None, "Use normalization_type='standard_new' instead."
                     # Compute the mean and std of the output variables
                     if len(self.output_vars) == 1 and self.output_vars[0] == "tas":
                         data_mean_act = {"tas": torch.tensor(279.7749)}
@@ -257,7 +281,10 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         # Get rsdt data
         rsdt = None
         if "rsdt" in self.hparams.additional_vars:
-            rsdt = get_rsdt(self.hparams.data_dir, self.hparams.simulations)
+            if self.is_experiment:
+                rsdt = get_rsdt(self.hparams.data_dir, self.hparams.simulations, solar_experiment=self.TEST_SIM)
+            else:
+                rsdt = get_rsdt(self.hparams.data_dir, self.hparams.simulations)
 
         ds_splits = {
             "train": set_train,
@@ -333,7 +360,8 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         """
         if self.hparams.comprehensive_validation.test_years is not None:
             test_time_slice = slice(
-                self.hparams.comprehensive_validation.test_years[0], self.hparams.comprehensive_validation.test_years[1]
+                self.hparams.comprehensive_validation.test_years[0],
+                self.hparams.comprehensive_validation.test_years[1],
             )
             log.info(f"Only using the time period {test_time_slice} for testing")
             new_X_test, new_Y_test = dict(), dict()
@@ -449,7 +477,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             use_snapshot_aggregator=True,
             record_normed=self.hparams.normalization_type is not None,
             record_abs_values=True,  # will record mean and std of the absolute values of preds and targets
-            snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
+            # snapshots_preprocess_fn=lambda x: np.flip(x, axis=-2),  # flip the latitudes for better visualization
             temporal_kwargs=self.hparams.comprehensive_validation,
             **aggr_kwargs,
         )
@@ -468,6 +496,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
                     max_ensemble_members=None,  # save all ensemble members
                     batch_dim_name="datetime",
                     coords=coords,
+                    var_names=self.hparams.output_vars,
                 )
                 aggregators["save_to_disk"] = save_to_disk_aggregator
 
@@ -601,9 +630,13 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         # Interpolate the input data to daily resolution of X (Function handles the edge cases at first and last year)
         #   ssp var needed for output ds with ensem so not using handle_ensemble
         inputs = self._handle_interpolation_yearly(ssp, inputs_ssp, ssp_index_datetime)
+        coordinate_mapping = {
+            "latitude": inputs.latitude,
+            "longitude": inputs.longitude,
+        }
         # additional vars are inputs with no ensemble handling so using handle_ensemble
         additional_vars = self._handle_additional_vars(
-            self.additional_vars, self.handle_ensemble(ssp), ssp_index_datetime
+            self.additional_vars, self.handle_ensemble(ssp), ssp_index_datetime, coordinate_mapping
         )
         if self.mean_over_mems or "member" not in inputs.dims:
             assert "member" not in inputs.dims and "member" not in outputs.dims
@@ -640,7 +673,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         return batch_element
 
     def _handle_additional_vars(
-        self, vars: list[str], ssp: str, ssp_index_datetime: cftime.datetime
+        self, vars: list[str], ssp: str, ssp_index_datetime: cftime.datetime, coordinate_mapping: Dict[str, xr.DataArray]
     ) -> Dict[str, xr.DataArray]:
         """
         Function to handle any additional variables that can be used for experimentation in `__getitem__`
@@ -653,9 +686,19 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
         interpolated_vars = {}
         for var in vars:
             if var == "rsdt" and self.rsdt is not None:
-                # rsdt disregards ssp type only historical vs ssp
-                rsdt_xr = self.rsdt["historical"] if ssp == "historical" else self.rsdt["ssp"]
-                rsdt_ds = self._handle_interpolation_monthly(rsdt_xr, var, ssp, ssp_index_datetime)
+                # rsdt disregards ssp type only historical vs ssp + experiments "G6Solar"
+                if ssp == "G6Solar":
+                    rsdt_xr = self.rsdt["G6Solar"]
+                elif ssp == "historical":
+                    rsdt_xr = self.rsdt["historical"]
+                else:
+                    try:
+                        rsdt_xr = self.rsdt['ssp']
+                    except KeyError:
+                        raise KeyError(f"rsdt data not available for {ssp}")
+                    except Exception as e:
+                        raise Exception(f"Error accessing rsdt data for {ssp}: {e}")
+                rsdt_ds = self._handle_interpolation_monthly(rsdt_xr, var, ssp, ssp_index_datetime, coordinate_mapping)
                 interpolated_vars[var] = rsdt_ds
             else:
                 raise NotImplementedError(f"Additional variable {var} not implemented yet")
@@ -723,7 +766,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
 
         return outputs, outputs.time.item()
 
-    def _handle_interpolation_monthly(self, input, var, ssp, ssp_index_datetime):
+    def _handle_interpolation_monthly(self, input, var, ssp, ssp_index_datetime, coordinate_mapping):
         """
         Handles interpolation of input data in monthly resolution to daily resolution for edge cases (May not be needed)
 
@@ -731,13 +774,16 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
             - rsdt: Incoming solar radiation at the top of the atmosphere
             add more as needed...
         """
+        FACTOR = 2 # To match the input data lat and lon with the rsdt data
         if var == "rsdt":
             # Monthly scale so get year and month from the datetime
             rsdt_interpolated = monthlyInterpolator(input, ssp_index_datetime)
 
-            # match rsdt lat and lon with the input data
-            rsdt_interpolated = rsdt_interpolated.sel(
-                y=self.ds_inputs[ssp]["longitude"], x=self.ds_inputs[ssp]["latitude"], method="nearest"
+            # coarsen rsdt lat and lon to match with the input data
+            rsdt_interpolated = rsdt_interpolated.coarsen(x=FACTOR, y=FACTOR, boundary='trim').mean()
+            # Handle the lat lng values not being the same
+            rsdt_interpolated = rsdt_interpolated.rename({"x": "longitude", "y": "latitude"}).assign_coords(
+                longitude=coordinate_mapping['longitude'], latitude=coordinate_mapping['latitude']
             )
             return rsdt_interpolated
 

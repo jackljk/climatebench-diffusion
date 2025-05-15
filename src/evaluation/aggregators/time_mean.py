@@ -11,8 +11,8 @@ from src.evaluation.torchmetrics import (
     MeanSquaredError,
     SpreadSkillRatio,
 )
-from src.utilities.utils import add
 from src.utilities.plotting import create_wandb_figures
+from src.utilities.utils import add
 
 
 def get_gen_shape(gen_data: Mapping[str, torch.Tensor]):
@@ -44,7 +44,7 @@ class TimeMeanAggregator(AbstractAggregator):
         gen_data: Mapping[str, torch.Tensor],
         target_data_norm: Mapping[str, torch.Tensor] = None,
         gen_data_norm: Mapping[str, torch.Tensor] = None,
-        metadata=None
+        metadata=None,
     ):
         def add_or_initialize_time_mean(
             maybe_dict: Optional[Dict[str, torch.Tensor]],
@@ -55,6 +55,7 @@ class TimeMeanAggregator(AbstractAggregator):
             else:
                 d = add(maybe_dict, new_data)
             return d
+
         if self.mean_over_batch_dim:
             self.total += target_data[list(target_data.keys())[0]].shape[0]
             b_dim_gen = 1 if self._is_ensemble else 0
@@ -114,8 +115,8 @@ class TimeMeanAggregator(AbstractAggregator):
                 logs[key] = to_float(metric.compute())  # Should be correctly synced across all processes
 
             # remove datetime from self.coords dict
-            if 'datetime' in self.coords:
-                self.coords.pop('datetime')
+            if "datetime" in self.coords:
+                self.coords.pop("datetime")
             # fig_shared_label="" since we'll add the time_mean prefix further down (so that it's in the front)
             snapshots_var = create_wandb_figures(target, gen, name, fig_shared_label="", coords=self.coords)
             log_snapshots.update(snapshots_var)

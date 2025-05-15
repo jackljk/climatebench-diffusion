@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+from collections import defaultdict
 from difflib import SequenceMatcher
 from inspect import isfunction
 from itertools import repeat
@@ -636,6 +637,46 @@ def print_gpu_memory_usage(
             log.info(info_str)
 
 
+def split_batch(x, start, end):
+    # break up inputs and kwargs into batches of size self.num_predictions_in_mem
+    if isinstance(x, (Tensor, TensorDictBase)):
+        return x[start:end]
+    return x
+
+
+def run_func_in_sub_batches_and_aggregate(
+    func: Union[Callable, Sequence[Callable]], *inputs, num_prediction_loops: int = 1, predictions_mask=None, **kwargs
+):
+    #         actual_batch_size = full_batch_size // base_num_predictions  # self.num_predictions
+    #         assert (
+    #             actual_batch_size > 0
+    #         ), f"{actual_batch_size=}, {full_batch_size=}, {self.num_predictions=}, {base_num_predictions=}"
+    if isinstance(func, collections.abc.Sequence):
+        assert len(func) == num_prediction_loops, f"{len(func)=}, {num_prediction_loops=}"
+    else:
+        func = [func] * num_prediction_loops
+    results = defaultdict(list)
+    full_batch_size = inputs[0].shape[0] if len(inputs) > 0 else kwargs[list(kwargs.keys())[0]].shape[0]
+    inputs_offset_factor = full_batch_size // num_prediction_loops
+    for i in range(num_prediction_loops):
+        start_i, end_i = i * inputs_offset_factor, (i + 1) * inputs_offset_factor
+        inputs_i = [split_batch(x, start_i, end_i) for x in inputs]
+        kwargs_i = {k: split_batch(v, start_i, end_i) for k, v in kwargs.items()}
+        results_i = func[i](*inputs_i, **kwargs_i)
+        # log.info(f"results_i: {results_i.keys()}, {results_i['preds'].shape}, inputs_i: {inputs_i[0].shape}")
+        if predictions_mask is not None:
+            results_i = {k: v[..., predictions_mask[0, :]] for k, v in results_i.items()}
+        if hasattr(results_i, "keys"):
+            for k, v in results_i.items():
+                results[k].append(v)
+        else:
+            results = [results_i] if i == 0 else results + [results_i]
+    # log.info({k: torch.cat(v, dim=0) for k, v in results.items()}["preds2d"].shape)
+    if hasattr(results, "keys"):
+        results = {k: torch.cat(v, dim=0) for k, v in results.items()}
+    return results
+
+
 def get_pl_trainer_kwargs_for_evaluation(
     trainer_config: DictConfig = None,
 ) -> (Dict[str, Any], torch.device):
@@ -664,46 +705,6 @@ def infer_main_batch_key_from_dataset(dataset: torch.utils.data.Dataset) -> str:
             else:
                 raise ValueError(f"Could not determine main_data_key from data_example: {data_example.keys()}")
     return main_data_key
-
-
-def rename_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> (Dict[str, torch.Tensor], bool):
-    #  Missing key(s) in state_dict: "model.downs.0.2.fn.fn.to_qkv.1.weight", "model.downs.1.2.fn.fn.to_qkv.1.weight",
-    #  Unexpected key(s) in state_dict: "model.downs.0.2.fn.fn.to_qkv.weight", "model.downs.1.2.fn.fn.to_qkv.weight",
-    # rename weights
-    renamed = False
-    for k in list(state_dict.keys()):
-        if "fn.to_qkv.weight" in k and "mid_attn" not in k:
-            state_dict[k.replace("fn.to_qkv.weight", "fn.to_qkv.1.weight")] = state_dict.pop(k)
-            renamed = True
-
-    return state_dict, renamed
-
-
-def rename_state_dict_keys_and_save(torch_model_state, ckpt_path: str, model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Renames the state dict keys and saves the renamed state dict back to the checkpoint."""
-    state_dict, has_been_renamed = rename_state_dict_keys(torch_model_state["state_dict"])
-    if has_been_renamed:
-        # Save the renamed model state
-        torch_model_state["state_dict"] = state_dict
-        torch.save(torch_model_state, ckpt_path)
-    # Check if model XOR state_dict are (not) torch.compiled.
-    # If one of them is but the other is not, we not to remove (or add) _orig_mod. to the state_dict keys.
-    #  However, we don't want to save the edited state_dict back to the checkpoint, so we do this here.
-    model_is_compiled = hasattr(model, "_orig_mod") or (hasattr(model, "model") and hasattr(model.model, "_orig_mod"))
-    state_dict_is_compiled = any(["_orig_mod" in k for k in state_dict.keys()])
-    if model_is_compiled and not state_dict_is_compiled:
-        # Add _orig_mod to the state_dict keys
-        log.info("Adding _orig_mod to the state_dict keys since the model is compiled but ckpt is not.")
-        state_dict = {
-            k.replace("model.", "model._orig_mod.").replace("model_ema.", "model_ema._orig_mod."): v
-            for k, v in state_dict.items()
-        }
-    elif not model_is_compiled and state_dict_is_compiled:
-        # Remove _orig_mod from the state_dict keys
-        log.info("Removing _orig_mod from the state_dict keys since the model is not compiled but the ckpt was.")
-        state_dict = {k.replace("._orig_mod", ".").replace("..", "."): v for k, v in state_dict.items()}
-
-    return state_dict
 
 
 def freeze_model(model: nn.Module, params_subset: List[str] = None) -> nn.Module:

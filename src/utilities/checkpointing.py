@@ -7,10 +7,11 @@ import hydra
 import numpy as np
 import pytorch_lightning
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig, ListConfig
 
 import src.utilities.wandb_api as wandb_api
-from src.utilities.utils import get_logger, rename_state_dict_keys_and_save
+from src.utilities.utils import get_logger
 
 
 log = get_logger(__name__)
@@ -122,6 +123,7 @@ def reload_model_from_config_and_ckpt(
     also_datamodule: bool = True,
     also_ckpt: bool = False,
     model: pytorch_lightning.LightningModule = None,
+    use_ema_weights_only: bool = False,
     reload_strict: bool = False,
     exclude_state_dict_keys: List[str] = None,
     print_name: str = "",
@@ -135,6 +137,7 @@ def reload_model_from_config_and_ckpt(
         also_datamodule (bool): If True, also reload the datamodule from the config. Defaults to True.
         also_ckpt (bool): If True, also returns the checkpoint from ``model_path``. Defaults to False.
         model (LightningModule): If provided, the model to reload the weights into. If None, a new model is instantiated.
+        use_ema_weights_only (bool): If True, only the EMA weights are loaded. Defaults to False.
         reload_strict (bool): If True, the model weights are loaded strictly (i.e. all keys must match). Defaults to False.
         exclude_state_dict_keys (List[str]): A list of keys to exclude from the state_dict when loading the model. Defaults to None.
         print_name (str): A string to print when reloading the model. Defaults to "".
@@ -168,9 +171,12 @@ def reload_model_from_config_and_ckpt(
         data_module = None
     # Reload model
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_state = torch.load(model_path, map_location=device, weights_only=False)
+    model_state = torch.load(model_path, map_location="cpu", weights_only=False)
     # rename weights (sometimes needed for backwards compatibility)
-    state_dict = rename_state_dict_keys_and_save(model_state, model_path, model)
+    state_dict, has_been_renamed = rename_state_dict_keys_and_save(
+        model_state, model_path, model, use_ema_weights_only
+    )
+    reload_strict = reload_strict or has_been_renamed  # force strict if we renamed the state dict keys
     # Reload weights
     state_dict = load_state_dict_and_analyze_weight_changes(
         model, state_dict, strict=reload_strict, exclude_keys=exclude_state_dict_keys
@@ -192,7 +198,7 @@ def reload_model_from_config_and_ckpt(
         f"Reloaded {print_name}{model_path}" + (" into provided model" if model_provided else "") + "."
         f" Epoch={model_state['epoch']}."
         f" Global_step={model_state['global_step']}."
-        f" File size [in MB]: {file_size / 1e6:.2f}"
+        f" File size [in MB]: {file_size / 1e6:.2f}. {use_ema_weights_only=}"
     )
     if model_state.get("wandb") is not None:
         str_to_print += f"\nRun ID: {model_state['wandb']['id']}\t Name: {model_state['wandb']['name']}"
@@ -243,6 +249,7 @@ def reload_checkpoint_from_wandb(
     epoch: Union[str, int] = "best",
     override_key_value: List[str] = None,
     local_checkpoint_path: str = None,
+    use_ema_weights_only: bool = False,
     **reload_kwargs,
 ) -> dict:
     """
@@ -261,6 +268,9 @@ def reload_checkpoint_from_wandb(
     entity, project = wandb_api.get_entity(entity), project or wandb_api.get_project_train()
     run_id = str(run_id).strip()
     run_path = f"{entity}/{project}/{run_id}"
+    if use_ema_weights_only:
+        override_key_value = override_key_value or []
+        override_key_value += ["module.use_ema=False"]  # EMA weights are reloaded into normal model, rest is discarded
 
     config = wandb_api.load_hydra_config_from_wandb(
         run_path, local_dir=local_checkpoint_path, override_key_value=override_key_value
@@ -289,7 +299,9 @@ def reload_checkpoint_from_wandb(
 
     assert os.path.isfile(ckpt_path), f"Could not find {ckpt_path=} in {os.getcwd()}"
     assert str(config.logger.wandb.id) == str(run_id), f"{config.logger.wandb.id=} != {run_id=}."
-    reloaded_model_data = reload_model_from_config_and_ckpt(config, ckpt_path, **reload_kwargs)
+    reloaded_model_data = reload_model_from_config_and_ckpt(
+        config, ckpt_path, use_ema_weights_only=use_ema_weights_only, **reload_kwargs
+    )
     # try:
     #     reloaded_model_data = reload_model_from_config_and_ckpt(config, ckpt_path, **reload_kwargs)
     # except RuntimeError as e:
@@ -300,7 +312,8 @@ def reload_checkpoint_from_wandb(
     #         f"config.model={config.model}"
     #     ) from e
     if reloaded_model_data.get("wandb") is not None:
-        if reloaded_model_data["wandb"].get("id") != run_id:
+        reloaded_id = reloaded_model_data["wandb"].get("id")
+        if reloaded_id != run_id and str(reloaded_id) not in str(run_id):
             raise ValueError(f"run_id={run_id} != state_dict['wandb']['id']={reloaded_model_data['wandb']['id']}")
     # config.trainer.resume_from_checkpoint = ckpt_path
     # os.remove(ckpt_path) if os.path.exists(ckpt_path) else None  # delete the downloaded ckpt
@@ -340,18 +353,27 @@ def get_local_ckpt_path(
     ckpt_filename: str = "last.ckpt",
     throw_error_if_local_not_found: bool = False,
 ) -> Optional[str]:
-    work_dir = config.work_dir.replace("-test", "")
-    potential_dirs = [
-        config.ckpt_dir,
-        os.path.join(work_dir, "checkpoints"),
-        os.path.join(work_dir, wandb_run.id, "checkpoints"),
-        os.path.join(os.getcwd(), "results", "checkpoints"),
-    ]
+    potential_dirs = []
+    work_dirs = [config.work_dir.replace("-test", ""), os.environ.get("WORK_DIR", None)]
+    for work_dir in work_dirs:
+        if work_dir is None or not os.path.exists(work_dir):
+            continue
+        potential_dirs.extend(
+            [
+                # config.ckpt_dir,
+                os.path.join(work_dir, "checkpoints"),
+                os.path.join(work_dir, wandb_run.id, "checkpoints"),
+                os.path.join(os.path.dirname(work_dir), "checkpoints", wandb_run.id),
+                os.path.join(os.getcwd(), "results", "checkpoints"),
+            ]
+        )
     if os.environ.get("PSCRATCH", None) is not None:
-        potential_dirs.append(os.path.join(os.environ["PSCRATCH"], "genie/output", wandb_run.id, "checkpoints"))
-        for script_dir in ["ns", "sm", ""]:
+        for script_dir in ["ns", "sm", "", "era5"]:
             potential_dirs.append(
                 os.path.join(os.environ["PSCRATCH"], "results", script_dir, "checkpoints", wandb_run.id)
+            )
+            potential_dirs.append(
+                os.path.join(os.environ["PSCRATCH"], "results", script_dir, wandb_run.id, "checkpoints")
             )
 
     for callback_k in config.get("callbacks", {}).keys():
@@ -359,8 +381,8 @@ def get_local_ckpt_path(
             if config.callbacks[callback_k].get("dirpath", None) is not None:
                 potential_dirs.append(config.callbacks[callback_k].dirpath)
 
-    for local_dir in potential_dirs:
-        # log.info(f"Checking {local_dir}. {os.path.exists(local_dir)=}")
+    for i, local_dir in enumerate(potential_dirs):
+        # log.info(f"Checking {local_dir}. {os.path.exists(local_dir)=}, {wandb_run.id=}")
         if not os.path.exists(local_dir):
             continue
         if wandb_run.id not in local_dir:
@@ -384,7 +406,10 @@ def get_local_ckpt_path(
             else:
                 # Get their epoch numbers from inside the file
                 # epochs = [torch.load(os.path.join(local_dir, f), weights_only=True)["epoch"] for f in ckpt_files]
-                epochs = [torch.load(os.path.join(local_dir, f), weights_only=False)["epoch"] for f in ckpt_files]
+                epochs = [
+                    torch.load(os.path.join(local_dir, f), weights_only=False, map_location="cpu")["epoch"]
+                    for f in ckpt_files
+                ]
                 # Find the ckpt file with the latest epoch
                 latest_ckpt_file = ckpt_files[np.argmax(epochs)]
                 log.info(
@@ -457,6 +482,7 @@ def load_state_dict_and_analyze_weight_changes(
     if exclude_keys:
         assert not strict, "Cannot exclude keys when strict=True"
         state_dict = {k: v for k, v in state_dict.items() if k not in exclude_keys}
+
     model.load_state_dict(state_dict, strict=strict)
 
     changed = []
@@ -554,3 +580,69 @@ def analyze_weight_changes_concise(model, state_dict, n_examples: int = 4):
         + ";  ".join(unchanged[:n_examples])
         + (f"\n... and {len(unchanged) - n_examples} more layers" if len(unchanged) > n_examples else "")
     )
+
+
+def rename_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> (Dict[str, torch.Tensor], bool):
+    #  Missing key(s) in state_dict: "model.downs.0.2.fn.fn.to_qkv.1.weight", "model.downs.1.2.fn.fn.to_qkv.1.weight",
+    #  Unexpected key(s) in state_dict: "model.downs.0.2.fn.fn.to_qkv.weight", "model.downs.1.2.fn.fn.to_qkv.weight",
+    # rename weights
+    renamed = False
+    for k in list(state_dict.keys()):
+        if "fn.to_qkv.weight" in k and "mid_attn" not in k:
+            state_dict[k.replace("fn.to_qkv.weight", "fn.to_qkv.1.weight")] = state_dict.pop(k)
+            renamed = True
+
+    return state_dict, renamed
+
+
+def rename_state_dict_keys_and_save(
+    torch_model_state, ckpt_path: str, model: nn.Module, use_ema_weights_only: bool = False
+) -> (Dict[str, torch.Tensor], bool):
+    """Renames the state dict keys and saves the renamed state dict back to the checkpoint."""
+    state_dict, has_been_renamed = rename_state_dict_keys(torch_model_state["state_dict"])
+    if has_been_renamed:
+        # Save the renamed model state
+        torch_model_state["state_dict"] = state_dict
+        torch.save(torch_model_state, ckpt_path)
+    # Check if model XOR state_dict are (not) torch.compiled.
+    # If one of them is but the other is not, we not to remove (or add) _orig_mod. to the state_dict keys.
+    #  However, we don't want to save the edited state_dict back to the checkpoint, so we do this here.
+    model_is_compiled = hasattr(model, "_orig_mod") or (hasattr(model, "model") and hasattr(model.model, "_orig_mod"))
+    state_dict_is_compiled = any(["_orig_mod" in k for k in state_dict.keys()])
+
+    if model_is_compiled and not state_dict_is_compiled:
+        # Add _orig_mod to the state_dict keys
+        log.info("Adding _orig_mod to the state_dict keys since the model is compiled but ckpt is not.")
+        state_dict = {
+            k.replace("model.", "model._orig_mod.").replace("model_ema.", "model_ema._orig_mod."): v
+            for k, v in state_dict.items()
+        }
+        has_been_renamed = True
+    elif not model_is_compiled and state_dict_is_compiled:
+        # Remove _orig_mod from the state_dict keys
+        log.info("Removing _orig_mod from the state_dict keys since the model is not compiled but the ckpt was.")
+        state_dict = {k.replace("._orig_mod", ".").replace("..", "."): v for k, v in state_dict.items()}
+        has_been_renamed = True
+
+    if use_ema_weights_only:
+        log.info("Using only EMA weights from the state_dict.")
+        # Remove all keys that do not start with "model_ema"
+        state_dict_new = {}
+        for k in state_dict.keys():
+            if "model." in k and "model_ema." not in k:
+                # Use EMA values for the model weights with key k
+                #   e.g.: model.model.out_norm.weight -> model_ema.modelmap_layer0weight
+                k_ema = k.replace(".", "").replace("model", "model_ema.", 1)
+                if k_ema in state_dict:
+                    state_dict_new[k] = state_dict[k_ema]
+                else:
+                    log.info(f"Key {k_ema} not found in state_dict. Using non-EMA value for {k}.")
+                    state_dict_new[k] = state_dict[k]
+
+        state_dict = state_dict_new
+        # state_dict = {k: v for k, v in state_dict.items() if "model_ema." in k}
+        # Remove "model_ema." from the keys
+        # state_dict = {k.replace("model_ema.", ""): v for k, v in state_dict.items()}
+        has_been_renamed = True
+
+    return state_dict, has_been_renamed

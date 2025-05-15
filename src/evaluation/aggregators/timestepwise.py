@@ -34,6 +34,8 @@ class MetricAggregator(Metric):
         record_normed: bool = False,
         record_rmse: bool = True,
         record_abs_values: bool = False,
+        record_ssr_square_dist: bool = False,
+        preprocess_fn: Optional[callable] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -43,16 +45,14 @@ class MetricAggregator(Metric):
         self.record_normed = record_normed
         self.record_rmse = record_rmse
         self.record_abs_values = record_abs_values
+        self.record_ssr_square_dist = record_ssr_square_dist
+        self.preprocess_fn = preprocess_fn
 
     def _get_variable_metrics(self, gen_data: Mapping[str, torch.Tensor]):
         if self._variable_metrics is None:
             self._variable_metrics = defaultdict(dict)
-            if torch.is_tensor(gen_data):
-                device = gen_data.device
-                gen_data_keys = [""]
-            else:
-                device = gen_data[list(gen_data.keys())[0]].device  # any key will do
-                gen_data_keys = list(gen_data.keys())
+            device = gen_data[list(gen_data.keys())[0]].device  # any key will do
+            gen_data_keys = list(gen_data.keys())
             assert self.device == device, f"Device mismatch: {self.device=} vs {device=}"
 
             area_weights = None if self._area_weights is None else self._area_weights.to(self.device)
@@ -119,7 +119,12 @@ class MetricAggregator(Metric):
         # rank = os.environ.get("RANK", None) or os.environ.get("LOCAL_RANK", None)
         # print(f"Rank: {rank}, {target_data.mean()=}")
         # Be cautious when DDP and eval dataset size not divisible by world size!! (some items will be duplicated)
-        variable_metrics = self._get_variable_metrics(gen_data)
+        if self.preprocess_fn is not None:
+            gen_data = self.preprocess_fn(gen_data)
+            target_data = self.preprocess_fn(target_data)
+            gen_data_norm = self.preprocess_fn(gen_data_norm) if gen_data_norm is not None else None
+            target_data_norm = self.preprocess_fn(target_data_norm) if target_data_norm is not None else None
+
         is_tensor = torch.is_tensor(gen_data)
         if is_tensor:  # add dummy key
             gen_data = {"": gen_data}
@@ -127,6 +132,7 @@ class MetricAggregator(Metric):
             gen_data_norm = {"": gen_data_norm}
             target_data_norm = {"": target_data_norm}
 
+        variable_metrics = self._get_variable_metrics(gen_data)
         record_normed_list = [True, False] if self.record_normed else [False]
         for is_normed in record_normed_list:
             if is_normed:
@@ -174,6 +180,9 @@ class MetricAggregator(Metric):
                     raise ValueError(f"{metric=} hasn't been computed for {variable=}. ({prefix=},  {i=})")
                 log_key = f"{prefix}{metric}/{variable}".rstrip("/")
                 logs[log_key] = float(metric_value.detach().item())
+                if metric == "ssr" and self.record_ssr_square_dist:
+                    log_key_ssr_sq = f"{prefix}ssr_squared_dist/{variable}".rstrip("/")
+                    logs[log_key_ssr_sq] = (1 - logs[log_key]) ** 2  # Distance from 1
 
         # for key in sorted(logs.keys()):
         # logs[key] = float(logs[key].cpu())  # .numpy()

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.nn.functional import silu
 
-from src.models.networks_edm import UNetBlock, Conv2d, Linear, PositionalEmbedding
+from src.models.networks_edm import Conv2d, Linear, PositionalEmbedding, UNetBlock
 
 
 class SongUNet(torch.nn.Module):
@@ -184,4 +184,3 @@ class SongUNet(torch.nn.Module):
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, emb)
         return aux
-

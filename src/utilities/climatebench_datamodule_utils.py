@@ -120,6 +120,7 @@ def handle_ensemble(
 def get_rsdt(
     data_path: str,
     simulations: Sequence[str],
+    solar_experiment: Optional[str] = None,
 ) -> xr.Dataset:
     """
     Load the raw data from the given path and return it as a dictionary of xarray datasets.
@@ -143,12 +144,16 @@ def get_rsdt(
         log.info(f"Loading historical rsdt data from {rsdt_path}")
         rsdt["historical"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 
-    # For now don't load piControl
-    rsdt_path = [path for path in rsdt_paths if "ssp126" in path]
-    assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
-    rsdt_path = rsdt_path[0]
-    log.info(f"Loading rsdt data from {rsdt_path}")
-    rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
+    if solar_experiment == "G6Solar":
+        # get the file with G6Solar
+        rsdt[solar_experiment] = xr.open_dataset(data_path + "/rsdt_Amon_CESM2-WACCM_G6solar.nc").compute()
+    else:
+        # For now don't load piControl
+        rsdt_path = [path for path in rsdt_paths if "ssp126" in path]
+        assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
+        rsdt_path = rsdt_path[0]
+        log.info(f"Loading rsdt data from {rsdt_path}")
+        rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 
     # Squeeze the nbnd & member_id dimension from the output datasets
     for k, v in rsdt.items():
@@ -429,7 +434,7 @@ def monthlyInterpolator(input_xr: xr.Dataset, index_datetime: cftime.datetime) -
     MONTH = index_datetime.month
     YEAR = index_datetime.year
     MIDDLE_OF_MONTH = cftime.DatetimeNoLeap(YEAR, MONTH, 15)
-    DAYS_FROM_MIDDLE = (index_datetime - MIDDLE_OF_MONTH).days
+    DAYS_FROM_MIDDLE = (MIDDLE_OF_MONTH - index_datetime).days if DAY < 15 else (index_datetime - MIDDLE_OF_MONTH).days
 
     try:
         # Get the values for the current month
@@ -471,8 +476,8 @@ def monthlyInterpolator(input_xr: xr.Dataset, index_datetime: cftime.datetime) -
             # Use the same month for interpolation if the previous month is not available (i.e. January 2015)
             prev_month = input_xr.sel(time=f"{YEAR}-{MONTH:02d}")
 
-        interpolated_values = ((NO_DAYS_IN_MONTH - DAYS_FROM_MIDDLE) / NO_DAYS_IN_MONTH * prev_month).squeeze() + (
-            DAYS_FROM_MIDDLE / NO_DAYS_IN_MONTH * curr
+        interpolated_values = ((NO_DAYS_IN_MONTH - DAYS_FROM_MIDDLE) / NO_DAYS_IN_MONTH * curr).squeeze() + (
+            DAYS_FROM_MIDDLE / NO_DAYS_IN_MONTH * prev_month
         ).squeeze()
 
     return interpolated_values

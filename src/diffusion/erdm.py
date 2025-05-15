@@ -1,17 +1,20 @@
+import math
 import os
 import time
 from collections import defaultdict
 from functools import partial
-from typing import Optional, Tuple, Union, Dict, Any
+from typing import Any, Dict, Optional, Tuple, Union
 
 import einops
 import numpy as np
 import torch
 from einops import rearrange, repeat
+from scipy.stats import norm
 from tqdm import tqdm
 
-from src.diffusion.edm import MPFourier, MPConv
 from src.diffusion._base_diffusion import BaseDiffusion
+from src.diffusion.edm import MPConv, MPFourier
+from src.utilities.random_control import StackedRandomGenerator
 from src.utilities.utils import get_logger, sample_random_real
 
 
@@ -19,9 +22,6 @@ log = get_logger(__name__)
 
 # ----------------------------------------------------------------------------
 
-import numpy as np
-from scipy.stats import norm
-import math
 
 def discretize_lognormal(P_mean, P_std, N, sigma_min, sigma_max, offset, batch_size):
     """
@@ -53,7 +53,7 @@ def discretize_lognormal(P_mean, P_std, N, sigma_min, sigma_max, offset, batch_s
         raise ValueError("N must be a positive integer.")
 
     # 1. Calculate parameters of the underlying normal distribution
-    sigma_log = math.sqrt(math.log(1 + (P_std / P_mean)**2))
+    sigma_log = math.sqrt(math.log(1 + (P_std / P_mean) ** 2))
     mu_log = math.log(P_mean) - 0.5 * sigma_log**2
 
     # 2. Calculate log-transformed min and max
@@ -87,7 +87,8 @@ def discretize_lognormal(P_mean, P_std, N, sigma_min, sigma_max, offset, batch_s
     parabolic_offset = 2.3 * offset * (1 - offset)
     linear_offset = offset * (2 * offset - 1)
     result = right_ends * (1 - parabolic_offset - linear_offset) + left_ends * (parabolic_offset + linear_offset)
-    return result #torch.tensor(result, dtype=torch.float32)
+    return result  # torch.tensor(result, dtype=torch.float32)
+
 
 # @persistence.persistent_class
 class ERDM(BaseDiffusion):
@@ -114,6 +115,7 @@ class ERDM(BaseDiffusion):
         # Use classical global mapping network based conditioning to inform network of fractional frame shift.
         # If False, the network will not be trained with randomly shifted noises, and will only handle the case offset=0! (XXX that mode is currently untested)
         use_map_noise: bool = True,
+        force_sigma_max_last_frame: bool = False,  # If True, the last frame will be forced to be sigma_max, instead of any potential initialization frame
         force_pure_noise_last_frame: bool = False,  # If True, the last frame will be forced to be randn * sigma_max, instead of any potential initialization frame
         noise_prior: str = "independent",  # independent | mixed | progressive
         noise_prior_alpha: float = 0.0,  # Mixing parameter for the mixed noise prior. Not used if independent.
@@ -136,6 +138,8 @@ class ERDM(BaseDiffusion):
         # A frame is yielded every time the steps add up to a full integer   # RDM does 4 (?) sub-steps per frame = 0.25
         step=1.0,
         S_churn=0,  # Maximum noise increase per step.
+        S_min=0,  # Minimum noise level for increased noise.
+        S_max=float("inf"),  # Maximum noise level for increased noise.
         S_noise=1,  # Noise level for increased noise.
         S_ar_noise=1,
         heun=True,  # Use Heun's method for ODE integration.
@@ -188,7 +192,7 @@ class ERDM(BaseDiffusion):
         self._noise_rand_cache = dict()
         if noise_prior in ["mixed", "progressive"]:
             # Common parameters for both methods
-            alpha_squared = noise_prior_alpha ** 2
+            alpha_squared = noise_prior_alpha**2
             scaling_factor = 1 / (1 + alpha_squared)
             correlation_factor = alpha_squared * scaling_factor
 
@@ -271,14 +275,15 @@ class ERDM(BaseDiffusion):
         Better to do it here in case self.* parameters are changed."""
         if self.hparams.variance_loss:
             if loss_function in ["l1", "l2"]:
-                log.warning(f"The specified {loss_function=} won't be told about the variance loss.")
+                raise ValueError(f"Please use a weighted loss function for {loss_function=}")
             else:
                 lvdn_to_i_n = kwargs.get("learned_var_dim_name_to_idx_and_n_dims", {})
                 lvdn_to_i_n["times"] = (self.time_dim, self.seq_len)  # (batch, channels, time, height, width)
                 kwargs["learned_var_dim_name_to_idx_and_n_dims"] = lvdn_to_i_n
                 if self.hparams.variance_loss == "with_channel":
                     kwargs["learn_per_dim"] = False  # Learn a (C, T) matrix rather than (C,) and (T,) vectors
-
+        if self.hparams.use_noise_logvar:
+            kwargs["use_batch_logvars"] = (0, self.time_dim)  # Tell which dimension to use for batch logvars
         return super()._get_loss_callable_from_name_or_config(loss_function, **kwargs)
 
     # ----------------------------------------------------------------------------
@@ -316,7 +321,6 @@ class ERDM(BaseDiffusion):
             # assert torch.all((frames+1) / self.seq_len >= 0) and torch.all((frames+1) / (seq_len+1) <= 1)
             normalized = (frame + 1) / self.seq_len
             focus_point = 2
-            sharpness = 3
             if self.hparams.discretization == "uniform":
                 normalized = 1 - normalized
             elif self.hparams.discretization == "sine":
@@ -337,7 +341,7 @@ class ERDM(BaseDiffusion):
                 normalized = (1 - normalized) * (1 + a * t * (1 - t) + b * t * t * (1 - t))
             elif self.hparams.discretization == "poly3":
                 a = 2.0 * (1.0 - focus_point)
-                b = 2.0 * focus_point - 1.0 +1
+                b = 2.0 * focus_point - 1.0 + 1
                 # This polynomial preserves endpoints and creates concentration around focus_point
                 t = normalized
                 normalized = (1 - normalized) * (1 + a * t * (1 - t) + b * t * t * (1 - t))
@@ -384,13 +388,15 @@ class ERDM(BaseDiffusion):
         B = x.shape[0]
         T = x.shape[self.time_dim]
         # NOTE: supporting other sequence lengths than self.seq_dim also, for sampling convenience and unification
-        frames = einops.repeat(torch.arange(T, dtype=x.dtype, device=x.device), "t -> t b", b=B) # Frame idxs
+        frames = einops.repeat(torch.arange(T, dtype=x.dtype, device=x.device), "t -> t b", b=B)  # Frame idxs
         if not self.hparams.use_map_noise:
             if torch.is_tensor(offset):
                 assert torch.all(offset == 0), f"Offset must be 0 if use_map_noise=False, got {offset}"
             else:
-                assert offset in [0, 1], (f"Offset must be 0 if usecccccbngkrfvcnurubeltvvjetgbujnhtllfkjubbftl"
-                                          f"_map_noise=False, got {offset}")
+                assert offset in [0, 1], (
+                    f"Offset must be 0 if usecccccbngkrfvcnurubeltvvjetgbujnhtllfkjubbftl"
+                    f"_map_noise=False, got {offset}"
+                )
 
         if self.hparams.schedule == "experimental":
             noise_std = discretize_lognormal(1, 2.5, T, self.tmin, self.tmax, offset, B)
@@ -440,7 +446,7 @@ class ERDM(BaseDiffusion):
             # See "Preserve Your Own Correlation: A Noise Prior for Video Diffusion Models"
             # Recommended alpha values from there: mixed=1 or progressive=2
             assert self.time_dim == 2, f"Only time_dim=2 supported for {self.hparams.noise_prior} noise prior"
-            
+
             # Get time dimension length and initialize noise tensor
             time_len = x_like.shape[self.time_dim]
             if self.hparams.noise_prior == "mixed":
@@ -454,7 +460,7 @@ class ERDM(BaseDiffusion):
 
                 # Sample independent noise components for each frame
                 indep_noise = self._indep_scale * rndn_handle(x_like)
-                
+
                 # Combine shared and independent noise
                 noise = self._corr_scale * shared_noise.expand_as(x_like) + indep_noise
             else:  # progressive
@@ -463,23 +469,25 @@ class ERDM(BaseDiffusion):
                 noise = torch.zeros_like(x_like)
                 # Sample initial noise for the first frame
                 noise[:, :, 0] = rndn_handle(x_like[:, :, 0])
-                
+
                 # Progressively generate noise for subsequent frames
                 for t in range(1, time_len):
                     # Auto-regressive component from previous frame
-                    ar_noise = noise[:, :, t-1]
-                    
+                    ar_noise = noise[:, :, t - 1]
+
                     # Independent noise component
                     indep_noise = self._indep_scale * rndn_handle(x_like[:, :, t])
-                    
+
                     # Combine for current frame
                     noise[:, :, t] = self._corr_scale * ar_noise + indep_noise
                 if use_cache:
                     self._noise_rand_cache["shared_noise"] = noise[:, :, -1:]
-                
+
             return noise
         else:
-            raise ValueError(f"Unknown noise_prior: {self.hparams.noise_prior}. Expected one of: independent, mixed, progressive")
+            raise ValueError(
+                f"Unknown noise_prior: {self.hparams.noise_prior}. Expected one of: independent, mixed, progressive"
+            )
 
     def sample_additional_noise_frame(self, size, rnd=None, **kwargs):
         rndn_handle = torch.randn if rnd is None else rnd.randn
@@ -496,7 +504,6 @@ class ERDM(BaseDiffusion):
             return new_noise
         else:
             raise ValueError(f"Unknown noise_prior: {self.hparams.noise_prior=}.")
-
 
     def forward(
         self,
@@ -644,10 +651,12 @@ class ERDM(BaseDiffusion):
             # loss = (error * weight).mean() #.float()
             # return {"loss": loss}
             if self.hparams.use_lambda_weighting == "inverse":
-                multiply_weight = 1 / sqrt_lambda  #(sqrt_lambda ** 2)
+                multiply_weight = 1 / sqrt_lambda  # (sqrt_lambda ** 2)
             elif self.hparams.use_lambda_weighting:
                 multiply_weight = sqrt_lambda**2  # Will be applied after squaring the error
-            if self.hparams.frame_weighting == "reverse":
+            if not self.hparams.frame_weighting:
+                pass
+            elif self.hparams.frame_weighting == "reverse":
                 # Assign higher loss weights to last frames
                 f_weight = torch.arange(1, self.seq_len + 1, device=x.device, dtype=x.dtype) / self.seq_len
                 f_weight = f_weight.reshape((1, *sqrt_lambda.shape[1:]))
@@ -666,14 +675,16 @@ class ERDM(BaseDiffusion):
             if self.hparams.use_noise_logvar:
                 logvars = self.logvar_linear(self.logvar_fourier(noise_std.flatten().log() / 4))
                 assert self.time_dim == 2, "Only time_dim=2 supported for use_noise_logvar"
-                # Reshape back to (B, T) shape and specify the dimensions to apply logvars to
-                loss_kwargs["batch_logvars"] = (logvars.reshape(bs, -1), (0, self.time_dim))
+                # Reshape back to (B, 1, T) shape
+                loss_kwargs["batch_logvars"] = logvars.reshape(bs, 1, -1)
 
             # Weight will be appropriately multiplied or combined with other weights in the loss function
             loss = self.loss_wrapper(preds=x_denoised, targets=x, multiply_weight=multiply_weight, **loss_kwargs)
             if not self.training and not self.hparams.use_lambda_weighting:
                 # Compute what lambda weighted loss would be, for comparison
-                loss_lambda = self.loss_wrapper(preds=x_denoised, targets=x, multiply_weight=sqrt_lambda**2, **loss_kwargs)
+                loss_lambda = self.loss_wrapper(
+                    preds=x_denoised, targets=x, multiply_weight=sqrt_lambda**2, **loss_kwargs
+                )
                 for k, v in loss_lambda.items():
                     loss[k.replace("loss", "loss_lambda")] = v.detach().cpu() if torch.is_tensor(v) else v
             return loss
@@ -708,13 +719,20 @@ class ERDM(BaseDiffusion):
             for k in temp_losses_keys:
                 if k in loss.keys():
                     loss_values = loss.pop(k)  # Vectorized across time dimension
-                    if isinstance(loss_values, float) or loss_values.numel() == 1:
+                    if isinstance(loss_values, float) or loss_values.ndim == 0:
                         loss[k] = float(loss_values)
                         continue  # Skip if it's a scalar
                     elif self.hparams.use_noise_logvar:  # Vectorized across batch and time dimension
                         loss_values = loss_values.mean(dim=0)  # Take mean over batch dimension
                     elif not self.hparams.variance_loss:
-                        loss_values = loss_values.mean(dim=[i for i in range(0, loss_values.ndim) if i != self.time_dim])
+                        loss_values = loss_values.mean(
+                            dim=[i for i in range(0, loss_values.ndim) if i != self.time_dim]
+                        )
+                    elif loss_values.ndim > 1 and self.hparams.learned_channel_variance_loss:
+                        loss_values = loss_values.mean(dim=0)
+                    if loss_values.ndim == 0:
+                        loss[k] = float(loss_values)
+                        continue
                     if sigmas is not None:
                         assert loss_values.shape == sigmas.shape, f"{k=}, {sigmas.shape=}, got {loss_values.shape=}"
                     for i, loss_value_i in enumerate(loss_values):
@@ -737,7 +755,6 @@ class ERDM(BaseDiffusion):
         if return_predictions:
             return loss, None
         return loss
-
 
     def get_loss_vs_sigmas(self, targets, **kwargs) -> Dict[str, float]:
         """Calculate the loss as a function of noise levels."""
@@ -782,7 +799,7 @@ class ERDM(BaseDiffusion):
         net = self
         step = self.hparams.step
         churn = self.hparams.S_churn
-        t0 = 0.0  # start timing from 0.0
+        t_cur = 0.0  # start timing from 0.0
         step_ode = step / (1 - churn)  # length of the step we'll take forward following the ODE
         S_ar_noise = self.hparams.S_ar_noise
         S_noise = self.hparams.S_noise
@@ -820,6 +837,7 @@ class ERDM(BaseDiffusion):
         # Insert copied frames into the initial prompt window according to the padded sequence length we'll be using
         # - they'll be fully under the noise, so no big deal what the content is (?)
         prompt = pad(prompt, 0, padding)  # pad `padding` frames to the right (i.e. to the future) of the prompt
+        # Equivalently: prompt = torch.cat([prompt, prompt[:, :, -padding:]], dim=self.time_dim)
         if self.hparams.force_pure_noise_last_frame in [True, "corrected"]:
             assert self.time_dim == 2, "Only time_dim=2 supported for force_pure_noise_last_frame"
             assert (
@@ -843,7 +861,7 @@ class ERDM(BaseDiffusion):
         ), f"per_frame_noise_coeffs.shape={per_frame_noise_coeffs.shape}. prompt.shape={prompt.shape}\nidx[0]={per_frame_noise_coeffs[0].squeeze()}, idx[1]={per_frame_noise_coeffs[1].squeeze()}"
         # noise = S_ar_noise * torch.randn(prompt.shape, dtype=dtype, generator=latent_rng, device=prompt.device)
         noise = S_ar_noise * self.sample_noise_tensor(prompt, rnd, use_cache=True)
-        x0 = prompt + per_frame_noise_coeffs * noise
+        x_cur = prompt + per_frame_noise_coeffs * noise
         # self.log.info(f"NOISE ADDED TO PROMPT")
 
         # Denoiser (will be called twice if heun==True, so isolated here)
@@ -911,18 +929,16 @@ class ERDM(BaseDiffusion):
         while True:
             # By this point, t0 has accumulated all the fractional steps we've taken so far,
             # minus all the full frames we've yielded; it's the float offset into the padded frame window we maintain
-            t1 = t0 + step_ode  # the global time we'll land after the ODE substep
-            t2 = t0 + step  # ... and after the churn/backtracking (if it's enabled)
+            t_next = t_cur + step_ode  # the global time we'll land after the ODE substep (>= t2)
             # To avoid floating point impurities, round to 6 decimal places
-            t0, t1, t2 = round(t0, 6), round(t1, 6), round(t2, 6)
+            t_cur, t_next = round(t_cur, 6), round(t_next, 6)
 
             # Collect some noise level tensors which can be used to set a randn() output
             # to the noise ramps with appropriate time offsets
             # These are one-dimensional tensors of length net.seq_len, padded with appropriate dimensions for broadcast
             # (for video, it'll be of shape [batchsize, 1, net.seq_len, 1, 1])
-            sigma_t0 = net.noise_coeff(x0, offset=t0)  # noise level at beginning of step
-            sigma_t1 = net.noise_coeff(x0, offset=t1)  # ... at end of ODE step but before churn
-            sigma_t2 = net.noise_coeff(x0, offset=t2)  # ... and after adding churn (passed to next iter)
+            sigma_cur = net.noise_coeff(x_cur, offset=t_cur)  # noise level at beginning of step
+            sigma_next = net.noise_coeff(x_cur, offset=t_next)  # ... at end of ODE step but before churn
             # print(f"Shapes of sigma_t0: {sigma_t0.shape}, sigma_t1: {sigma_t1.shape}, sigma_t2: {sigma_t2.shape}")
             # print(f"Frame-wise coeffs=", sigma_t0[0].squeeze(), sigma_t1[0].squeeze(), sigma_t2[0].squeeze())
 
@@ -938,18 +954,17 @@ class ERDM(BaseDiffusion):
 
             ###################
             # ODE SUB-STEP
-
             # Call the network on the appropriate window
             # Denoised frame window. If you visualize this, you'll see a short video of increasingly blurry frames,
             # reflecting the uncertainty of the future evolution.
             # x0,Dx0.shape = [B, C, seq_len+padding, H, W]
-            Dx0 = denoise(x0, t0, sigmas=sigma_t0, cond=condition, **kwargs)
+            Dx0 = denoise(x_cur, t_cur, sigmas=sigma_cur, cond=condition, **kwargs)
 
             # Mix between noisy and denoised frames in the exact per-frame proportion that
             # leaves us with noise levels in sigma_t1
             # Count num nan or inf in sigma_t1/sigma_t0
             if self.verbose:
-                div = 1 - sigma_t1 / sigma_t0  # future noise level / current noise level
+                div = 1 - sigma_next / sigma_cur  # future noise level / current noise level
                 assert torch.allclose(div[0], div[1]), f"div[0] != div[1] for frame {curr_frame} and step {curr_step}"
                 # log.info(f"t0={t0}, t1={t1}, t2={t2}.\t Num nan in sigma_t1/sigma_t0: {torch.isnan(div).sum()}, in sigma_t2={torch.isnan(sigma_t2).sum()}")
                 # join a str sigma_t0[0] -> sigma_t2[0] -> div[0] \t sigma_t0[1] -> sigma_t2[1] -> div[1] ...
@@ -957,9 +972,9 @@ class ERDM(BaseDiffusion):
                 # log.info("\t".join([f"{i}: {sigma_t0[0, 0, i].item():.4f} -> {sigma_t1[0, 0, i].item():.4f} -> {sigma_t2[0, 0, i].item():.4f}; {div[0, 0, i].item():.4f}" for i in print_steps]))
                 # log.info(f"sigma_t0.min;max={sigma_t0.min():.4f};{sigma_t0.max()}, sigma_t1.min;max={sigma_t1.min():.4f};{sigma_t1.max()}, sigma_t2.min;max={sigma_t2.min():.4f};{sigma_t2.max()}, div.min;max={div.min():.4f};{div.max()}")
 
-            d_cur = (x0 - Dx0) / sigma_t0
+            d_cur = (x_cur - Dx0) / sigma_cur
             # Mix between noisy and denoised frames in the exact per-frame proportion that
-            x1 = x0 + (sigma_t1 - sigma_t0) * d_cur  # same as torch.lerp(x0, Dx0, 1 - sigma_t1 / sigma_t0)
+            x_next = x_cur + (sigma_next - sigma_cur) * d_cur  # same as torch.lerp(x0, Dx0, 1 - sigma_t1 / sigma_t0)
             # EDM=> x0 + (t_next - t_hat) * (x0 - Dx0) / t_hat  # t_next ~= sigma_t1, t_hat ~= sigma_t0
             #       x0 + (t_next / t_hat - 1) * (x0 - Dx0)
             #       x0 + (1 - t_next / t_hat) * (Dx0 - x0)
@@ -973,32 +988,31 @@ class ERDM(BaseDiffusion):
             if heun:
                 # Heun correction sub-substep.
                 # Denoise at the levels and time offset of the initial step
-                Dx1 = denoise(x1, t1, sigmas=sigma_t1, cond=condition, **kwargs)
+                Dx1 = denoise(x_next, t_next, sigmas=sigma_next, cond=condition, **kwargs)
 
                 # Apply Heun formulas per-frame (like EDM algorithm)
-                d_prime = (x1 - Dx1) / sigma_t1
-                x1 = x0 + (sigma_t1 - sigma_t0) * (0.5 * d_cur + 0.5 * d_prime)  # corrected x1
+                d_prime = (x_next - Dx1) / sigma_next
+                x_next = x_cur + (sigma_next - sigma_cur) * (0.5 * d_cur + 0.5 * d_prime)  # corrected x1
 
             ###################
             # CHURN SUB-STEP
             if churn > 0:  # stochasticity enabled
+                # step_ode = step / (1 - churn)  # length of the step we'll take forward following the ODE
+                t_hat = round(t_cur + step, 6)  # ... and after the churn/backtracking (if it's enabled)
+                sigma_hat = net.noise_coeff(x_cur, offset=t_hat)  # ... and after adding churn (passed to next iter)
+                # Set all noise levels smaller that S_min and larger than S_max to be equal to sigma_next
+                no_churn_levels = torch.logical_or(sigma_hat < self.hparams.S_min, sigma_hat > self.hparams.S_max)
+                sigma_hat = torch.where(no_churn_levels, sigma_next, sigma_hat)
                 # Add a frame-dependent amount of noise that gets us to the ramp corresponding to t2
-                noise = S_noise * rnd_churn.randn(x1.shape, dtype=dtype, device=x1.device)
                 # noise = S_noise * torch.randn(x1.shape, dtype=dtype, generator=churn_rng, device=x1.device)
-                x2 = x1 + torch.sqrt(sigma_t2**2 - sigma_t1**2) * noise
-                # self.print(f"curr_frame={curr_frame}\tAdding churn={S_noise}*{torch.sqrt(sigma_t2 ** 2 - sigma_t1 ** 2)[0].squeeze()} noise to x1.")
-            else:
-                x2 = x1
-
+                x_next = x_next + (sigma_hat**2 - sigma_next**2).sqrt() * S_noise * rnd_churn.randn_like(x_cur)
+                t_next = t_hat
             ############################
             # YIELD FINISHED FRAMES
-            x0_next = x2.clone()
-            t0_next = t2
-
             # If we've crossed a full time interval, remove the resolved frames from left, and add fresh noise to end
             # t0 indicates how far we are inside our window -- if it's >=1, this means there are frame(s) we'll no longer
             # be touching on the left, so we'll yield those and cut them off
-            num_finished = int(t0_next)
+            num_finished = int(t_next)
             if self.hparams.save_debug_sampling_to_file:
 
                 def process_tensor(t):
@@ -1007,69 +1021,69 @@ class ERDM(BaseDiffusion):
                     return t.mean(dim=0).cpu()
 
                 if curr_frame <= 9:
-                    log_dict["sigma_t0"].append(process_tensor(sigma_t0))
-                    log_dict["sigma_t1"].append(process_tensor(sigma_t1))
-                    log_dict["sigma_t2"].append(process_tensor(sigma_t2))
-                log_dict["t0"].append(t0)
-                log_dict["t1"].append(t1)
-                log_dict["t2"].append(t2)
+                    log_dict["sigma_t0"].append(process_tensor(sigma_cur))
+                    log_dict["sigma_t1"].append(process_tensor(sigma_next))
+                    log_dict["sigma_t2"].append(process_tensor(sigma_hat))
+                log_dict["t0"].append(t_cur)
+                log_dict["t1"].append(t_next)
+                log_dict["t2"].append(t_hat)
                 log_dict["num_finished"].append(num_finished)
                 log_dict["curr_step"].append(curr_step)
                 log_dict["curr_frame"].append(curr_frame)
-                d = (x0 - Dx0) / sigma_t0
+                d = (x_cur - Dx0) / sigma_cur
                 add_full_tensor = False
                 if add_full_tensor:
-                    log_dict["x0"].append(process_tensor(x0))
-                    log_dict["x1"].append(process_tensor(x1))
-                    log_dict["x2"].append(process_tensor(x2))
+                    log_dict["x0"].append(process_tensor(x_cur))
+                    log_dict["x1"].append(process_tensor(x_next))
+                    log_dict["x2"].append(process_tensor(x_next))
                     log_dict["Dx0"].append(process_tensor(Dx0))
                     log_dict["d"].append(process_tensor(d))
-                log_dict["x0_norm_l2"].append(torch.linalg.norm(x0).item())
-                log_dict["x1_norm_l2"].append(torch.linalg.norm(x1).item())
-                log_dict["x2_norm_l2"].append(torch.linalg.norm(x2).item())
+                log_dict["x0_norm_l2"].append(torch.linalg.norm(x_cur).item())
+                log_dict["x1_norm_l2"].append(torch.linalg.norm(x_next).item())
+                log_dict["x2_norm_l2"].append(torch.linalg.norm(x_next).item())
                 log_dict["Dx0_norm_l2"].append(torch.linalg.norm(Dx0).item())
                 log_dict["d_norm_l2"].append(torch.linalg.norm(d).item())
                 # Log L1 and inf norms
-                log_dict["x0_squared_mean"].append((x0**2).mean().item())
-                log_dict["x1_squared_mean"].append((x1**2).mean().item())
-                log_dict["x2_squared_mean"].append((x2**2).mean().item())
+                log_dict["x0_squared_mean"].append((x_cur**2).mean().item())
+                log_dict["x1_squared_mean"].append((x_next**2).mean().item())
+                log_dict["x2_squared_mean"].append((x_next**2).mean().item())
                 log_dict["Dx0_squared_mean"].append((Dx0**2).mean().item())
                 log_dict["d_squared_mean"].append((d**2).mean().item())
-                log_dict["x0_abs_mean"].append(x0.abs().mean().item())
-                log_dict["x1_abs_mean"].append(x1.abs().mean().item())
-                log_dict["x2_abs_mean"].append(x2.abs().mean().item())
+                log_dict["x0_abs_mean"].append(x_cur.abs().mean().item())
+                log_dict["x1_abs_mean"].append(x_next.abs().mean().item())
+                log_dict["x2_abs_mean"].append(x_next.abs().mean().item())
                 log_dict["Dx0_abs_mean"].append(Dx0.abs().mean().item())
                 log_dict["d_abs_mean"].append(d.abs().mean().item())
-                log_dict["x0_max"].append(x0.max().item())
-                log_dict["x1_max"].append(x1.max().item())
-                log_dict["x2_max"].append(x2.max().item())
+                log_dict["x0_max"].append(x_cur.max().item())
+                log_dict["x1_max"].append(x_next.max().item())
+                log_dict["x2_max"].append(x_next.max().item())
                 log_dict["Dx0_max"].append(Dx0.max().item())
                 log_dict["d_max"].append(d.max().item())
-                log_dict["x0_min"].append(x0.min().item())
-                log_dict["x1_min"].append(x1.min().item())
-                log_dict["x2_min"].append(x2.min().item())
+                log_dict["x0_min"].append(x_cur.min().item())
+                log_dict["x1_min"].append(x_next.min().item())
+                log_dict["x2_min"].append(x_next.min().item())
                 log_dict["Dx0_min"].append(Dx0.min().item())
                 log_dict["d_min"].append(d.min().item())
-                log_dict["x0_mean"].append(x0.mean().item())
-                log_dict["x1_mean"].append(x1.mean().item())
-                log_dict["x2_mean"].append(x2.mean().item())
+                log_dict["x0_mean"].append(x_cur.mean().item())
+                log_dict["x1_mean"].append(x_next.mean().item())
+                log_dict["x2_mean"].append(x_next.mean().item())
                 log_dict["Dx0_mean"].append(Dx0.mean().item())
                 log_dict["d_mean"].append(d.mean().item())
-                log_dict["x0_std"].append(x0.std().item())
-                log_dict["x1_std"].append(x1.std().item())
-                log_dict["x2_std"].append(x2.std().item())
+                log_dict["x0_std"].append(x_cur.std().item())
+                log_dict["x1_std"].append(x_next.std().item())
+                log_dict["x2_std"].append(x_next.std().item())
                 log_dict["Dx0_std"].append(Dx0.std().item())
                 log_dict["d_std"].append(d.std().item())
-                log_dict["x0_median"].append(x0.median().item())
-                log_dict["x1_median"].append(x1.median().item())
-                log_dict["x2_median"].append(x2.median().item())
+                log_dict["x0_median"].append(x_cur.median().item())
+                log_dict["x1_median"].append(x_next.median().item())
+                log_dict["x2_median"].append(x_next.median().item())
                 log_dict["Dx0_median"].append(Dx0.median().item())
                 log_dict["d_median"].append(d.median().item())
 
             if num_finished > 0:
                 # Extract the finished frames (use the denoised versions if yield_denoised is set)
                 x_finished = select_range(
-                    Dx0 if yield_denoised else x0_next, dim=net.time_dim, start=None, end=num_finished
+                    Dx0 if yield_denoised else x_next, dim=net.time_dim, start=None, end=num_finished
                 )
                 if condition is not None:
                     # x_finished=[10, 69, 1, 240, 121], condition=[10, 69, 8, 240, 121], num_finished=1 net.time_dim=2
@@ -1088,7 +1102,7 @@ class ERDM(BaseDiffusion):
                 try:
                     yield dict(
                         frames=x_finished,
-                        noisy_future=x0,  # the full window of frames with noise
+                        noisy_future=x_cur,  # the full window of frames with noise
                         denoised_future=Dx0,  # The denoised version of the above
                     )
                 except GeneratorExit:
@@ -1112,29 +1126,35 @@ class ERDM(BaseDiffusion):
                     return
 
                 # The caller got their frames, we no longer need them -- clip them off
-                x0_next = select_range(x0_next, dim=net.time_dim, start=num_finished)
+                x_next = select_range(x_next, dim=net.time_dim, start=num_finished)
                 # update the offset into the window of frames to match dropping of num_finished
-                t0_next -= num_finished
+                t_next -= num_finished
 
                 # Our window has now become shorter by num_finished -- draw new noise to the right (with correct
                 # noise levels) to bring it to back to proper length
                 # NOTE implicitly we've padded the window with black frames with the maximal noise levels
                 # ... might still be worth validating some choices
-                sigma_fresh = select_range(net.noise_coeff(x0, offset=t0_next), dim=net.time_dim, start=-num_finished)
+                if self.hparams.force_sigma_max_last_frame:
+                    sigma_fresh = self.get_tmax()
+                else:
+                    sigma_fresh = select_range(
+                        net.noise_coeff(x_cur, offset=t_next), dim=net.time_dim, start=-num_finished
+                    )
+
                 # self.print(f"sigma_fresh.min;max={sigma_fresh.min():.4f};{sigma_fresh.max()}")
                 # Get a block of appropriately shaped white
-                xs = x0_next.shape
+                xs = x_next.shape
                 fresh_noise = self.sample_additional_noise_frame(
-                        [num_finished if dim == net.time_dim else xs[dim] for dim in range(len(xs))],
-                        dtype=dtype,
-                        device=x0_next.device,
-                    rnd=rnd
+                    [num_finished if dim == net.time_dim else xs[dim] for dim in range(len(xs))],
+                    dtype=dtype,
+                    device=x_next.device,
+                    rnd=rnd,
                 )
                 fresh_noise = sigma_fresh * S_ar_noise * fresh_noise  # shape: [B, C, num_finished, H, W]
                 if self.hparams.force_pure_noise_last_frame == "plus_data":
                     fresh_noise = x_finished + fresh_noise
                 # Cat it onto the frame window, scaled by the sigmas found above
-                x0_next = torch.cat((x0_next, fresh_noise), net.time_dim)
+                x_next = torch.cat((x_next, fresh_noise), net.time_dim)
 
                 curr_frame += num_finished
                 self.curr_frame = curr_frame
@@ -1143,33 +1163,11 @@ class ERDM(BaseDiffusion):
 
             if self.hparams.save_debug_sampling_to_file:
                 log_dict["sigma_fresh"].append(sigma_fresh)
-                # if add_full_tensor:
-                # log_dict["x0_next"].append(x0_next)
-                # log_dict["t0_next"].append(t0_next)
-
             # Adopt the updated window and time offset for the next iteration
-            t0 = t0_next
-            x0 = x0_next
+            t_cur = t_next
+            x_cur = x_next
 
             curr_step += 1
-
-
-
-class StackedRandomGenerator:
-    def __init__(self, device, seeds):
-        super().__init__()
-        self.generators = [torch.Generator(device).manual_seed(int(seed) % (1 << 32)) for seed in seeds]
-
-    def randn(self, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randn(size[1:], generator=gen, **kwargs) for gen in self.generators])
-
-    def randn_like(self, input):
-        return self.randn(input.shape, dtype=input.dtype, layout=input.layout, device=input.device)
-
-    def randint(self, *args, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])
 
 
 # return a slice object the interval start:end of dimension dim
@@ -1205,131 +1203,7 @@ def exp_a_b_normalized(s, a: float, b: float, tmin: float, tmax: float, noises_m
 # noises_max = float(exp_a_b(torch.tensor(1.0), a=a, b=b))
 
 
-@torch.inference_mode()
-def sample_simple(self, prompt, dtype=torch.float32, batch_seeds=None, **kwargs):  # Salva: dtype=torch.float64!
-    batch_seeds = batch_seeds or torch.randint(0, 2**32, (prompt.shape[0],), device=prompt.device)
-    rnd = StackedRandomGenerator(self.device, batch_seeds)
-    rnd_churn = StackedRandomGenerator(self.device, batch_seeds + 123) if self.hparams.S_churn > 0 else None
-    net = self
-    step = self.hparams.step
-    churn = self.hparams.S_churn
-    t0 = 0.0  # start timing from 0.0
-    step_ode = step / (1 - churn)  # length of the step we'll take forward following the ODE
-    S_ar_noise = self.hparams.S_ar_noise
-    S_noise = self.hparams.S_noise
-    yield_denoised = self.hparams.yield_denoised
-    padding = int(step_ode) + 1
-
-    def win(x, i):
-        nonlocal net  # variable is defined in the outer scope and will be modified inside the function.
-        return select_range(x, dim=net.time_dim, start=i, end=i + net.seq_len)
-
-    def pad(x, pre, post, mode="replicate"):
-        nonlocal net
-        return torch.nn.functional.pad(
-            x, (0, 0) * (len(x.shape) - 1 - net.time_dim) + (pre, post) + (0, 0) * (net.time_dim - 2), mode=mode
-        )
-
-    # Insert copied frames into the initial prompt window according to the padded sequence length we'll be using
-    # - they'll be fully under the noise, so no big deal what the content is (?)
-    prompt = pad(prompt, 0, padding)  # pad `padding` frames to the right (i.e. to the future) of the prompt
-    per_frame_noise_coeffs = net.noise_coeff(prompt, offset=0.0)
-    noise = S_ar_noise * rnd.randn(prompt.shape, dtype=dtype, device=prompt.device)
-    x0 = prompt + per_frame_noise_coeffs * noise
-
-    def denoise(x, t, cond=None, **denoise_kwargs):
-        Dx = net(win(x, int(t)), offset=frac(t), dtype=dtype, condition=cond, **denoise_kwargs)
-        # Extend the denoiser output to cover the entire window, by appropriate replication padding
-        Dx = pad(Dx, int(t), padding - int(t))  # for t=0, this pads the right side of the frame
-        range_kwargs = dict(dim=net.time_dim, start=None, end=int(t))
-        Dx[slice_range(**range_kwargs, of=len(Dx.shape))] = select_range(x, **range_kwargs)
-        return Dx
-
-    curr_frame = 0
-    while True:
-        # By this point, t0 has accumulated all the fractional steps we've taken so far,
-        # minus all the full frames we've yielded; it's the float offset into the padded frame window we maintain
-        t1 = t0 + step_ode  # the global time we'll land after the ODE substep
-        t2 = t0 + step  # ... and after the churn/backtracking (if it's enabled)
-
-        # Collect some noise level tensors which can be used to set a randn() output
-        # to the noise ramps with appropriate time offsets
-        # These are one-dimensional tensors of length net.seq_len, padded with appropriate dimensions for broadcast
-        sigma_t0 = net.noise_coeff(x0, offset=t0)  # noise level at beginning of step
-        sigma_t1 = net.noise_coeff(x0, offset=t1)  # ... at end of ODE step but before churn
-        sigma_t2 = net.noise_coeff(x0, offset=t2)  # ... and after adding churn (passed to next iter)
-
-        # ODE SUB-STEP
-        # Denoised frame window. If you visualize this, you'll see a short video of increasingly blurry frames,
-        # reflecting the uncertainty of the future evolution.
-        Dx0 = denoise(x0, t0, **kwargs)  # x0,Dx0.shape = [B, C, seq_len+padding, H, W]
-        d_cur = (x0 - Dx0) / sigma_t0
-        x1 = x0 + (sigma_t1 - sigma_t0) * d_cur  # same as torch.lerp(x0, Dx0, 1 - sigma_t1 / sigma_t0)
-        # Heun correction sub-substep.
-        Dx1 = denoise(x1, t1, **kwargs)
-        dp = (x1 - Dx1) / sigma_t1
-        x1 = x0 + (sigma_t1 - sigma_t0) * (d_cur + dp) / 2  # corrected x1
-
-        # CHURN SUB-STEP
-        if churn > 0:  # stochasticity enabled
-            # Add a frame-dependent amount of noise that gets us to the ramp corresponding to t2
-            noise = S_noise * rnd_churn.randn(x1.shape, dtype=dtype, device=x1.device)
-            x2 = x1 + torch.sqrt(sigma_t2**2 - sigma_t1**2) * noise
-        else:
-            x2 = x1
-
-        # YIELD FINISHED FRAMES
-        x0_next = x2.clone()
-        t0_next = t2
-
-        # If we've crossed a full time interval, remove the resolved frames from left, and add fresh noise to end
-        # t0 indicates how far we are inside our window -- if it's >=1, this means there are frame(s) we'll no longer
-        # be touching on the left, so we'll yield those and cut them off
-        num_finished = int(t0_next)
-        if num_finished > 0:
-            # Extract the finished frames (use the denoised versions if yield_denoised is set)
-            x_finished = select_range(
-                Dx0 if yield_denoised else x0_next, dim=net.time_dim, start=None, end=num_finished
-            )
-            # return a "video" of all the finished frames with time dimension intact (there might be more than one if
-            # step > 1 -- this is much more efficient than yielding each one separately, e.g. for audio)
-            # Also output some extra tensors we might be interested in visualizing.
-            try:
-                yield dict(
-                    frames=x_finished,
-                    noisy_future=x0,  # the full window of frames with noise
-                    denoised_future=Dx0,  # The denoised version of the above
-                )
-            except GeneratorExit:
-                return
-
-            # The caller got their frames, we no longer need them -- clip them off
-            x0_next = select_range(x0_next, dim=net.time_dim, start=num_finished)
-            t0_next -= num_finished  # update the offset to the window of frames to match dropping of num_finished
-
-            # Our window has now become shorter by num_finished -- draw new noise to the right (with correct
-            # noise levels) to bring it to back to proper length
-            # NOTE implicitly we've padded the window with black frames with the maximal noise levels
-            # ... might still be worth validating some choices
-            sigma_fresh = select_range(net.noise_coeff(x0, offset=t0_next), dim=net.time_dim, start=-num_finished)
-            # Get a block of appropriately shaped white
-            xs = x0_next.shape
-            fresh_noise = S_ar_noise * rnd.randn(
-                [num_finished if dim == net.time_dim else xs[dim] for dim in range(len(xs))],
-                dtype=dtype,
-                device=x0_next.device,
-            )  # shape: [B, C, num_finished, H, W]
-            # Cat it onto the frame window, scaled by the sigmas found above
-            x0_next = torch.cat((x0_next, sigma_fresh * fresh_noise), net.time_dim)
-
-            curr_frame += num_finished
-            self.curr_frame = curr_frame
-
-        # Adopt the updated window and time offset for the next iteration
-        t0 = t0_next
-        x0 = x0_next
-
-def calculate_lognormal_weight(sigma, P_mean = 0.5, P_std = 1.2):
+def calculate_lognormal_weight(sigma, P_mean=0.5, P_std=1.2):
     """
     Calculate a weight proportional to the frequency of a noise level sigma
     under a lognormal distribution.
@@ -1350,7 +1224,7 @@ def calculate_lognormal_weight(sigma, P_mean = 0.5, P_std = 1.2):
     """
     # Calculate PDF of normal distribution in log space
     # f(x) = (1/(σ√(2π))) * exp(-(x-μ)²/(2σ²))
-    exponent = -((torch.log(sigma) - P_mean) ** 2) / (2 * P_std ** 2)
+    exponent = -((torch.log(sigma) - P_mean) ** 2) / (2 * P_std**2)
     coefficient = 1 / (P_std * np.sqrt(2 * np.pi))
 
     # PDF of normal distribution in log space
@@ -1363,4 +1237,3 @@ def calculate_lognormal_weight(sigma, P_mean = 0.5, P_std = 1.2):
     # The weight is directly proportional to the PDF value
     weight = lognormal_pdf
     return weight
-

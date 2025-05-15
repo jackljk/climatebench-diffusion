@@ -3,11 +3,13 @@ from typing import Dict
 
 import numpy as np
 import torch
+from einops import repeat
 
 # from src.utilities.torch_utils import persistence
 from src.diffusion._base_diffusion import BaseDiffusion
 from src.losses.losses import AbstractWeightedLoss, crps_ensemble
-from src.utilities.utils import get_logger
+from src.utilities.random_control import StackedRandomGenerator
+from src.utilities.utils import get_logger, rrearrange
 
 
 log = get_logger(__name__)
@@ -64,8 +66,8 @@ class VPPrecond(BaseDiffusion):
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x
 
-    def get_loss(self, images, labels=None, augment_pipe=None):
-        return self.criterion(self, images, labels, augment_pipe)
+    def get_loss(self, targets, labels=None, augment_pipe=None):
+        return self.criterion(self, targets, labels, augment_pipe)
 
     def sigma(self, t):
         return self.loss.sigma(t)
@@ -123,11 +125,89 @@ class VEPrecond(BaseDiffusion):
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x
 
-    def get_loss(self, images, labels=None, augment_pipe=None):
-        return self.criterion(self, images, labels, augment_pipe)
+    def get_loss(self, targets, labels=None, augment_pipe=None):
+        return self.criterion(self, targets, labels, augment_pipe)
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
+
+
+# ----------------------------------------------------------------------------
+# Preconditioning corresponding to improved DDPM (iDDPM) formulation from
+# the paper "Improved Denoising Diffusion Probabilistic Models".
+
+
+class iDDPMPrecond(torch.nn.Module):
+    def __init__(
+        self,
+        img_resolution,  # Image resolution.
+        img_channels,  # Number of color channels.
+        label_dim=0,  # Number of class labels, 0 = unconditional.
+        use_fp16=False,  # Execute the underlying model at FP16 precision?
+        C_1=0.001,  # Timestep adjustment at low noise levels.
+        C_2=0.008,  # Timestep adjustment at high noise levels.
+        M=1000,  # Original number of timesteps in the DDPM formulation.
+        model_type="DhariwalUNet",  # Class name of the underlying model.
+        **model_kwargs,  # Keyword arguments for the underlying model.
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.use_fp16 = use_fp16
+        self.C_1 = C_1
+        self.C_2 = C_2
+        self.M = M
+        self.model = globals()[model_type](
+            img_resolution=img_resolution,
+            in_channels=img_channels,
+            out_channels=img_channels * 2,
+            label_dim=label_dim,
+            **model_kwargs,
+        )
+
+        u = torch.zeros(M + 1)
+        for j in range(M, 0, -1):  # M, ..., 1
+            u[j - 1] = ((u[j] ** 2 + 1) / (self.alpha_bar(j - 1) / self.alpha_bar(j)).clip(min=C_1) - 1).sqrt()
+        self.register_buffer("u", u)
+        self.sigma_min = float(u[M - 1])
+        self.sigma_max = float(u[0])
+
+    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        class_labels = (
+            None
+            if self.label_dim == 0
+            else (
+                torch.zeros([1, self.label_dim], device=x.device)
+                if class_labels is None
+                else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+            )
+        )
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == "cuda") else torch.float32
+
+        c_skip = 1
+        c_out = -sigma
+        c_in = 1 / (sigma**2 + 1).sqrt()
+        c_noise = self.M - 1 - self.round_sigma(sigma, return_index=True).to(torch.float32)
+
+        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        assert F_x.dtype == dtype
+        D_x = c_skip * x + c_out * F_x[:, : self.img_channels].to(torch.float32)
+        return D_x
+
+    def alpha_bar(self, j):
+        j = torch.as_tensor(j)
+        return (0.5 * np.pi * j / self.M / (self.C_2 + 1)).sin() ** 2
+
+    def round_sigma(self, sigma, return_index=False):
+        sigma = torch.as_tensor(sigma)
+        index = torch.cdist(
+            sigma.to(self.u.device).to(torch.float32).reshape(1, -1, 1), self.u.reshape(1, -1, 1)
+        ).argmin(2)
+        result = index if return_index else self.u[index.flatten()].to(sigma.dtype)
+        return result.reshape(sigma.shape).to(sigma.device)
 
 
 # ----------------------------------------------------------------------------
@@ -148,6 +228,7 @@ class EDMPrecond(BaseDiffusion):
         P_std=1.2,  # Standard deviation of the noise level distribution.
         noise_distribution: str = "lognormal",  # Distribution of the noise level.
         use_noise_logvar: bool = False,
+        when_3d_concat_condition_to: str = None,  # When using 3D model: Concat to 'time' or 'channel' dimension?
         force_unconditional=False,  # Ignore conditioning information?
         # Sampling parameters.
         num_steps=18,  # Number of steps in the sampling loop.
@@ -193,9 +274,9 @@ class EDMPrecond(BaseDiffusion):
             raise ValueError(f"Unknown noise distribution: {self.hparams.noise_distribution}")
 
         log.info(f"Using EDM loss function: {loss_function}")
-        if loss_function == "mse":
+        if loss_function in ["mse", "l1"]:
             loss_kwargs.pop("reduction", None)
-            return EDMLoss(**loss_kwargs)
+            return EDMLoss(**loss_kwargs) if loss_function == "mse" else EDMLossMAE(**loss_kwargs)
         elif loss_function == "wmse":
             return WeightedEDMLoss(**loss_kwargs, loss_type="L2")
         elif loss_function == "wmae":
@@ -218,16 +299,33 @@ class EDMPrecond(BaseDiffusion):
             else:
                 _ = model_kwargs.pop("condition", None)
         x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        sigma = sigma.to(torch.float32)  # .reshape(-1, 1, 1, 1)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == "cuda") else torch.float32
 
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2).sqrt()
         c_in = 1 / (self.sigma_data**2 + sigma**2).sqrt()
         c_noise = sigma.flatten().log() / 4
+        x_in = (c_in * x).to(dtype)
+        if self.model.is_3d:
+            # Concatenate initial condition prompt with the noisy input/sequence.
+            assert x_in.ndim == 5, f"Expected 5D input for 3D model, got {x_in.ndim}D"  # (B, C, T, H, W)
+            condition = model_kwargs.pop("condition", None)  # (B, C, T_cond, H, W), x_in: (B, C, T_gen, H, W)
+            if condition is not None:
+                # Ensure to concat condition with x_in (after applying c_in!), and put it to the front of the sequence.
+                if self.hparams.when_3d_concat_condition_to == "time":
+                    x_in = torch.cat([condition, x_in], dim=2)  # (B, C, T_cond+T_gen, H, W)
+                elif self.hparams.when_3d_concat_condition_to == "channel":
+                    condition = rrearrange(condition, "b c tcond ... -> b (c tcond) ...")
+                    condition = repeat(condition, "b ctcond ... -> b ctcond tgen ...", tgen=x_in.shape[2])
+                    model_kwargs["condition"] = condition  # will be concatenated to x_in on the channel dimension
+                else:
+                    raise ValueError(f"Invalid {self.hparams.when_3d_concat_condition_to=}")
 
-        F_x = self.model((c_in * x).to(dtype), c_noise, **model_kwargs)
-        # assert F_x.dtype == dtype, f"{F_x.dtype} != {dtype}"
+        F_x = self.model(x_in, c_noise, **model_kwargs)
+        if self.model.is_3d and self.hparams.when_3d_concat_condition_to == "time":
+            # Remove condition from the model output.
+            F_x = F_x[:, :, -x.shape[2] :, ...]  # (B, C, T_gen, H, W)
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x
 
@@ -241,7 +339,7 @@ class EDMPrecond(BaseDiffusion):
             sigmas = self.edm_discretization(steps=steps, sigma_min=self.sigma_min_train, sigma_max=self.sigma_max)
             kwargs["sigma"] = sigmas
 
-        loss = self.criterion["preds"](self, images=targets, condition=inputs, **kwargs)
+        loss = self.criterion["preds"](self, targets=targets, condition=inputs, **kwargs)
         # condition will be fed back to .forward() above as part of model_kwargs
         if self.hparams.compute_loss_per_sigma:
             loss = {"loss": loss} if torch.is_tensor(loss) else loss
@@ -255,7 +353,7 @@ class EDMPrecond(BaseDiffusion):
         sigmas = self.edm_discretization(steps=200)
         losses = dict()  # defaultdict(list)
         for sigma in sigmas:
-            loss_sigma = self.criterion["preds"](self, images=targets, condition=inputs, sigma=sigma, **kwargs)
+            loss_sigma = self.criterion["preds"](self, targets=targets, condition=inputs, sigma=sigma, **kwargs)
             loss_sigma = {"loss": loss_sigma} if torch.is_tensor(loss_sigma) else loss_sigma
             if "raw_loss" not in loss_sigma:
                 loss_sigma["raw_loss"] = loss_sigma["loss"]
@@ -287,11 +385,16 @@ class EDMPrecond(BaseDiffusion):
         **kwargs,
     ):
         dtype = torch.float64 if self.hparams.dtype == "double" else torch.float32
+        dtype = torch.float32
 
         def denoise(x, t):
             denoised = self(x, t, **kwargs).to(dtype)
             if self.hparams.guidance == 1:
                 return denoised
+            elif self.hparams.guidance_interval is not None and (
+                t < self.hparams.guidance_interval[0] or t > self.hparams.guidance_interval[1]
+            ):  # todo: ensure that guidance interval is exactly at step boundaries to satisfy smoothness requiremen
+                return denoised  # No guidance outside the interval.
             # Guided denoiser.
             kwargs_g = kwargs
             if self.guidance_model.model.hparams.force_unconditional:
@@ -322,7 +425,7 @@ class EDMPrecond(BaseDiffusion):
             # Increase noise temporarily.
             if S_churn > 0 and S_min <= t_cur <= S_max:
                 gamma = min(S_churn / num_steps, np.sqrt(2) - 1)
-                t_hat = t_cur + gamma * t_cur
+                t_hat = t_cur + gamma * t_cur  # = (1 + gamma) * t_cur
                 x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * randn_like(x_cur)
             else:
                 t_hat = t_cur
@@ -345,14 +448,17 @@ class EDMPrecond(BaseDiffusion):
 
     @torch.inference_mode()
     def sample(self, condition, batch_seeds=None, **kwargs):
-        batch_seeds = batch_seeds or torch.randint(0, 2**32, (condition.shape[0],), device=condition.device)
-        rnd = StackedRandomGenerator(self.device, batch_seeds)
-        init_latents_shape = (
-            condition.shape[0],
-            self.num_input_channels,
-            self.spatial_shape_out[0],
-            self.spatial_shape_out[1],
-        )
+        batch_size = condition.shape[0]
+        batch_seeds = batch_seeds or torch.randint(0, 2**32, (batch_size,), device=condition.device)
+        rnd = StackedRandomGenerator(self.device, batch_seeds)  # todo: check how much this makes a difference
+        if self.model.is_3d:
+            # 3D model, so we need to add the temporal dimension explicitly.
+            nt_gen = self.num_temporal_channels
+            if self.hparams.when_3d_concat_condition_to != "channel":
+                nt_gen -= condition.shape[2]  # Remove the condition time dimensions from latents.
+            init_latents_shape = (batch_size, self.num_input_channels, nt_gen, *self.spatial_shape_out)
+        else:
+            init_latents_shape = (batch_size, self.num_input_channels, *self.spatial_shape_out)
         latents = rnd.randn(
             init_latents_shape, dtype=condition.dtype, layout=condition.layout, device=condition.device
         )
@@ -385,11 +491,11 @@ class VPLoss:
         self.beta_min = beta_min
         self.epsilon_t = epsilon_t
 
-    def __call__(self, net, images, labels, augment_pipe=None):
-        rnd_uniform = torch.rand([images.shape[0], 1, 1, 1], device=images.device)
+    def __call__(self, net, targets, labels, augment_pipe=None):
+        rnd_uniform = torch.rand([targets.shape[0], 1, 1, 1], device=targets.device)
         sigma = self.sigma(1 + rnd_uniform * (self.epsilon_t - 1))
         weight = 1 / sigma**2
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        y, augment_labels = augment_pipe(targets) if augment_pipe is not None else (targets, None)
         n = torch.randn_like(y) * sigma
         D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y) ** 2)
@@ -412,11 +518,11 @@ class VELoss:
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
-    def __call__(self, net, images, labels, augment_pipe=None):
-        rnd_uniform = torch.rand([images.shape[0], 1, 1, 1], device=images.device)
+    def __call__(self, net, targets, labels, augment_pipe=None):
+        rnd_uniform = torch.rand([targets.shape[0], 1, 1, 1], device=targets.device)
         sigma = self.sigma_min * ((self.sigma_max / self.sigma_min) ** rnd_uniform)
         weight = 1 / sigma**2
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        y, augment_labels = augment_pipe(targets) if augment_pipe is not None else (targets, None)
         n = torch.randn_like(y) * sigma
         D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y) ** 2)
@@ -496,22 +602,23 @@ class EDMLossAbstract:  # For some reason this cannot inherit (torch.nn.Module) 
     def loss(self, preds, targets, sigma_weights, **kwargs):
         pass
 
-    def __call__(self, net, images, predictions_post_process=None, targets_pre_process=None, sigma=None, **kwargs):
+    def __call__(self, net, targets, predictions_post_process=None, targets_pre_process=None, sigma=None, **kwargs):
+        y = targets_pre_process(targets) if targets_pre_process is not None else targets
+        n_dims1 = (1,) * (y.ndim - 1)
         if sigma is None:
             # Sample noise level from the prior distribution. Only specify sigma for analysis of loss vs. sigma.
-            rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+            rnd_normal = torch.randn([targets.shape[0], *n_dims1], device=targets.device)
             sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         else:
-            sigma = sigma.reshape(-1, 1, 1, 1)
+            sigma = sigma.reshape(-1, *n_dims1)
 
         weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
-        y = images
-        if targets_pre_process is not None:
-            y = targets_pre_process(y)
+
         try:
             n = torch.randn_like(y) * sigma
         except RuntimeError as e:
             raise RuntimeError(f"Shape mismatch: y={y.shape}, sigma={sigma.shape}") from e
+
         D_yn = net(y + n, sigma, **kwargs)
         if predictions_post_process is not None:
             D_yn = predictions_post_process(D_yn)
@@ -523,7 +630,7 @@ class EDMLossAbstract:  # For some reason this cannot inherit (torch.nn.Module) 
         loss_kwargs = {}
         if self.use_logvar:
             loss_kwargs["batch_logvars"] = self.logvar_linear(self.logvar_fourier(sigma.flatten().log() / 4))
-        loss = self.loss(D_yn, images, weight, **loss_kwargs)
+        loss = self.loss(D_yn, targets, weight, **loss_kwargs)
         return {"loss": loss} if torch.is_tensor(loss) else loss
 
 
@@ -534,9 +641,15 @@ class EDMLoss(EDMLossAbstract):
         return (sigma_weights * ((preds - targets) ** 2)).mean()
 
 
+class EDMLossMAE(EDMLossAbstract):
+    def loss(self, preds, targets, sigma_weights, **kwargs):
+        assert len(kwargs) == 0, f"Unknown kwargs: {kwargs}. Consider using a weighted loss like 'wmse' instead?"
+        return (sigma_weights * ((preds - targets).abs())).mean()
+
+
 class WeightedEDMLossAbstract(AbstractWeightedLoss, EDMLossAbstract):
     def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, **kwargs):
-        AbstractWeightedLoss.__init__(self, **kwargs)
+        AbstractWeightedLoss.__init__(self, use_batch_logvars=use_logvar, **kwargs)
         EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data, use_logvar=use_logvar)
 
     @property
@@ -572,15 +685,15 @@ class WeightedEDMLoss(WeightedEDMLossAbstract):
 
 
 class WeightedEDMLossCRPS(WeightedEDMLossAbstract):
-    def __call__(self, net, images, predictions_post_process=None, targets_pre_process=None, **kwargs):
-        rnd_normal1 = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        rnd_normal2 = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+    def __call__(self, net, targets, predictions_post_process=None, targets_pre_process=None, **kwargs):
+        rnd_normal1 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
+        rnd_normal2 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
         sigma1 = (rnd_normal1 * self.P_std + self.P_mean).exp()
         sigma2 = (rnd_normal2 * self.P_std + self.P_mean).exp()
         weight1 = (sigma1**2 + self.sigma_data**2) / (sigma1 * self.sigma_data) ** 2
         weight2 = (sigma2**2 + self.sigma_data**2) / (sigma2 * self.sigma_data) ** 2
 
-        y = images
+        y = targets
         n1 = torch.randn_like(y) * sigma1
         n2 = torch.randn_like(y) * sigma2
         D_yn1 = net(y + n1, sigma1, **kwargs)
@@ -594,27 +707,3 @@ class WeightedEDMLossCRPS(WeightedEDMLossAbstract):
         # Copilot suggestion:
         # CRPS = E[|D_yn1 - D_yn2|] - 0.5 * E[|D_yn1 - y|] - 0.5 * E[|D_yn2 - y|]
         # crps = (D_yn1 - D_yn2).abs().mean() - 0.5 * (D_yn1 - y).abs().mean() - 0.5 * (D_yn2 - y).abs().mean()
-
-
-# ----------------------------------------------------------------------------
-
-# ----------------------------------------------------------------------------
-# Wrapper for torch.Generator that allows specifying a different random seed
-# for each sample in a minibatch.
-
-
-class StackedRandomGenerator:
-    def __init__(self, device, seeds):
-        super().__init__()
-        self.generators = [torch.Generator(device).manual_seed(int(seed) % (1 << 32)) for seed in seeds]
-
-    def randn(self, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randn(size[1:], generator=gen, **kwargs) for gen in self.generators])
-
-    def randn_like(self, input):
-        return self.randn(input.shape, dtype=input.dtype, layout=input.layout, device=input.device)
-
-    def randint(self, *args, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])

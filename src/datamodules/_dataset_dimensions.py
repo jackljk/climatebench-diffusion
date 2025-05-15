@@ -100,7 +100,7 @@ def get_dims_of_dataset(datamodule_config: DictConfig):
     elif "debug_datamodule" in target:
         input_dim = output_dim = datamodule_config.channels
         spatial_dims = (datamodule_config.height, datamodule_config.width)
-        conditional_dim = 5
+        conditional_dim = datamodule_config.channels_cond
 
     else:
         raise ValueError(f"Unknown dataset: {target}")

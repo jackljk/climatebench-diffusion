@@ -160,18 +160,21 @@ class OneStepAggregator(AbstractAggregator):
         record_rmse: bool = True,
         record_abs_values: bool = False,  # logs absolutes mean and std of preds and targets
         use_snapshot_aggregator: bool = True,
-        snapshot_var_names: list[str] = None,
-        every_nth_epoch_snapshot: int = 8,
-        snapshots_preprocess_fn: Callable = None,
         record_spectra: bool = False,
-        spectra_var_names: list[str] = None,
+        metrics_kwargs: dict = None,
+        snapshot_kwargs: dict = None,
+        spectra_kwargs: dict = None,
         temporal_kwargs: dict = None,
-        coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         save_to_path: str = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         snapshot_agg = mean_agg = spectra_agg = temporal_agg = None
+
+        if record_spectra == "targets":
+            # Do not record anything if we only want to record spectra of targets
+            log.info("Recording spectra of targets only, disabling all other metrics and image logging.")
+            record_metrics = use_snapshot_aggregator = False
 
         if record_metrics:
             mean_agg = MetricAggregator(
@@ -180,33 +183,26 @@ class OneStepAggregator(AbstractAggregator):
                 record_normed=record_normed,
                 record_rmse=record_rmse,
                 record_abs_values=record_abs_values,
+                **(metrics_kwargs or {}),
             )
+
         if use_snapshot_aggregator:
-            # Don't need snapshot aggregator if temporal metrics are used
             snapshot_agg = SnapshotAggregator(
                 is_ensemble=self._is_ensemble,
-                var_names=snapshot_var_names,
-                every_nth_epoch=every_nth_epoch_snapshot,
-                preprocess_fn=snapshots_preprocess_fn,
+                **(snapshot_kwargs or {}),
             )
 
         if record_spectra:
             spectra_agg = SpectraAggregator(
                 is_ensemble=self._is_ensemble,
-                var_names=spectra_var_names,
                 coords=self.coords,
                 data_to_log="targets" if record_spectra == "targets" else "preds",
+                **(spectra_kwargs or {}),
             )
 
-        if temporal_kwargs is not None and temporal_kwargs.run:
+        if temporal_kwargs is not None and temporal_kwargs.get("run", False):
             temporal_agg = TemporalMetricsAggregator(
-                area_weights=self._area_weights,
-                is_ensemble=self._is_ensemble,
-                var_names=snapshot_var_names,
-                metrics=temporal_kwargs.metrics,
-                temporal_scale=temporal_kwargs.temporal_scale,
-                save_to_wandb=temporal_kwargs.save_to_wandb,
-                coords=coords,
+                area_weights=self._area_weights, is_ensemble=self._is_ensemble, coords=self.coords, **temporal_kwargs
             )
 
         self._aggregators: Dict[str, _Aggregator] = {

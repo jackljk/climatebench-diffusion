@@ -44,7 +44,9 @@ class BaseModel(LightningModule):
     Read the docs regarding LightningModule for more information:
         https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html
     """
+
     is_3d = False
+
     def __init__(
         self,
         num_input_channels: int = None,
@@ -92,6 +94,18 @@ class BaseModel(LightningModule):
         self.datamodule_config = datamodule_config
         self.predict_non_spatial_condition = predict_non_spatial_condition
 
+        print_text = f"Model: {self.__class__.__name__} with {self.num_input_channels=}, {self.num_output_channels=}"
+        if self.spatial_shape_in == self.spatial_shape_out:
+            print_text += f", {self.spatial_shape_in=}"
+        else:
+            print_text += f", {self.spatial_shape_in=}, {self.spatial_shape_out=}"
+        print_text += f", {self.num_temporal_channels=}" if self.num_temporal_channels is not None else ""
+        print_text += f", {self.num_conditional_channels=}" if self.num_conditional_channels > 0 else ""
+        print_text += (
+            f", {self.num_conditional_channels_non_spatial=}" if self.num_conditional_channels_non_spatial > 0 else ""
+        )
+        self.log_text.info(print_text)
+
         if upsample_condition_by > 1:
             self.upsample_condition = nn.Upsample(scale_factor=upsample_condition_by)
 
@@ -123,7 +137,7 @@ class BaseModel(LightningModule):
             elif isinstance(criterion, torch.nn.Module):
                 self.criterion = torch.nn.ModuleDict({"preds": criterion})
             else:
-                self.log_text.debug(f"Criterion is not a torch.nn.Module! This may cause issues if it contain weights.")
+                self.log_text.debug("Criterion is not a torch.nn.Module! This may cause issues if it contain weights.")
                 self.criterion = {"preds": criterion}
 
         self.ema_scope = None  # EMA scope for the model. May be set by the BaseExperiment instance
@@ -284,6 +298,7 @@ class BaseModel(LightningModule):
                     f"condition and static_condition are both None but num_conditional_channels is {self.num_conditional_channels}"
                 )
             elif condition is not None and static_condition is not None:
+                # condition.shape = torch.Size([32, 3, 1, 221, 42]), static_condition.shape = torch.Size([32, 2, 3, 221, 42])
                 condition = torch.cat((condition, static_condition), dim=1)
             elif condition is None:
                 assert static_condition is not None, "condition and static_condition are both None"

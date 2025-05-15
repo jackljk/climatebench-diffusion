@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
-import time
 from abc import abstractmethod
 from collections import defaultdict
-from datetime import datetime
 from os.path import join
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
 import numpy as np
-import pandas as pd
 import torch
 import xarray as xr
 import xbatcher
 from dask.distributed import Client, LocalCluster
-from torch import multiprocessing
-from tqdm.auto import tqdm
 
 from src.datamodules.abstract_datamodule import BaseDataModule
 from src.evaluation.aggregators.main import ListAggregator, OneStepAggregator
@@ -40,25 +34,6 @@ log = get_logger(__name__)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# should be moved to dataset_utils
-def extract_date(date_info, shift_text_date):
-    # date info can be in format a) "2020-01-01" or b) "2020-01-01 00:00:00" or c) datetime object
-    if isinstance(date_info, datetime):
-        date = date_info
-    else:
-        # read the date
-        date = date_info.split(" ")[0]  # "2020-01-01 00:00:00" -> "2020-01-01"
-
-    # Remove hours from the date
-    date = np.datetime64(date, "D")
-
-    if shift_text_date is not None and shift_text_date != 0:
-        # print(f"Shifting {date=} to {date + np.timedelta64(shift_text_date, 'D')}")
-        date += np.timedelta64(shift_text_date, "D")
-
-    return date
-
-
 class ERA5DataModuleBase(BaseDataModule):
     def __init__(
         self,
@@ -72,7 +47,6 @@ class ERA5DataModuleBase(BaseDataModule):
         predict_slice: Optional[slice] = slice("2020-03-01", "2020-12-31", 96),
         hourly_resolution: int = 1,
         possible_initial_times: Optional[List[str]] = None,
-        possible_initial_times_eval: Optional[List[str]] = None,
         subsample_valid: int = 1,
         window: int = 1,  # Number of time steps to use in the input
         horizon: int = 1,  # Number of time steps to predict into the future
@@ -203,14 +177,13 @@ class ERA5DataModuleBase(BaseDataModule):
             cache = dask_Cache(dask_cache_size)  # dask_Cache(1e10)  # 10gb cache
             cache.register()
 
+        if self.hparams.log_spectra == "targets":
+            # Don't log metrics/images when only wanting to log target spectra
+            self.hparams.log_metrics = self.hparams.log_images = False
+
         # Infer hourly resolution of dataset
         if "-6h-" in dataset:
             if hourly_resolution == 6:
-                hourly_resolution = 1
-            else:
-                raise ValueError(f"Invalid hourly resolution: {hourly_resolution} for dataset: {dataset}")
-        elif "-12h-" in dataset:
-            if hourly_resolution == 12:
                 hourly_resolution = 1
             else:
                 raise ValueError(f"Invalid hourly resolution: {hourly_resolution} for dataset: {dataset}")
@@ -219,41 +192,6 @@ class ERA5DataModuleBase(BaseDataModule):
         else:
             raise ValueError(f"Could not infer hourly resolution from dataset: {dataset}")
 
-        if possible_initial_times is not None and possible_initial_times_eval is None:
-            self.hparams.possible_initial_times_eval = possible_initial_times_eval = possible_initial_times
-        # Set the temporal slices for the train, val, and test sets
-        data_slices = dict(train=train_slice, val=val_slice, test=test_slice, predict=predict_slice)
-        for split, slice_ in data_slices.items():
-            if isinstance(slice_, Sequence) and len(slice_) == 2:
-                slice_ = slice(*slice_)
-            assert isinstance(slice_, slice), f"Invalid slice for {split}: {slice_}"
-            # Convert start and end to dates, if only years are given
-            if isinstance(slice_.start, int):
-                slice_ = slice(f"{slice_.start}-01-01", slice_.stop, slice_.step)
-            if isinstance(slice_.stop, int):
-                slice_ = slice(slice_.start, f"{slice_.stop}-12-31", slice_.step)
-            # If it does not have a step, set the step to hourly_resolution
-            if slice_.step is None:
-                slice_ = slice(slice_.start, slice_.stop, hourly_resolution)  # e.g. slice(2014, 2020, 6)
-            # To datetime
-            slice_ = slice(
-                datetime.strptime(
-                    str(slice_.start), "%Y-%m-%d" if ":" not in str(slice_.start) else "%Y-%m-%d %H:%M:%S"
-                ),
-                datetime.strptime(
-                    str(slice_.stop), "%Y-%m-%d" if ":" not in str(slice_.stop) else "%Y-%m-%d %H:%M:%S"
-                ),
-                slice_.step,
-            )
-            if split != "predict":
-                assert slice_.step == hourly_resolution, f"Invalid step for {split=}: {slice_.step}"
-            setattr(self, f"{split}_slice", slice_)  # e.g. self.train_slice = train_slice
-
-        # Check that train and test slices are not overlapping
-        train_slice_end_date = extract_date(self.train_slice.stop, 0)
-        test_slice_start_date = extract_date(self.test_slice.start, 0)
-        assert train_slice_end_date <= test_slice_start_date, f"train_slice: {train_slice}, test_slice: {test_slice}"
-
         # Normalization
         if data_dir_stats is None:
             if (Path(data_dir) / "statistics").exists():
@@ -261,7 +199,7 @@ class ERA5DataModuleBase(BaseDataModule):
             elif (Path(data_dir).parent / "statistics").exists():
                 data_dir_stats = Path(data_dir).parent / "statistics"
             else:
-                raise FileNotFoundError(f"Please specify ``data_dir_stats``. Could not find {data_dir_stats=}.")
+                raise FileNotFoundError("Please specify ``data_dir_stats``. Could not find statistics directory.")
         else:
             data_dir_stats = Path(data_dir_stats)
 
@@ -308,130 +246,6 @@ class ERA5DataModuleBase(BaseDataModule):
                     assert v.start >= crop_inputs_k.start, f"Invalid crop for {k}: {v}"
                     assert v.stop <= crop_inputs_k.stop, f"Invalid crop for {k}: {v}"
 
-        self.text_data = self.text_emb_dim = None
-
-        if text_data_path is None:
-            assert text_type is None, f"Invalid text_type: {text_type} without text_data_path"
-        else:
-            if text_type is None:
-                text_type = "tf-idf"
-                log.info(f"Text type is not specified. Using default: {text_type}")
-            if not os.path.isfile(text_data_path):
-                possible_paths = [
-                    join(data_dir, text_data_path),
-                    join(data_dir, os.path.basename(text_data_path)),
-                    join(os.path.dirname(data_dir), text_data_path),
-                    join(os.path.dirname(data_dir), os.path.basename(text_data_path)),
-                ]
-                for path in possible_paths:
-                    if os.path.isfile(path):
-                        text_data_path = path
-                        break
-            # text data loading
-            df = pd.read_csv(text_data_path)
-            corpus = df["output"] if "output" in df.columns else df["text"]
-            dates = df["date"]
-            # Convert from str to datetime
-            dates = pd.to_datetime(dates)
-            assert len(corpus) == len(dates), f"Corpus and dates have different lengths: {len(corpus)} vs {len(dates)}"
-            if text_period_start is not None:
-                text_period_start = np.datetime64(text_period_start, "D")
-                corpus = corpus[dates >= text_period_start]
-                dates = dates[dates >= text_period_start]
-            if text_period_end is not None:
-                text_period_end = np.datetime64(text_period_end, "D")
-                corpus = corpus[dates <= text_period_end]
-                dates = dates[dates <= text_period_end]
-            assert len(corpus) > 0, f"No text data found for {text_period_start=} and {text_period_end=}"
-
-            metadata = dict(corpus_filename=text_data_path, period_start=text_period_start, period_end=text_period_end)
-            embs_kwargs = dict(metadata=metadata, history_length=self.hparams.text_history)
-            if text_type == "bert":
-                from src.utilities.text import get_or_create_embeddings
-
-                model_name = "bert-base-uncased"
-                text_features = get_or_create_embeddings(corpus, model_name, None, **embs_kwargs)
-                self.text_emb_dim = len(text_features[0])  # First text feature
-
-            elif "llama" in text_type.lower():
-                from src.utilities.text import get_or_create_embeddings
-
-                model_name = text_type.replace("llama", "Meta-Llama-3.1-8B")
-                model_name = f"meta-llama/{model_name}"
-                # try meta-llama/Llama-3.1-8B-Instruct
-                cache_dir = os.path.join(os.environ.get("PSCRATCH", os.environ.get("HOME")), ".cache", "huggingface")
-                text_features = get_or_create_embeddings(corpus, model_name, cache_dir, **embs_kwargs)
-                self.text_emb_dim = len(text_features[0])  # First text feature
-
-            elif text_type == "bow":
-                from sklearn.feature_extraction.text import CountVectorizer
-
-                log.info("Bag of words representation is used for text data.")
-                vectorizer = CountVectorizer(stop_words="english")
-                X = vectorizer.fit_transform(corpus)
-                text_features = X.toarray().astype(np.float32)  # text_features=bow_array
-                self.text_emb_dim = len(text_features[0])
-
-            elif text_type == "tf-idf":
-                from sklearn.feature_extraction.text import TfidfVectorizer
-
-                log.info("Tf-idf representation is used for text data.")
-                vectorizer = TfidfVectorizer(stop_words="english")
-                text_features = vectorizer.fit_transform(corpus)
-                text_features = text_features.toarray().astype(np.float32)
-                self.text_emb_dim = text_features.shape[1]
-                assert len(corpus) == len(text_features), f"{len(corpus)=} vs {len(text_features)=}"
-
-            else:
-                raise ValueError(f"Invalid text_type: {text_type}")
-
-            self.text_data = {}
-            self.raw_text_dataset = {}  # to analyse the text data, if needed
-            for text, feature, date in zip(corpus, text_features, dates):
-                # log.info(f"Text: {text[:10]}... Feature: {feature[:15]}...")
-                if feature is None:
-                    log.warning(f"Text data for {date=} is None. Skipping...")
-                    continue
-                date_feature = extract_date(date, shift_text_date)
-                self.text_data[date_feature] = torch.from_numpy(feature).squeeze()
-                self.raw_text_dataset[date_feature] = text
-
-            # Compute how many days from training+val period are missing in the text data
-            missing_dates = set()
-            for split in ["train", "val"]:
-                slice_ = getattr(self, f"{split}_slice")
-                slice_datetimes = pd.date_range(slice_.start, slice_.stop, freq="D")
-                slice_datetimes = [np.datetime64(x, "D") for x in slice_datetimes]
-                missing_dates.update(set(slice_datetimes) - set(self.text_data.keys()))
-                if split == "train":
-                    # Go over first 3 dates in training period
-                    for h in range(3):
-                        date_h = slice_datetimes[h]
-                        text_example = self.raw_text_dataset.get(date_h) or "No text"
-                        text_example = text_example[:80].replace("\n", "\t")
-                        feature_shape = self.text_data[date_h].shape if date_h in self.text_data else "None"
-                        log.info(f"{h=}, {date_h=}, {text_example=}... {feature_shape=}")
-
-                # print(list(slice_datetimes)[:10], list(self.text_data.keys())[:10])
-            if missing_dates:
-                missing_dates = sorted(set([str(x)[:7] for x in missing_dates]))  # Get unique years and months only
-                log.info(
-                    f"Missing {len(missing_dates)} dates (year-month only) in training+val period: {missing_dates}"
-                )
-                #  Missing >=98 dates (year-month only) in training+val period: [All the way to 1987-12, and ...,
-                #  '1988-01', '1988-02', '1988-04', '1988-05', '1988-08', '1988-09', '1988-10', '1988-12', '1989-01',
-                #  '1989-03', '1989-07', '1989-08', '1989-12', '1990-10', '1991-01', '1991-02', '1991-04', '1991-05',
-                #  '1991-06', '1991-11', '1992-12', '1993-01', '1993-04', '1994-04', '1996-04', '1997-05', '1997-07',
-                #  '1998-10', '1999-04', '1999-07', '1999-12', '2000-03', '2001-01', '2001-04', '2001-07', '2001-08',
-                #  '2002-01', '2004-05', '2005-03', '2005-05', '2006-01', '2006-08', '2006-09', '2007-03', '2007-06',
-                #  '2008-01', '2008-12', '2009-03', '2010-02', '2010-03', '2010-04', '2010-05', '2010-06', '2010-07',
-                #  '2010-08', '2010-09', '2010-10', '2010-11', '2010-12', '2011-01', '2011-02', '2011-03', '2011-04',
-                #  '2011-05', '2011-06', '2011-07', '2011-08', '2011-09', '2011-10', '2011-11', '2011-12', '2012-02',
-                #  '2012-03', '2012-10']
-
-            log.info(f"Text embedding dimension: {self.text_emb_dim}")
-            log.info(f"Text data loaded. Number of entries: {len(self.text_data)} n_texts: {len(corpus)}")
-
     @property
     def dataset_identifier(self) -> str:
         iden = f"ERA5_horizon{self.hparams.horizon}"
@@ -464,8 +278,9 @@ class ERA5DataModuleBase(BaseDataModule):
         w = self.hparams.window
         assert isinstance(h, list) or h > 0, f"horizon must be > 0 or a list, but is {h}"
         assert w == 1, f"window must be > 0, but is {w}"
-        # if os.path.isdir(self.zarr_path):  # Check local directory
-        #     assert os.path.isfile(join(self.zarr_path, ".zmetadata")), f"Could not find .zmetadata in data_dir: {self.zarr_path}"
+        data_dir = self.zarr_path  # .zmetadata needs to be in the same directory
+        if os.path.isdir(data_dir):  # Check local directory
+            assert os.path.isfile(join(data_dir, ".zmetadata")), f"Could not find .zmetadata in data_dir: {data_dir}"
 
     def get_split_dataset(self, split: str, time_slice: slice, **kwargs) -> ERA5DatasetBase:
         assert split in ["fit", "train", "validate", "val", "test", "predict"], f"Invalid split: {split}"
@@ -519,7 +334,7 @@ class ERA5DataModuleBase(BaseDataModule):
             log.info(f"Using optimized Dask chunks: {chunks} for horizon={horizon}")
         else:
             chunks = None
-        ds = xr.open_zarr(self.zarr_path, decode_times=True, chunks=chunks, mask_and_scale=False, consolidated=False)
+        ds = xr.open_zarr(self.zarr_path, decode_times=True, chunks=chunks, mask_and_scale=False, consolidated=True)
         ds = ds.sel(time=time_slice)
         if self.spatial_crop_inputs is not None:
             log.info(f"Applying spatial crop to inputs: {self.spatial_crop_inputs}")
@@ -530,11 +345,11 @@ class ERA5DataModuleBase(BaseDataModule):
         kwargs["static_fields"] = self.hparams.static_fields
         kwargs["use_dask"] = self.hparams.use_dask
         kwargs["hourly_resolution"] = self.hparams.hourly_resolution
+        kwargs["possible_initial_times"] = self.hparams.possible_initial_times
         kwargs["spatial_crop_outputs"] = self.spatial_crop_outputs
         kwargs["output_mask_area"] = self.hparams.output_mask_area
         kwargs["text_skip_missing_dates"] = self.hparams.text_skip_missing_dates
         if split in ["fit", "train"]:
-            kwargs["possible_initial_times"] = self.hparams.possible_initial_times
             # Set loss weights
             kwargs["loss_latitude_weighting"] = self.hparams.loss_latitude_weighting
             kwargs["loss_pressure_weighting"] = self.hparams.loss_pressure_weighting
@@ -542,8 +357,6 @@ class ERA5DataModuleBase(BaseDataModule):
             kwargs["loss_pressure_weighting_divide_by"] = self.hparams.loss_pressure_weighting_divide_by
             kwargs["loss_surface_vars_weighting"] = self.hparams.loss_surface_vars_weighting
             kwargs["spatial_crop_during_training"] = self.hparams.spatial_crop_during_training
-        else:
-            kwargs["possible_initial_times"] = self.hparams.possible_initial_times_eval
 
         if self.hparams.lat_lon_format == "lat_lon":
             ds = ds.transpose(..., "latitude", "longitude")  # Don't put this before spatial crop! (it will be slower)
@@ -624,7 +437,7 @@ class ERA5DataModuleBase(BaseDataModule):
         aggregators_all = defaultdict(list)
         area_weights = to_torch_and_device(split_ds.area_weights_tensor, device)
         aggr_kwargs = dict(area_weights=area_weights, is_ensemble=is_ensemble)
-        coords = {"longitude": self._longitude, "latitude": self._latitude}
+        aggr_kwargs["coords"] = {"latitude": self._latitude, "longitude": self._longitude}
         record_normed = self.hparams.log_normed and split_horizon <= 80  # save logging space for huge horizons
         record_abs_values = True if split_horizon <= 80 else False
         record_rmse = True
@@ -663,18 +476,13 @@ class ERA5DataModuleBase(BaseDataModule):
                 "every_nth_epoch": self.hparams.every_nth_epoch_snapshot,
             }
             spectra_names = ["2m_temperature", "10m_u_component_of_wind", "mean_sea_level_pressure"]
-            spectra_levels = [50, 100, 500, 700, 850, 1000]
+            spectra_levels = [100, 500, 700, 850, 1000]
             spectra_names += [f"temperature_{lev}" for lev in spectra_levels]
             spectra_names += [f"geopotential_{lev}" for lev in spectra_levels]
             spectra_names += [f"u_component_of_wind_{lev}" for lev in spectra_levels]
             spectra_names += [f"v_component_of_wind_{lev}" for lev in spectra_levels]
             spectra_names += [f"specific_humidity_{lev}" for lev in spectra_levels]
-            spectra_kwargs = {
-                "var_names": spectra_names,
-                "spectra_type": "zonal_60_90",
-                "spatial_dims": ["longitude", "latitude"],
-            }
-
+            spectra_kwargs = {"var_names": spectra_names, "spectra_type": "zonal_60_90"}
             for h in horizon_range:
                 h_to_hours = h * hourly_res
                 record_spectra = self.hparams.log_spectra if h_to_hours in spectra_horizons_hours else False
@@ -691,7 +499,6 @@ class ERA5DataModuleBase(BaseDataModule):
                         # Preprocess the snapshots to flip latitudes and bring lats before lons for proper plotting
                         record_spectra=record_spectra,
                         spectra_kwargs=spectra_kwargs,
-                        coords=coords,
                         **aggr_kwargs,
                     )
                 )
@@ -704,9 +511,9 @@ class ERA5DataModuleBase(BaseDataModule):
         if save_to_path is not None:
             # Specify ++module.save_predictions_filename="xarray" to save the predictions in xarray format
             aggregators_all["save_to_disk"] = SaveToDiskAggregator(
-                final_dims_of_data=["longitude", "latitude"],  # list(coords.keys())
+                final_dims_of_data=["longitude", "latitude"],
                 is_ensemble=is_ensemble,
-                coords=coords,
+                coords=aggr_kwargs["coords"],
                 concat_dim_name="lead_time",
                 batch_dim_name="datetime",
                 save_to_path=save_to_path,
@@ -959,11 +766,6 @@ class ERA5Dataset2D(ERA5DatasetBase):
         output_vars: Sequence[str],
         normalizer,
         in_only_packer: Packer = None,
-        loss_pressure_weighting: bool = False,
-        loss_pressure_weighting_levels: Union[str, List[int]] = "era5",  # can be "era5", "wb", or a list of levels
-        loss_pressure_weighting_divide_by: str = "mean",  # can be "mean" or "sum"
-        loss_surface_vars_weighting: Optional[str] = None,
-        preselect_vars: bool = False,  # True,
         preprocess_to_tensor: bool = False,
         **kwargs,
     ):
@@ -972,12 +774,6 @@ class ERA5Dataset2D(ERA5DatasetBase):
         self.output_vars = output_vars
         self.normalizer = copy.copy(normalizer)
         self.normalizer.to("cpu")
-        if loss_pressure_weighting is True:
-            loss_pressure_weighting = "graphcast"
-        self.loss_pressure_weighting = loss_pressure_weighting
-        self.loss_pressure_weighting_levels = loss_pressure_weighting_levels
-        self.loss_pressure_weighting_divide_by = loss_pressure_weighting_divide_by
-        self.loss_surface_vars_weighting = loss_surface_vars_weighting
         self.preprocess_to_tensor = preprocess_to_tensor
         # Need to flatten the 3D variables to 2D (by stacking the pressure levels)
         self.all_vars = set(input_vars) | set(output_vars)
@@ -1018,224 +814,25 @@ class ERA5Dataset2D(ERA5DatasetBase):
         self.all_levels = sorted(self.all_levels)
 
         self.all_vars_stem = set(self.var3d_to_levels.keys()) | set(self.vars2d)
-        self.preselect_vars = preselect_vars
-        if preselect_vars:
-            self.var_to_ds = self.get_variables_ds(self.dataset, preprocess_to_tensor=preprocess_to_tensor)
-            del self.dataset  # No longer needed
-        else:
-            ds = self.dataset[self.all_vars_stem]
-            ds = ds.sel(level=self.all_levels)
-            # ds = ds.sel(level=self.all_levels).load() # makes faster but can get killed
+        ds = self.dataset[self.all_vars_stem]
+        ds = ds.sel(level=self.all_levels)
+        # ds = ds.sel(level=self.all_levels).load() # makes faster but can get killed
 
-            input_dims = dict(  # input_dims for the ML model, or the __getitem__ method below
-                time=self.window + self.horizon,
-                latitude=len(ds.latitude),
-                longitude=len(ds.longitude),
-            )
-            self.input_dims = input_dims
-            if "level" in ds.dims and len(ds.level) >= 1:
-                input_dims["level"] = len(ds.coords["level"])
-            self.bgen = xbatcher.BatchGenerator(
-                ds,
-                input_dims=input_dims,
-                preload_batch=False,
-                input_overlap={"time": self.window + self.horizon - 1},
-                # batch_dims={"time": 1},
-            )
-
-            if "val" in self.dataset_id and (self.subsample > 1 or self.max_num_samples is not None):
-                # log.info(f"Subsampling the dataset by a factor of {self.subsample}")
-                # Print the 1,2,-2,-1 date indices to check if the subsampling is correct
-                dates = [self.__get_date__(i) for i in [0, 1, 2, 3, -3, -2, -1] if i < self.__len__()]
-                # dates = [self.__get_date__(i) for i in range(self.__len__())]
-                # Dates are np.datetime64 objects, let's print only year, month, day, hour
-                dates = [str(d) for d in dates]
-                if self.max_num_samples is not None:
-                    log.info(f"Using {self.max_num_samples=} for split: `{self.dataset_id}`.\nDates examples: {dates}")
-                else:
-                    log.info(f"Using {self.subsample=} for split: `{self.dataset_id}`.\nDates examples: {dates}")
-
-    @property
-    def loss_weights_tensor(self) -> Optional[torch.Tensor]:
-        weights = super().loss_weights_tensor  # may be None or cos(lat) weights
-        if self.loss_pressure_weighting is not None or self.loss_surface_vars_weighting is not None:
-            if self.loss_pressure_weighting in [False, None] or self.loss_pressure_weighting_levels is None:
-                # Throw error if one is set but not the other
-                raise ValueError(
-                    f"Unexpected loss_pressure_weighting: {self.loss_pressure_weighting}, "
-                    f"loss_pressure_weighting_levels: {self.loss_pressure_weighting_levels}"
-                    f"\nIt is expected to set both or neither. Are you sure you want to set one but not the other?"
-                )
-
-            var_to_weight = torch.ones(len(self.output_vars))
-            if self.loss_pressure_weighting is not None:
-                if self.loss_pressure_weighting == "graphcast":
-                    log.info("Applying GraphCast-like pressure weighting to the loss")
-                    # all_levels = self.all_levels   # Actually used levels
-                    if self.loss_pressure_weighting_levels == "era5":
-                        # Not sure if results are sensitive at all to which levels are used here for computing the
-                        # weighting normalization. Probably not, but it's worth checking.
-                        all_levels = (
-                            1,
-                            2,
-                            3,
-                            5,
-                            7,
-                            10,
-                            20,
-                            30,
-                            50,
-                            70,
-                            100,
-                            125,
-                            150,
-                            175,
-                            200,
-                            225,
-                            250,
-                            300,
-                            350,
-                            400,
-                            450,
-                            500,
-                            550,
-                            600,
-                            650,
-                            700,
-                            750,
-                            775,
-                            800,
-                            825,
-                            850,
-                            875,
-                            900,
-                            925,
-                            950,
-                            975,
-                            1000,
-                        )  # ERA5 levels
-                    elif self.loss_pressure_weighting_levels == "wb":
-                        all_levels = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-                    else:
-                        assert isinstance(self.loss_pressure_weighting_levels, list)
-                        all_levels = self.loss_pressure_weighting_levels
-
-                    if self.loss_pressure_weighting_divide_by == "mean":
-                        level_div = np.mean(all_levels)  # Graphcast code uses this
-                    elif self.loss_pressure_weighting_divide_by == "sum":
-                        level_div = np.sum(all_levels)  # Graphcast paper says this
-                    else:
-                        raise ValueError(
-                            f"Invalid loss_pressure_weighting_divide_by: {self.loss_pressure_weighting_divide_by}"
-                        )
-                elif self.loss_pressure_weighting == "makani":
-                    log.info("Applying Makani-like pressure weighting to the loss")
-                    pass
-                else:
-                    raise ValueError(f"Invalid loss_pressure_weighting: {self.loss_pressure_weighting}")
-                for i, ov in enumerate(self.output_vars):
-                    if ov in self.possible_2d_vars:
-                        # Keep the weight as 1 for 2D variables
-                        continue
-                    p_level = int(ov.split("_")[-1])
-                    # Weight the pressure levels such that higher levels are weighted more
-                    if self.loss_pressure_weighting == "graphcast":
-                        var_to_weight[i] = p_level / level_div
-                    elif self.loss_pressure_weighting == "makani":
-                        var_to_weight[i] = 0.001 * p_level
-                    else:
-                        assert False, f"Invalid loss_pressure_weighting: {self.loss_pressure_weighting}"
-                    # Github copilot suggested the ones below
-                    # var_to_weight[i] = 1 / (1 + np.abs(p_level - level_mean))
-                    # var_to_weight[i] = 1 - np.abs(p_level - level_mean) / level_mean
-
-            if self.loss_surface_vars_weighting is not None:
-                log.info(f"Applying surface variable weighting ``{self.loss_surface_vars_weighting}`` to the loss")
-                # Weight the surface variables differently
-                if self.loss_surface_vars_weighting == "graphcast":
-                    fixed_var_weights = {
-                        # Any variables not specified here are weighted as 1.0 (or with pressure weighting)
-                        # A single-level variable, but an important headline variable
-                        # and also one which we have struggled to get good performance
-                        # on at short lead times, so leaving it weighted at 1.0, equal
-                        # to the multi-level variables:
-                        "2m_temperature": 1.0,
-                        # New single-level variables, which we don't weight too highly
-                        # to avoid hurting performance on other variables.
-                        "10m_u_component_of_wind": 0.1,
-                        "10m_v_component_of_wind": 0.1,
-                        "mean_sea_level_pressure": 0.1,
-                        "total_precipitation_6hr": 0.1,
-                    }
-                    for i, v in enumerate(self.output_vars):
-                        if v in fixed_var_weights.keys():
-                            assert var_to_weight[i] == 1.0, f"var_to_weight[{i}]: {var_to_weight[i]}"
-                            var_to_weight[i] = fixed_var_weights[v]
-                else:
-                    raise ValueError(f"Invalid loss_surface_vars_weighting: {self.loss_surface_vars_weighting}")
-
-            n_spatial_dims = 2 if weights is None else len(weights.shape)
-            # Create singleton dimensions for the spatial dimensions (after the variable dimension)
-            var_to_weight = var_to_weight.view(len(self.output_vars), *([1] * n_spatial_dims))
-            if self.loss_pressure_weighting == "makani":
-                # Renormalize to 1
-                var_to_weight = var_to_weight / var_to_weight.sum()
-
-            if weights is None:
-                weights = var_to_weight
-            else:
-                assert len(weights.shape) <= 2, f"weights.shape: {weights.shape}"
-                # Weights shape is either (H, W) or (H*W). We need to create a (C, H, W) tensor using the var_to_weight
-                # tensor, where C is the number of output variables
-                weights = var_to_weight * weights.unsqueeze(0)
-
-        return weights
-
-    def get_variables_ds(self, dataset: xr.Dataset, preprocess_to_tensor: bool = False, use_tqdm: bool = False):
-        def to_tensor_or_not(v):
-            if preprocess_to_tensor:
-                # disable dask threading to avoid warnings
-                with dask.config.set(scheduler="synchronous"):
-                    return torch.as_tensor(v.values)  # , device="cpu")
-            return v
-
-        var_to_ds = dict()
-        pbar = (
-            tqdm(self.vars2d, desc="Stacking 2D vars", leave=False, total=len(self.vars2d))
-            if use_tqdm
-            else self.vars2d
+        input_dims = dict(  # input_dims for the ML model, or the __getitem__ method below
+            time=self.window + self.horizon,
+            latitude=len(ds.latitude),
+            longitude=len(ds.longitude),
         )
-        for v in pbar:
-            pbar.set_description(f"Stacking 2D var: {v}") if use_tqdm else None
-            var_to_ds[v] = to_tensor_or_not(dataset[v])
-        pbar = (
-            tqdm(self.var3d_to_levels.items(), desc="Stacking 3D vars", leave=False, total=len(self.var3d_to_levels))
-            if use_tqdm
-            else self.var3d_to_levels.items()
+        self.input_dims = input_dims
+        if "level" in ds.dims and len(ds.level) >= 1:
+            input_dims["level"] = len(ds.coords["level"])
+        self.bgen = xbatcher.BatchGenerator(
+            ds,
+            input_dims=input_dims,
+            preload_batch=False,
+            input_overlap={"time": self.window + self.horizon - 1},
+            # batch_dims={"time": 1},
         )
-        for v, levels in pbar:
-            var_ds = dataset[v]
-            for level in levels:
-                pbar.set_description(f"Stacking 3D var: {v} with level: {level}") if use_tqdm else None
-                var_to_ds[f"{v}_{level}"] = to_tensor_or_not(var_ds.sel(level=level))
-
-        # # Stack up all 2d variables into a single array
-        # self._ds_vars2d = torch.stack([torch.as_tensor(self.dataset[v].values) for v in vars2d], dim=1)
-        # # For each 3d variable, stack up the pressure levels
-        # self._ds_vars3d = dict()
-        # for v, levels in var3d_to_levels.items():
-        #     var_ds = self.dataset[v].sel(level=levels).values
-        #     self._ds_vars3d[v] = torch.as_tensor(var_ds)
-        return var_to_ds
-
-    def __get_date__(self, idx):
-        try:
-            bgen_idx = int(self.ds_idxs[idx])
-        except IndexError:
-            return None
-        batch = self.bgen[bgen_idx].load()
-        batch_start_time = batch.coords["time"].values[0]
-        return batch_start_time  # .astype("datetime64[D]")
 
     def __getitem__(self, idx):
         if idx in self.skip_idxs:
@@ -1248,134 +845,70 @@ class ERA5Dataset2D(ERA5DatasetBase):
         if self.return_mask is not None:
             arrays["predictions_mask"] = self.return_mask
 
-        # ---------------- You can ignore this part!   ----------------
-        if self.preselect_vars:
-            if self.preprocess_to_tensor:
-                idx_slice = slice(idx_actual, idx_actual + self.horizon + 1)
-                arrays["dynamics"] = {vr: self.var_to_ds[vr][idx_slice] for vr in self.all_vars}
-            else:
-                idx_slice_xr = slice(idx_actual, idx_actual + self.horizon)
-                arrays["dynamics"] = {vr: self.var_to_ds[vr].isel(time=idx_slice_xr).values for vr in self.all_vars}
-        # ------------------ Focus on this part! ------------------
+        try:
+            batch = self.bgen[idx_actual]  # .load()
+        except OSError as e:
+            new_idx = idx + 1
+            log.warning(f"OSError: {e}. Trying to load a different batch {idx}->{new_idx}.")
+            return self[new_idx]
+        if self.use_dask:
+            batch = dask.compute(batch)[0].load()
         else:
-            try:
-                batch = self.bgen[idx_actual]  # .load()
-            except OSError as e:
-                new_idx = idx + 1
-                log.warning(f"OSError: {e}. Trying to load a different batch {idx}->{new_idx}.")
-                return self[new_idx]
-            if self.use_dask:
-                batch = dask.compute(batch)[0].load()
-            else:
-                batch = batch.load()
-            # You can access the time of the batch with batch.coords['time'], which is a DataArray of datetime64
-            # To select the start time of the batch, you can use batch.coords['time'].values[0]
-            batch_start_time = batch.coords["time"].values[0]  # e.g. 2020-01-01T00:00:00
-            # if self.possible_initial_times is not None:
-            #     batch_hour = batch_start_time.astype("datetime64[h]").astype("int") % 24
-            #     if batch_hour not in self.possible_initial_times:
-            #         raise ValueError(f"Invalid {batch_hour=} for {self.possible_initial_times=}")
+            batch = batch.load()
+        # You can access the time of the batch with batch.coords['time'], which is a DataArray of datetime64
+        # To select the start time of the batch, you can use batch.coords['time'].values[0]
+        batch_start_time = batch.coords["time"].values[0]  # e.g. 2020-01-01T00:00:00
+        # Tensorfy all 2D variables
+        for vr in self.vars2d:
+            dynamics[vr] = torch.from_numpy(batch[vr].values)
+        # Tensorfy all 3D variables
+        for vr, levels in self.var3d_to_levels.items():
+            var_ds = batch[vr]
+            for level in levels:
+                dynamics[f"{vr}_{level}"] = torch.from_numpy(var_ds.sel(level=level).values)
 
-            # log.info(f"idx: {idx}, batch.dims: {batch.dims}") #batch_time: {batch_time}")
-            # arrays["dynamics"] = self.get_variables_ds(batch, preprocess_to_tensor=True, use_tqdm=False)
-            # Tensorfy all 2D variables
-            for vr in self.vars2d:
-                dynamics[vr] = batch[vr].values  # torch.from_numpy(batch[vr].values)
+        if len(self.input_only_vars) > 0:
+            # Return as separate key, "dynamical_condition"
+            dynamical_condition = {vr: dynamics.pop(vr) for vr in self.input_only_vars}
+            arrays["dynamical_condition"] = self.in_only_packer.pack(self.normalizer.normalize(dynamical_condition))
 
-            # Tensorfy all 3D variables
-            for vr, levels in self.var3d_to_levels.items():
-                var_ds = batch[vr]
-                for level in levels:
-                    dynamics[f"{vr}_{level}"] = var_ds.sel(level=level).values
+        arrays["dynamics"] = dynamics
+        if self.dataset_id not in ["train", "fit"]:
+            arrays["metadata"] = dict(datetime=float(batch_start_time.astype("datetime64[s]").astype("int64")))
 
-            if len(self.input_only_vars) > 0:
-                # Return as separate key, "dynamical_condition"
-                dynamical_condition = {vr: dynamics.pop(vr) for vr in self.input_only_vars}
-                arrays["dynamical_condition"] = self.in_only_packer.pack(
-                    self.normalizer.normalize(dynamical_condition)
-                )
-
-            arrays["dynamics"] = dynamics
-            if self.dataset_id not in ["train", "fit"]:
-                arrays["metadata"] = dict(datetime=float(batch_start_time.astype("datetime64[s]").astype("int64")))
-
-            if self.text_dataset is not None:
-                date = batch_start_time.astype("datetime64[D]")
-                if date not in self.text_dataset:  # e.g.: KeyError: numpy.datetime64('2018-06-18')
-                    if self.text_skip_missing_dates:  # Skip missing dates
-                        log.warning(
-                            f"[{idx=}] Date {date} ({type(date)=}) not found in text dataset. {len(self.skip_idxs)=} Skipping."
-                        )
-                        self.skip_idxs.add(idx)
-                        return self.__getitem__(idx + 1)
-                    arrays["condition_non_spatial"] = torch.zeros(self._text_dim)
-                    # may be replaced with null embeddings inside model
-                    # arrays["condition_non_spatial"] = None  # this leads to a collate fn error
-                    # raise KeyError(f"Date {date} not found in text dataset")
-
-                elif self.return_future_date_for_training and self.dataset_id in ["train", "fit"]:
-                    # Return multiple text dates for training only (using them during eval would be cheating)
-                    arrays["condition_non_spatial"] = torch.stack(
-                        [
-                            self.text_dataset.get(date + np.timedelta64(h, "D"), torch.zeros(self._text_dim))
-                            for h in range(self.horizon + 1)
-                        ],
-                        dim=0,
-                    )
-                else:
-                    # log.info(f"Date {date} found in text dataset.")
-                    arrays["condition_non_spatial"] = self.text_dataset[date]
-                # print(f"{self.dataset_id} idx: {idx}, batch_start_time: {batch_start_time}, text: {arrays['text']}")
         return arrays
 
-    def get_item_and_speed_test(self, idx, add_pid: bool = False, verbose: bool = False):
-        t0 = time.time()
-        if verbose:
-            print_json(
-                {
-                    "event": "get-batch start",
-                    "time": t0,
-                    "idx": idx,
-                    "pid": multiprocessing.current_process().pid if add_pid else None,
-                }
-            )
-        arrays = self[idx]
-        t1 = time.time()
-        if verbose:
-            print_json(
-                {
-                    "event": "get-batch end",
-                    "time": t1,
-                    "idx": idx,
-                    "pid": multiprocessing.current_process().pid if add_pid else None,
-                    "duration": t1 - t0,
-                }
-            )
-        # t1 - t0 is the time taken to get the batch (in seconds)
-        return arrays, t1 - t0
 
-
-def print_json(obj):
-    print(json.dumps(obj))
-
-
-if __name__ == "__main__":
-    dm = ERA5DataModule2D(
-        data_dir="gs://weatherbench2/datasets/era5/1959-2022-1h-240x121_equiangular_with_poles_conservative.zarr",
-        # Put the statistic files and text data at the root of the repository in the /data directory
-        data_dir_stats="../../data/stats/",  # change to your local path
-        text_data_path="../../data/text/meteorological_all_with_date.csv",  # change to your local path
-        predict_slice=slice("2020-12-01", "2020-12-31"),
-        static_fields=(
-            "land_sea_mask",
-            "soil_type",
-            "geopotential_at_surface",
-            "lat_lon_embeddings",
-        ),
-        horizon=3,
-        text_type="bert",
-    )
-    dm.setup(stage="fit")
-    x = dm._data_train[0]
-    for k, v in x.items():
-        print(f"{k}: {v[list(v.keys())[0]].shape if isinstance(v, dict) else v.shape}")
+# Epoch 0:   1%|█▎                       | 202/14973 [02:19<2:49:39,  1.45it/s, v_num=hkpo, raw_loss_step=0.141, loss_step=0.136]
+# Epoch 0:   3%|██▌                      | 383/14973 [07:11<4:33:51,  0.89it/s, v_num=hkpo, raw_loss_step=0.139, loss_step=0.135]
+#
+# With 16 workers:
+# Epoch 0:   0%|▏                                                                                                   | 25/14973 [00:30<5:04:05,  0.82it/s, v_num=1nad, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   1%|▊                                                                                                  | 117/14973 [01:29<3:08:46,  1.31it/s, v_num=1nad, raw_loss_step=0.139, loss_step=0.134]
+# Epoch 0:   1%|█▎                                                                                                 | 202/14973 [02:21<2:52:37,  1.43it/s, v_num=1nad, raw_loss_step=0.141, loss_step=0.136]
+# Epoch 0:   2%|██▏                                                                                                | 326/14973 [03:38<2:43:49,  1.49it/s, v_num=1nad, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   3%|██▉                                                                                                | 444/14973 [04:51<2:38:55,  1.52it/s, v_num=1nad, raw_loss_step=0.139, loss_step=0.134]
+# Epoch 0:   3%|███▏                                                                                               | 482/14973 [05:47<2:54:21,  1.39it/s, v_num=1nad, raw_loss_step=0.143, loss_step=0.138]
+# Epoch 0:   3%|███▎                                                                                               | 510/14973 [06:48<3:13:13,  1.25it/s, v_num=1nad, raw_loss_step=0.144, loss_step=0.139]
+# Epoch 0:   4%|███▋                                                                                               | 565/14973 [09:04<3:51:27,  1.04it/s, v_num=1nad, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   4%|███▊                                                                                               | 572/14973 [09:08<3:50:17,  1.04it/s, v_num=1nad, raw_loss_step=0.139, loss_step=0.134]
+# After setting ulimit -n 8192:
+# Epoch 0:   1%|▌                                                                                                   | 76/14973 [01:02<3:24:35,  1.21it/s, v_num=6jay, raw_loss_step=0.141, loss_step=0.136]
+# Epoch 0:   2%|█▌                                                                                                 | 242/14973 [02:45<2:47:25,  1.47it/s, v_num=6jay, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   2%|██                                                                                                 | 314/14973 [03:30<2:43:28,  1.49it/s, v_num=6jay, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   3%|███                                                                                                | 459/14973 [04:59<2:38:03,  1.53it/s, v_num=6jay, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   4%|███▌                                                                                               | 547/14973 [05:57<2:37:18,  1.53it/s, v_num=6jay, raw_loss_step=0.140, loss_step=0.135]
+# Epoch 0:   4%|████▎                                                                                              | 658/14973 [07:06<2:34:37,  1.54it/s, v_num=6jay, raw_loss_step=0.141, loss_step=0.136]
+# Epoch 0:   5%|████▋                                                                                              | 701/14973 [08:05<2:44:39,  1.44it/s, v_num=6jay, raw_loss_step=0.138, loss_step=0.133]
+# Epoch 0:   5%|████▉                                                                                              | 743/14973 [09:37<3:04:28,  1.29it/s, v_num=6jay, raw_loss_step=0.138, loss_step=0.133]
+# Epoch 0:   6%|█████▌                                                                                             | 841/14973 [12:25<3:28:45,  1.13it/s, v_num=6jay, raw_loss_step=0.138, loss_step=0.132]
+# Epoch 0:   6%|██████                                                                                             | 912/14973 [14:26<3:42:32,  1.05it/s, v_num=6jay, raw_loss_step=0.141, loss_step=0.136]
+# After removing consolidate=True and torch.from_numpy:
+# Epoch 0:   1%|▌                                                                                                   | 85/14973 [01:09<3:23:28,  1.22it/s, v_num=xre9, raw_loss_step=0.138, loss_step=0.133]
+# Epoch 0:   1%|█▏                                                                                                 | 171/14973 [02:02<2:57:08,  1.39it/s, v_num=xre9, raw_loss_step=0.142, loss_step=0.138]
+# Epoch 0:   2%|██▏                                                                                                | 333/14973 [03:43<2:43:37,  1.49it/s, v_num=xre9, raw_loss_step=0.142, loss_step=0.137]
+# Epoch 0:   3%|███▎                                                                                               | 503/14973 [05:31<2:39:10,  1.52it/s, v_num=xre9, raw_loss_step=0.139, loss_step=0.134]
+# Epoch 0:   4%|████                                                                                               | 623/14973 [06:45<2:35:50,  1.53it/s, v_num=xre9, raw_loss_step=0.142, loss_step=0.137]
+# Epoch 0:   6%|█████▊                                                                                             | 870/14973 [09:18<2:31:00,  1.56it/s, v_num=xre9, raw_loss_step=0.139, loss_step=0.134]
+# Epoch 0:   7%|███████                                                                                           | 1081/14973 [11:32<2:28:21,  1.56it/s, v_num=xre9, raw_loss_step=0.134, loss_step=0.129]
+# Epoch 0:   9%|████████▊                                                                                         | 1344/14973 [16:42<2:49:23,  1.34it/s, v_num=xre9, raw_loss_step=0.134, loss_step=0.128]

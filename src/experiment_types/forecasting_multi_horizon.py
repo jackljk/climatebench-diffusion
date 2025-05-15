@@ -26,17 +26,16 @@ from src.experiment_types._base_experiment import BaseExperiment
 from src.interface import NoTorchModuleWrapper
 from src.models.modules.ema import LitEma
 from src.utilities.checkpointing import reload_checkpoint_from_wandb
-from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.utils import (
     freeze_model,
     multiply_by_scalar,
     rrearrange,
+    run_func_in_sub_batches_and_aggregate,
     split3d_and_merge_variables,
     to_tensordict,
     torch_select,
     torch_to_numpy,
 )
-from src.utilities.wandb_callbacks import save_arrays_as_line_plot
 
 
 class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
@@ -49,12 +48,10 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         empty_cache_at_autoregressive_step: bool = False,
         inference_val_every_n_epochs: int = 1,
         return_outputs_at_evaluation: str | bool = "auto",
-        stack_window_to_channel_dim=True,
         **kwargs,
     ):
         assert autoregressive_steps >= 0, f"Autoregressive steps must be >= 0, but is {autoregressive_steps}"
         assert autoregressive_steps == 0, "Autoregressive steps are not yet supported for this experiment type."
-        self.stack_window_to_channel_dim = stack_window_to_channel_dim
         super().__init__(**kwargs)
         # The following saves all the args that are passed to the constructor to self.hparams
         #   e.g. access them with self.hparams.autoregressive_steps
@@ -119,9 +116,8 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
     def actual_num_input_channels(self, num_input_channels: int) -> int:
         # if we use the inputs as conditioning, and use an output-shaped input (e.g. for DDPM),
         # we need to use the output channels here!
-        is_standard_diffusion = self.is_diffusion_model and "dyffusion" not in self.diffusion_config._target_.lower()
         is_dyffusion = self.is_diffusion_model and "dyffusion" in self.diffusion_config._target_.lower()
-        if is_standard_diffusion:
+        if self.is_standard_diffusion:
             return self.actual_num_output_channels(self.dims["output"])
         elif is_dyffusion:
             return num_input_channels  # window is used as conditioning
@@ -132,7 +128,15 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
     @property
     def num_temporal_channels(self) -> Optional[int]:
         """The number of temporal dimensions."""
-        return None if self.stack_window_to_channel_dim else self.window
+        if self.stack_window_to_channel_dim:
+            return None
+        elif self.is_standard_diffusion:
+            if self.diffusion_config.get("when_3d_concat_condition_to") != "channel":
+                return self.window + self.horizon  # Condition prompt + sequence to denoise
+            else:
+                return self.horizon  # Sequence to denoise only
+        else:
+            return self.window
 
     def get_horizon(self, split: str, dataloader_idx: int = 0) -> int:
         if self.datamodule is not None and hasattr(self.datamodule, "get_horizon"):
@@ -182,7 +186,6 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         verbose: bool = True,
         prediction_horizon: int = None,
     ):
-        # todo: for huge horizons: load full dynamics + dynamics condition on CPU and send to GPU piece by piece
         return_dict = dict()
         if prediction_horizon is not None:
             assert split == "predict", "Prediction horizon only to be used for split='predict'"
@@ -207,6 +210,9 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
 
         main_data_raw = batch.pop("raw_dynamics", None)  # Unnormalized (raw scale) data, used to compute targets
         dynamic_conds = batch.pop("dynamical_condition", None)  # will be added back to batch later, piece by piece
+        if prediction_horizon > 20:  # Move to CPU to save GPU memory, if long horizon.
+            main_data_raw = main_data_raw.to("cpu") if main_data_raw is not None else None
+            dynamic_conds = dynamic_conds.to("cpu") if dynamic_conds is not None else None
         # main_batch = batch.copy()
         # Compute how many autoregressive steps to complete
         if dataloader_idx is not None and dataloader_idx > 0 and no_aggregators:
@@ -222,13 +228,12 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
         # Remove the last part of the dynamics that is not needed for prediction inside the module/model
         # dynamics = batch["dynamics"].clone()
         batch["dynamics"] = batch["dynamics"][:, : self.window + self.true_horizon, ...]
-
         if self.is_diffusion_model and dataloader_idx in [0, None] and not no_aggregators:
             # self._set_loss_weights()  # Set the loss weights (might be needed if only doing validation)
             # log validation loss
             if dynamic_conds is not None:
                 # first window of dyn. condition
-                batch["dynamical_condition"] = dynamic_conds[:, : self.window + self.true_horizon]
+                batch["dynamical_condition"] = dynamic_conds[:, : self.window + self.true_horizon].to(self.device)
             loss = self.get_loss(batch)
             aggregators["diffusion_loss"].update(loss=loss)
             # if isinstance(loss, dict):
@@ -248,7 +253,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
             desc="Autoregressive Step",
             position=0,
             leave=True,
-            disable=not self.verbose or n_outer_loops <= 1,
+            disable=not verbose or n_outer_loops <= 1 or self.global_rank != 0,
         )
         # Loop over autoregressive steps (to cover timesteps beyond training horizon)
         preds_normed = None
@@ -264,11 +269,13 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
                     break
                 PREDS_NORMED_K = f"t{t_step}_preds_normed"
                 PREDS_RAW_K = f"t{t_step}_preds"
-                pr_kwargs = {} if autoregressive_inputs is None else {"num_predictions": 1}
+                # When autoregressive, don't predict more predictions than needed (already have an ensemble).
+                pr_kwargs = {}  # todo: need to fix this?: if autoregressive_inputs is None else {"num_predictions": 1}
+                # If we uncomment the above, need to fix base experiment predict() when N_preds_in_mem < n_predictions
                 if dynamic_conds is not None:  # self.true_horizon=1
                     # ar_step = 0 --> slice(0, H+1), ar_step = 1 --> slice(H, 2H+1), etc.
                     current_slice = slice(ar_step * self.true_horizon, (ar_step + 1) * self.true_horizon + 1)
-                    batch["dynamical_condition"] = dynamic_conds[:, current_slice]
+                    batch["dynamical_condition"] = dynamic_conds[:, current_slice].to(self.device)
 
                 results = self.get_preds_at_t_for_batch(
                     batch, t_step, split, is_autoregressive=ar_step > 0, ensemble=True, **pr_kwargs
@@ -285,7 +292,7 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
 
                 if float(total_horizon).is_integer() and main_data_raw is not None:
                     target_time = self.window + int(total_horizon) - 1
-                    targets_tensor_t = main_data_raw[:, target_time, ...]
+                    targets_tensor_t = main_data_raw[:, target_time, ...].to(self.device)
                     targets = self.get_target_variants(targets_tensor_t, is_normalized=False)
                 else:
                     targets = None
@@ -374,64 +381,6 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
     def on_autoregressive_loop_end(self, split: str, dataloader_idx: int = None, **kwargs):
         pass
 
-    def test_step(self, batch: Any, batch_idx: int, dataloader_idx: int = None, **kwargs):
-        if "PhysicalSystemsBenchmarkDataModule" not in self.datamodule_config.get("_target_", "None"):
-            return super().test_step(batch, batch_idx, dataloader_idx, **kwargs)
-        else:
-            results = super().test_step(batch, batch_idx, dataloader_idx, return_outputs=True)
-            test_prediction_horizon = self.get_horizon("test")
-            timesteps = range(1, test_prediction_horizon + 1)
-            # Use axis=-5 to be robust for case where predictions have ensemble dimension or not in axis=0
-            # Need to take _normed versions of preds and targets because there's no normalization for these datasets
-            predicted_trajectory = np.stack([results[f"t{t}_preds_normed"] for t in timesteps], axis=-5)
-            true_trajectory = np.stack([results[f"t{t}_targets_normed"] for t in timesteps], axis=-5)
-            # Shapes will be (n_ensemble, n_timesteps, batch_size, n_channels, n_lat, n_lon)
-
-            metrics = evaluate_ensemble_prediction(predicted_trajectory, true_trajectory, mean_over_samples=False)
-
-            log_as_step = True  # self.datamodule.hparams.physical_system == "navier-stokes"
-            split_name = self.test_set_names[0 if dataloader_idx is None else dataloader_idx]
-            wandb_key_stem = f'{split_name}_instance/{batch_idx}/{self.ensemble_logging_infix("test")}'
-            save_arrays_as_line_plot(
-                self,
-                np.array(timesteps),
-                metrics,
-                wandb_key_stem=wandb_key_stem.replace("//", "/"),
-                x_label="time",
-                log_as_table=False,
-                log_as_step=log_as_step,
-            )
-
-            for m, v in metrics.items():  # save metrics to compute average over all instances
-                if batch_idx == 0:
-                    self._test_metrics_aggregate[m] = []
-                self._test_metrics_aggregate[m].append(v)
-
-    def on_test_epoch_end(self, **kwargs) -> None:
-        if "PhysicalSystemsBenchmarkDataModule" not in self.datamodule_config.get("_target_", "None"):
-            return super().on_test_epoch_end(**kwargs)
-        else:
-            # compute average over all instances
-            test_set_names = self.test_set_names
-            assert len(test_set_names) == 1, "Only one test set supported for now"
-            split_name = self.test_set_names[0]
-            wandb_key_stem = f'{split_name}/{self.ensemble_logging_infix("test")}'.replace("//", "/")
-            metrics_agg = {k: np.mean(np.array(v), axis=0) for k, v in self._test_metrics_aggregate.items()}
-            max_h = len(metrics_agg[list(metrics_agg.keys())[0]]) + 1
-            xaxis = np.arange(1, max_h)
-            self.log_text.info(f"Logging test metrics for split {split_name}. stem={wandb_key_stem}")
-            for k, v in metrics_agg.items():
-                self.log(f"{wandb_key_stem}avg/{k}", v.mean(), on_step=False, on_epoch=True, prog_bar=True)
-            log_as_table = self.datamodule.hparams.physical_system == "navier-stokes"
-            save_arrays_as_line_plot(
-                self, xaxis, metrics_agg, wandb_key_stem, x_label="time", log_as_table=log_as_table
-            )
-            self._test_metrics_aggregate = defaultdict(list)
-            for i, aggregators in enumerate(self.aggregators_test):
-                if "save_to_disk" in aggregators:
-                    metadata = self.get_logger_metadata()
-                    aggregators["save_to_disk"].compute(prefix="test", epoch=self.current_epoch, metadata=metadata)
-
     def get_preds_at_t_for_batch(
         self,
         batch: Dict[str, Tensor],
@@ -511,6 +460,8 @@ class AbstractMultiHorizonForecastingExperiment(BaseExperiment, ABC):
             stack_window_to_channel_dim = self.stack_window_to_channel_dim
         if stack_window_to_channel_dim:
             inputs = rrearrange(inputs, "b window c ... -> b (window c) ...")
+        else:
+            inputs = rrearrange(inputs, "b window c ... -> b c window ...")  # channels first
         if ensemble:
             inputs = self.get_ensemble_inputs(inputs, **kwargs)
         return inputs
@@ -812,7 +763,7 @@ class AbstractSimultaneousMultiHorizonForecastingModule(AbstractMultiHorizonFore
         self.autoregressive_loss_weights = autoregressive_loss_weights
 
         if self.stack_window_to_channel_dim:
-            # Need to reshape the predictions to (b, t, c, h, w), where t = num_time_steps predicted
+            # Need to reshape the noisy inputs to (b, (t c), h, w), where t = num_time_steps predicted
             # if self.horizon_at_once > 1:
             self.targets_pre_process = partial(rrearrange, pattern="b t c ... -> b (t c) ...", t=self.horizon_at_once)
             # else:
@@ -821,7 +772,10 @@ class AbstractSimultaneousMultiHorizonForecastingModule(AbstractMultiHorizonFore
                 rrearrange, pattern="b (t c) ... -> b t c ...", t=self.horizon_at_once
             )
         else:
-            self.predictions_post_process = self.targets_pre_process = None
+            self.targets_pre_process = partial(rrearrange, pattern="b t c ... -> b c t ...", t=self.horizon_at_once)
+            self.predictions_post_process = partial(
+                rrearrange, pattern="b c t ... -> b t c ...", t=self.horizon_at_once
+            )
 
     @property
     def horizon_at_once(self) -> int:
@@ -925,6 +879,7 @@ class SimultaneousMultiHorizonForecasting(AbstractSimultaneousMultiHorizonForeca
                 inputs=inputs,
                 targets=targets,
                 return_predictions=True,
+                # todo: Possible to just reshape targets above and not pass the below to the model?
                 predictions_post_process=self.predictions_post_process,
                 targets_pre_process=self.targets_pre_process,
                 **extra_kwargs,
@@ -1014,7 +969,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         regression_ckpt_filename: Optional[str] = "last.ckpt",
         regression_use_ema: bool = False,
         regression_inference_dropout: bool = False,
-        regression_overrides: Optional[List[str]] = None,  # a dot list, e.g. ["model.hidden_dims=128"]
+        regression_overrides: Optional[List[str]] = None,  # a dot list, e.g. ["diffusion.num_steps=16"]
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1025,12 +980,14 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
         if initialize_window == "regression":
             regression_overrides = list(regression_overrides) if regression_overrides is not None else []
             regression_overrides.append("model.verbose=False")
+            regression_overrides.append("module.from_pretrained_checkpoint_run_id=null")
             self.log_text.info(f"Regression model overrides: {regression_overrides}")
             regr_model_reloaded = reload_checkpoint_from_wandb(
                 run_id=regression_run_id,
                 local_checkpoint_path=regression_local_checkpoint_path,
                 epoch="last",
                 ckpt_filename=regression_ckpt_filename,
+                use_ema_weights_only=False,  # Use regression_use_ema to set the EMA weights
                 override_key_value=regression_overrides,
                 print_name="Init. window regression model",
                 also_datamodule=False,
@@ -1199,6 +1156,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                 init_window = batch["dynamics"][:, self.window - 1, ...].clone()
                 # Copy the initial window to the full horizon
                 init_window = torch.stack([init_window for _ in range(window_size)], dim=self.model.time_dim)
+                init_window = self.pack_data(init_window, input_or_output="output")
                 if ensemble:
                     # Add ensemble dimension to batch dimension (B, T, C, H, W) -> (B*E, T, C, H, W)
                     init_window = self.get_ensemble_inputs(init_window, split=split, add_noise=False)
@@ -1219,13 +1177,11 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                 else:
                     left_t = self.window  # - self.hparams.truth_shift
                     init_window = batch["dynamics"][:, left_t : left_t + window_size, ...].clone()
+                init_window = self.pack_data(init_window, input_or_output="output")
                 if self.model.time_dim == 2:
-                    # Swap the time dimension to the third dimension
                     init_window = rrearrange(init_window, "b t c ... -> b c t ...")
                 else:
                     assert self.model.time_dim == 1, f"Unexpected time_dim={self.model.time_dim}"
-                init_window = self.pack_data(init_window, input_or_output="output")
-
                 if ensemble:
                     init_window = self.get_ensemble_inputs(init_window, split=split, add_noise=False)
 
@@ -1259,7 +1215,7 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
                             split="predict",
                             return_outputs="preds_only",
                             aggregators=None,
-                            verbose=False,
+                            verbose=self.global_rank == 0,
                             prediction_horizon=window_size * self.skip_every_n_reg_step,
                         )
                 self.regression_model.cpu()  # move to CPU to save GPU memory
@@ -1298,38 +1254,58 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
             else:
                 raise ValueError(f"Unsupported initialize_window={self.hparams.initialize_window}")
 
-            # Condition on last clean samples (if conditional=True). Note that dynamics are normalized already>
-            dynamics_cond = batch["dynamics"][:, : self.window, ...].to(dtype=self.dtype)
-            dynamics_cond = self.pack_data(dynamics_cond, input_or_output="input")
-            # Now, we can use the diffusion model to refine the predictions
-            if dynamics_cond.shape[0] != init_window.shape[0]:
-                assert (
-                    dynamics_cond.shape[0] * self.num_predictions == init_window.shape[0]
-                ), f"init_window.shape={init_window.shape}, dynamics_cond.shape={dynamics_cond.shape}"
-                dynamics_cond = dynamics_cond.repeat(self.num_predictions, *[1] * (len(dynamics_cond.shape) - 1))
+            dynamics_cond = None
+            if self.model.hparams.conditional:
+                # Condition on last clean samples (if conditional=True). Note that dynamics are normalized already>
+                dynamics_cond = batch["dynamics"][:, : self.window, ...].to(dtype=self.dtype)
+                dynamics_cond = self.pack_data(dynamics_cond, input_or_output="input")
+                # Now, we can use the diffusion model to refine the predictions
+                if dynamics_cond.shape[0] != init_window.shape[0]:
+                    assert (
+                        dynamics_cond.shape[0] * self.num_predictions == init_window.shape[0]
+                    ), f"init_window.shape={init_window.shape}, dynamics_cond.shape={dynamics_cond.shape}"
+                    dynamics_cond = dynamics_cond.repeat(self.num_predictions, *[1] * (len(dynamics_cond.shape) - 1))
 
-            if self._pretrained_is_conditional:
-                assert self.model.time_dim == 2, f"Unexpected time_dim={self.model.time_dim}"
-                dynamics_cond = rrearrange(dynamics_cond, "b t c ... -> b c t ...")
-                # Concat the first part of the init window to the condition
-                dynamics_cond = torch.cat([dynamics_cond, init_window[:, :, :-1, ...]], dim=self.model.time_dim)
+                if self._pretrained_is_conditional:
+                    assert self.model.time_dim == 2, f"Unexpected time_dim={self.model.time_dim}"
+                    dynamics_cond = rrearrange(dynamics_cond, "b t c ... -> b c t ...")
+                    # Concat the first part of the init window to the condition
+                    dynamics_cond = torch.cat([dynamics_cond, init_window[:, :, :-1, ...]], dim=self.model.time_dim)
 
             extra_kwargs = self.get_extra_model_kwargs(
                 batch, split=split, ensemble=ensemble, is_autoregressive=is_autoregressive
             )
-            # self.sampler = self.model.sample_maybe_guided(init_window, condition=dynamics_cond, **extra_kwargs)
+            del batch
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             with self.model.guidance_scope():
-                self.sampler = self.model.sample(init_window, condition=dynamics_cond, **extra_kwargs)
+                self.sampler = run_func_in_sub_batches_and_aggregate(
+                    self.model.sample,
+                    init_window,
+                    num_prediction_loops=self.num_prediction_loops,
+                    condition=dynamics_cond,
+                    **extra_kwargs,
+                )
+            if len(self.sampler) > 1:
+                self.log_text.info(f"Using {len(self.sampler)} samplers ({self.num_prediction_loops=}).")
 
             if n_discard > 0:
+                # no-op sampling iterations to arrive at t=0 (and t=1 after if statement below)
                 self.log_text.info(f"Discarding first {n_discard} 'predictions'")
                 for _ in range(n_discard):
-                    # no-op sampling iterations to arrive at t=0 (and t=1 after if statement below)
-                    _ = next(self.sampler)
+                    for sampler in self.sampler:
+                        _ = next(sampler)
                 assert self.model.curr_frame + lookback_start_t == 0, f"{self.model.curr_frame=}, {lookback_start_t=}"
 
-                # next_clean_frame = next(self.sampler)
-        results = next(self.sampler)  # shape (b, c, t, h, w)
+        if len(self.sampler) == 1:
+            results = next(self.sampler[0])  # shape (b, c, t, h, w)
+        else:
+            results = defaultdict(list)
+            for sampler in self.sampler:
+                results_i = next(sampler)
+                for k, v in results_i.items():
+                    results[k].append(v)
+            results = {k: torch.cat(v, dim=0) for k, v in results.items()}
+
         plot = False
         if plot:
             import matplotlib.pyplot as plt
@@ -1363,7 +1339,8 @@ class RollingDiffusion(AbstractMultiHorizonForecastingExperiment):
 
     def on_autoregressive_loop_end(self, split: str, dataloader_idx: int = None, **kwargs):
         self.log("diffusion/nfe", self.model.nfe)
-        self.sampler.close()
+        for sampler in self.sampler:
+            sampler.close()
         self.sampler = None
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):

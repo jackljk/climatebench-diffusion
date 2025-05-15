@@ -7,13 +7,13 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import xarray as xr
 
 import wandb
-import xarray as xr
-import cartopy.crs as ccrs
 from src.losses.losses import crps_ensemble
 from src.utilities.naming import (
     clean_metric_name,
@@ -21,7 +21,6 @@ from src.utilities.naming import (
     normalize_run_name,
 )
 from src.utilities.wandb_api import (
-    get_existing_wandb_group_runs,
     get_runs_for_group_with_any_metric,
     has_summary_metric,
     metrics_of_runs_to_arrays,
@@ -1305,14 +1304,19 @@ def beautify_plots_with_metrics(
         y = anchor_y + 0.035 if plot_legend_on_top else 0.93
         axes[0].figure.suptitle(title, y=y)
 
+
 def create_wandb_figures(target, gen, var_name, fig_shared_label, coords, show_log_precip=True):
     # Some plotting parameters
     map_transform = ccrs.PlateCarree()
     _plot_params = {
-        "pr": {"cmap": "BrBG", "add_colorbar": False, "transform": map_transform}, #, "cbar_kwargs": {"shrink": 0.9}
+        "pr": {"cmap": "BrBG", "add_colorbar": False, "transform": map_transform},  # , "cbar_kwargs": {"shrink": 0.9}
         "tas": {"cmap": "inferno", "add_colorbar": False, "transform": map_transform},
         "crps": {"cmap": "viridis", "transform": map_transform, "cbar_kwargs": {"shrink": 0.8}},
-        "error": {"cmap": "coolwarm", "add_colorbar": False, "transform": map_transform}, # , "cbar_kwargs": {"shrink": 0.5}
+        "error": {
+            "cmap": "coolwarm",
+            "add_colorbar": False,
+            "transform": map_transform,
+        },  # , "cbar_kwargs": {"shrink": 0.5}
     }
     cbar_kwargs = {"fraction": 0.046, "pad": 0.04}
 
@@ -1477,6 +1481,7 @@ def create_wandb_figures(target, gen, var_name, fig_shared_label, coords, show_l
     #
     snapshots = {k.strip("/").replace("//", "/"): v for k, v in snapshots.items()}
     return snapshots
+
 
 class RollingPlotFormats:
     def __init__(

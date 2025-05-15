@@ -11,3 +11,4 @@ defaults:
 model:
   model_channels: 128
   upsample_outputs_by: 2
+  loss_function: "wmse"

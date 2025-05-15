@@ -10,8 +10,14 @@ defaults:
   - override /trainer: debug.yaml
   - override /logger: none.yaml
   - override /callbacks: none.yaml
+  - override /datamodule: _debug.yaml
 
 debug_mode: True
+model:
+  debug_mode: True
+
+datamodule:
+  num_workers: 2
 
 hydra:
   # sets level of all command line loggers to 'DEBUG'

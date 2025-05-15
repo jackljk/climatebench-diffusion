@@ -561,7 +561,7 @@ class DYffusionMarkov(BaseDYffusion2):
 
         # Forecast x_{h} from \tilde{x}_{t} for 0 <= t <= h-1
         xhat_th = self.predict_x_last(x_t=xtilde_t, time_of_input=t_abs, **kwargs)
-        loss_forward = criterion(xhat_th, x_th) # for l1-l2mix:, time_of_input=t_abs)
+        loss_forward = criterion(xhat_th, x_th)  # for l1-l2mix:, time_of_input=t_abs)
         loss_forward_dict = {"loss": loss_forward} if not isinstance(loss_forward, dict) else loss_forward
         loss_forward = loss_forward_dict.pop("loss")
 
@@ -577,7 +577,7 @@ class DYffusionMarkov(BaseDYffusion2):
             # forecast x_{h} from \hat{x}_{t'} for 1 <= t' <= h-1, where t' = t+1
             kwargs = {k: v[t_not_last_mask] if torch.is_tensor(v) else v for k, v in kwargs.items()}
             xhat_th2 = self.predict_x_last(xhat_ti_next, time_of_input=t_abs_not_last + 1, **kwargs)
-            loss_forward2 = criterion(xhat_th2, x_th[t_not_last_mask]) # for l1-l2mix:, , time_of_input=t_abs_not_last + 1)
+            loss_forward2 = criterion(xhat_th2, x_th[t_not_last_mask])  # l1-l2mix:, time_of_input=t_abs_not_last + 1
             loss_forward2_dict = {"loss": loss_forward2} if not isinstance(loss_forward2, dict) else loss_forward2
             loss_forward2 = loss_forward2_dict.pop("loss")
         else:

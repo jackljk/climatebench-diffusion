@@ -3,22 +3,22 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
-import xarray as xr
 from torch import Tensor
 
+from src.evaluation.aggregators.save_data import SaveToDiskAggregator
 from src.evaluation.metrics import (
+    compute_metric_on,
+    mean_absolute_error,
     root_mean_squared_error,
     spread_skill_ratio,
-    weighted_mean_bias,
     weighted_mean,
-    compute_metric_on,
+    weighted_mean_bias,
     weighted_std,
-    mean_absolute_error,
 )
 from src.losses.losses import crps_ensemble
-from src.utilities.utils import get_logger, rrearrange
 from src.utilities.plotting import create_wandb_figures
-from src.evaluation.aggregators.save_data import SaveToDiskAggregator
+from src.utilities.utils import get_logger, rrearrange
+
 
 log = get_logger(__name__)
 
@@ -60,6 +60,7 @@ class TemporalMetricsAggregator:
         coords: Optional[Dict[str, np.ndarray]] = None,  # Xarray coordinates
         save_data: bool = False,
         save_to_wandb: bool = False,
+        **kwargs,
     ):
         """
         Args:
@@ -235,7 +236,8 @@ class TemporalMetricsAggregator:
                             gen_variance,
                             date_as_str,
                             is_ensemble=self.is_ensemble,
-                            ssp=ssp, show_log_precip=False
+                            ssp=ssp,
+                            show_log_precip=False,
                         ).items()
                     }
                 )

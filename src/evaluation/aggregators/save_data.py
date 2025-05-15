@@ -164,6 +164,7 @@ class SaveToDiskAggregator(AbstractAggregator):
         final_ds.to_netcdf(save_to_path)
         if self.save_to_wandb:
             import wandb
+
             wandb.save(save_to_path)
 
         # Reset running data

@@ -101,7 +101,11 @@ class ZonalEnergySpectrum(DerivedVariable):
 
     def compute(self, dataset: xr.Dataset) -> xr.DataArray:
         """Computes zonal power at wavenumber and frequency."""
-        spacing = self.lon_spacing_m(dataset)
+        is_earth = "lon" in self.lon_name
+        if is_earth:
+            wavenumber_name = "zonal_wavenumber"
+        else:
+            wavenumber_name = "wavenumber"
 
         def simple_power(f_x):
             f_k = np.fft.rfft(f_x, axis=-1, norm="forward")
@@ -116,22 +120,28 @@ class ZonalEnergySpectrum(DerivedVariable):
             input_core_dims=[[self.lon_name]],
             output_core_dims=[[self.lon_name]],
             exclude_dims={self.lon_name},
-        ).rename_dims({self.lon_name: "zonal_wavenumber"})[self.variable_name]
-        spectrum = spectrum.assign_coords(zonal_wavenumber=("zonal_wavenumber", spectrum.zonal_wavenumber.data))
+        ).rename_dims({self.lon_name: wavenumber_name})[self.variable_name]
+        spectrum = spectrum.assign_coords({wavenumber_name: (wavenumber_name, spectrum[wavenumber_name].data)})
         base_frequency = xr.DataArray(
             np.fft.rfftfreq(len(getattr(dataset, self.lon_name))),
-            dims="zonal_wavenumber",
-            coords={"zonal_wavenumber": spectrum.zonal_wavenumber},
+            dims=wavenumber_name,
+            coords={wavenumber_name: spectrum[wavenumber_name]},
         )
-        spectrum = spectrum.assign_coords(frequency=base_frequency / spacing)
-        spectrum["frequency"] = spectrum.frequency.assign_attrs(units="1 / m")
+        if is_earth:
+            spacing = self.lon_spacing_m(dataset)
+            spectrum = spectrum.assign_coords(frequency=base_frequency / spacing)
+            spectrum["frequency"] = spectrum.frequency.assign_attrs(units="1 / m")
 
-        spectrum = spectrum.assign_coords(wavelength=1 / spectrum.frequency)
-        spectrum["wavelength"] = spectrum.wavelength.assign_attrs(units="m")
+            spectrum = spectrum.assign_coords(wavelength=1 / spectrum.frequency)
+            spectrum["wavelength"] = spectrum.wavelength.assign_attrs(units="m")
 
-        # This last step ensures the sum of spectral components is equal to the
-        # (discrete) integral of data around a line of latitude.
-        return spectrum * self._circumference(spectrum)
+            # This last step ensures the sum of spectral components is equal to the
+            # (discrete) integral of data around a line of latitude.
+            spectrum = spectrum * self._circumference(spectrum)
+        else:
+            spectrum = spectrum.assign_coords(frequency=base_frequency)
+            spectrum = spectrum.assign_coords(wavelength=1 / spectrum.frequency)
+        return spectrum
 
 
 def interpolate_spectral_frequencies(

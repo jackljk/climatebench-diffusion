@@ -233,7 +233,7 @@ def extras(
         if run_api is None:
             run_api = get_run_api(run_path=run_path)
         # original overrides + command line overrides (latter take precedence)
-        overrides = run_api.metadata["args"] + sys.argv[1:]
+        overrides = run_api.metadata["args"] + (sys.argv[1:] if len(sys.argv) > 1 else [])
         GlobalHydra.instance().clear()
         with hydra.initialize(version_base=None, config_path="../configs"):
             new_config = hydra.compose(config_name="main_config.yaml", overrides=overrides)
@@ -257,13 +257,19 @@ def extras(
     # Edit some config values
     # Create working dir if it does not exist yet
     if config.get("work_dir"):
+        if config.get("logger") and config.logger.get("wandb") and config.logger.wandb.get("id"):
+            if str(config.logger.wandb.id) not in config.work_dir:
+                config.work_dir = os.path.join(config.work_dir, str(config.logger.wandb.id))
+                log.info(f"Changing work_dir to {config.work_dir} since wandb id is not in it.")
         try:
             os.makedirs(name=config.get("work_dir"), exist_ok=True)
         except PermissionError as e:
             if allow_permission_error:
                 log.warning(f"PermissionError: {e}")
             else:
-                log.info(f"Please set ``work_dir`` to a valid path for which you have write permissions. Current: {config.work_dir}")
+                log.info(
+                    f"Please set ``work_dir`` to a valid path for which you have write permissions. Current: {config.work_dir}"
+                )
                 raise e
 
     # disable python warnings if <config.ignore_warnings=True>
@@ -700,7 +706,7 @@ def check_config_values(config: DictConfig):
             config.datamodule.prefetch_factor = None
         if config.datamodule.num_workers == 0 and config.datamodule.get("persistent_workers") is True:
             # Not using workers, so persistent_workers will be ignored
-            log.warning(f"datamodule.persistent_workers=True will be ignored since num_workers=0! Set to False.")
+            log.warning("datamodule.persistent_workers=True will be ignored since num_workers=0! Set to False.")
             config.datamodule.persistent_workers = False
 
         if config.get("eval_mode"):
@@ -749,6 +755,15 @@ def check_config_values(config: DictConfig):
                 config.trainer.devices = 1  # devices = num_processes for CPU
                 log.warning(
                     "CUDA is not available, switching to CPU.\n"
+                    "\tIf you want to use GPU, please re-install pytorch: https://pytorch.org/get-started/locally/."
+                    "\n\tIf you want to use a different accelerator, specify it with ``trainer.accelerator=...``."
+                )
+            # Check if MPS is available
+            if torch.backends.mps.is_available():
+                config.trainer.accelerator = "mps"
+                config.trainer.devices = 1
+                log.warning(
+                    "CUDA is not available, switching to MPS.\n"
                     "\tIf you want to use GPU, please re-install pytorch: https://pytorch.org/get-started/locally/."
                     "\n\tIf you want to use a different accelerator, specify it with ``trainer.accelerator=...``."
                 )

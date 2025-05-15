@@ -1194,8 +1194,7 @@ class DhariwalUNetTemporal(DhariwalUNet):
         x = rearrange(inputs, "b c t h w -> (b t) c h w")  # concat with cond: (b t) c h w -> (b t) (c+cond) h w
         if kwargs.get("static_condition") is not None:
             # Copy the static condition to all time steps b c' h w -> (b t) c' h w
-            static_condition = kwargs["static_condition"]
-            kwargs["static_condition"] = repeat(static_condition, "b c2 h w -> (b t) c2 h w", t=t)
+            kwargs["static_condition"] = repeat(kwargs["static_condition"], "b c2 h w -> (b t) c2 h w", t=t)
 
         emb_t = None
         if self.extra_time_emb_mlp:

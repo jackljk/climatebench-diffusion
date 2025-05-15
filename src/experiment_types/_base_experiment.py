@@ -11,10 +11,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import hydra
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import xarray as xr
 from omegaconf import DictConfig
-from pytorch_lightning import LightningModule
+from pytorch_lightning.utilities import grad_norm
 from tensordict import TensorDict, TensorDictBase
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
@@ -28,7 +29,6 @@ from src.models.gan import BaseGAN
 from src.models.modules import padding
 from src.models.modules.ema import LitEma
 from src.utilities.checkpointing import reload_checkpoint_from_wandb
-from src.utilities.evaluation import evaluate_ensemble_prediction
 from src.utilities.lr_scheduler import get_scheduler
 from src.utilities.utils import (
     AlreadyLoggedError,
@@ -38,6 +38,7 @@ from src.utilities.utils import (
     print_gpu_memory_usage,
     raise_error_if_invalid_value,
     rrearrange,
+    run_func_in_sub_batches_and_aggregate,
     to_DictConfig,
     to_tensordict,
     torch_to_numpy,
@@ -48,7 +49,7 @@ class StopTraining(Exception):
     pass
 
 
-class BaseExperiment(LightningModule):
+class BaseExperiment(pl.LightningModule):
     r"""This is a template base class, that should be inherited by any stand-alone ML model.
     Methods that need to be implemented by your concrete ML model (just as if you would define a :class:`torch.nn.Module`):
         - :func:`__init__`
@@ -100,6 +101,7 @@ class BaseExperiment(LightningModule):
         use_ema: bool = False,
         ema_decay: float = 0.9999,
         enable_inference_dropout: bool = False,
+        stack_window_to_channel_dim=True,
         conv_padding_mode_global: Optional[str] = None,
         learned_channel_variance_loss: bool = False,
         learned_spatial_variance_loss: bool = False,
@@ -107,6 +109,7 @@ class BaseExperiment(LightningModule):
         from_pretrained_checkpoint_run_id: Dict[str, Any] = None,
         from_pretrained_local_path: Optional[str] = None,
         from_pretrained_checkpoint_filename: Optional[str] = "last.ckpt",
+        from_pretrained_load_ema: bool = False,
         from_pretrained_frozen: bool = False,
         from_pretrained_exclude_keys: Optional[List[str]] = None,
         from_pretrained_lr_multiplier: float = None,
@@ -146,6 +149,7 @@ class BaseExperiment(LightningModule):
         if conv_padding_mode_global is not None:
             padding.set_global_padding_mode(padding_mode=conv_padding_mode_global)
 
+        self.stack_window_to_channel_dim = stack_window_to_channel_dim
         self.model_config = model_config
         self.datamodule_config = datamodule_config
         self.diffusion_config = diffusion_config
@@ -154,8 +158,10 @@ class BaseExperiment(LightningModule):
         assert (
             num_predictions % self.num_predictions_in_mem == 0
         ), f"{num_predictions_in_memory=} % {num_predictions=} != 0"
-        self.num_prediction_loops = num_predictions // self.num_predictions_in_mem
-        self.is_diffusion_model = diffusion_config is not None and diffusion_config.get("_target_", None) is not None
+        diffusion_class = None if diffusion_config is None else diffusion_config.get("_target_", None)
+        self.is_diffusion_model = diffusion_config is not None and diffusion_class is not None
+        self.is_standard_diffusion = self.is_diffusion_model and "dyffusion" not in diffusion_class.lower()
+        # Infer input, output, spatial dimensions from datamodule
         self.dims = get_dims_of_dataset(self.datamodule_config)
         self._instantiate_auxiliary_modules()
         self.use_ema = use_ema
@@ -248,15 +254,16 @@ class BaseExperiment(LightningModule):
         """The number of channels that are used for conditioning as auxiliary inputs."""
         nc = self.dims.get("conditional", 0)
         if self.is_diffusion_model:
-            d_class = self.diffusion_config.get("_target_").lower()
-            is_standard_diffusion = "dyffusion" not in d_class
-            if is_standard_diffusion:
+            if self.is_standard_diffusion:
                 if self.diffusion_config.get("force_unconditional", False) is True:
                     pass
-                else:
-                    nc += (
-                        self.window * self.dims["input"]
-                    )  # we use the data from the past window frames as conditioning
+                elif (
+                    self.stack_window_to_channel_dim
+                    or self.diffusion_config.get("when_3d_concat_condition_to") == "channel"
+                ):
+                    # we use the data from the past window frames as conditioning (unless we use a temporal model)
+                    # Would be easier to check if not self.model.is_3d here, but model is not set yet
+                    nc += self.window * self.dims["input"]
             else:
                 fwd_cond = self.diffusion_config.get("forward_conditioning", "").lower()
                 if fwd_cond == "":
@@ -292,6 +299,10 @@ class BaseExperiment(LightningModule):
         # internally_probabilistic = isinstance(self.model, (GaussianDiffusion, DDPM))
         # return 0 if internally_probabilistic else self.hparams.prediction_inputs_noise
         return self.hparams.prediction_inputs_noise
+
+    @property
+    def num_prediction_loops(self):
+        return self.num_predictions // self.num_predictions_in_mem
 
     @property
     def datamodule(self) -> BaseDataModule:
@@ -355,10 +366,6 @@ class BaseExperiment(LightningModule):
             **kwargs,
             **self.extra_model_kwargs(),
         )
-        self.log_text.info(
-            f"Instantiated model: {model.__class__.__name__}, with"
-            f" # input/output/conditional channels: {in_channels}, {out_channels}, {cond_channels}"
-        )
         if self.is_diffusion_model:
             model = hydra.utils.instantiate(self.diffusion_config, model=model, _recursive_=False, **kwargs)
             self.log_text.info(
@@ -379,7 +386,6 @@ class BaseExperiment(LightningModule):
         """Reload weights from a pretrained model, potentially freezing some layers."""
         reloaded_pretrained_ckpt = None
         if self.hparams.from_pretrained_checkpoint_run_id is not None:
-            # todo: Do we want to reload the EMA weights instead of the model weights?
             local_checkpoint_path = self.hparams.from_pretrained_local_path or True
             reloaded_pretrained_ckpt = reload_checkpoint_from_wandb(
                 run_id=self.hparams.from_pretrained_checkpoint_run_id,
@@ -388,6 +394,7 @@ class BaseExperiment(LightningModule):
                 model=self,
                 also_datamodule=False,
                 exclude_state_dict_keys=self.hparams.from_pretrained_exclude_keys,
+                use_ema_weights_only=self.hparams.from_pretrained_load_ema,
                 print_name="Pretrained model",
             )
             self.reloaded_state_dict_keys = reloaded_pretrained_ckpt["state_dict"]
@@ -640,32 +647,14 @@ class BaseExperiment(LightningModule):
         base_num_predictions = self.num_predictions
         self.num_predictions = num_predictions or base_num_predictions
 
-        # break up inputs and kwargs into batches of size self.num_predictions_in_mem
-        def split_batch(x, start, end):
-            if isinstance(x, (Tensor, TensorDict)):
-                return x[start:end]
-            return x
-
-        results = defaultdict(list)
         # By default, we predict the entire batch at once (i.e. num_prediction_loops=1)
-        full_batch_size = inputs[0].shape[0] if len(inputs) > 0 else kwargs[list(kwargs.keys())[0]].shape[0]
-        actual_batch_size = full_batch_size // base_num_predictions  # self.num_predictions
-        assert (
-            actual_batch_size > 0
-        ), f"{actual_batch_size=}, {full_batch_size=}, {self.num_predictions=}, {base_num_predictions=}"
-        inputs_offset_factor = self.num_predictions_in_mem * actual_batch_size
-        for i in range(self.num_prediction_loops):
-            start_i, end_i = i * inputs_offset_factor, (i + 1) * inputs_offset_factor
-            inputs_i = [split_batch(x, start_i, end_i) for x in inputs]
-            kwargs_i = {k: split_batch(v, start_i, end_i) for k, v in kwargs.items()}
-            results_i = self.predict_packed(*inputs_i, **kwargs_i)
-            # log.info(f"results_i: {results_i.keys()}, {results_i['preds'].shape}, inputs_i: {inputs_i[0].shape}")
-            if predictions_mask is not None:
-                results_i = {k: v[..., predictions_mask[0, :]] for k, v in results_i.items()}
-            for k, v in results_i.items():
-                results[k].append(v)
-        # log.info({k: torch.cat(v, dim=0) for k, v in results.items()}["preds2d"].shape)
-        results = {k: torch.cat(v, dim=0) for k, v in results.items()}
+        results = run_func_in_sub_batches_and_aggregate(
+            self.predict_packed,
+            *inputs,
+            num_prediction_loops=self.num_prediction_loops,
+            predictions_mask=predictions_mask,
+            **kwargs,
+        )
         # results = TensorDict(results, batch_size=(full_batch_size,))
         # results = to_tensordict({k: torch.cat(v, dim=0) for k, v in results.items()}, find_batch_size_max=True)
         # log.info(results["preds2d"].shape, "after cat")
@@ -692,13 +681,6 @@ class BaseExperiment(LightningModule):
         # for k, v in results.items(): print(k, v.shape if torch.is_tensor(v) else v)
         return results
 
-    def predict(self, inputs: Union[Tensor, TensorDictBase], **kwargs) -> Dict[str, Tensor]:
-        """Wrapper around the main predict method, to allow inputs to be a TensorDictBase or a Tensor."""
-        if torch.is_tensor(inputs):
-            return self._predict(inputs, **kwargs)
-        else:
-            return self._predict(**inputs, **kwargs)
-
     def reshape_predictions(self, results: TensorDict) -> TensorDict:
         """Reshape and unpack the predictions from the model. This modifies the input dictionary in-place.
         Args:
@@ -712,6 +694,13 @@ class BaseExperiment(LightningModule):
                     results[k] = self._reshape_ensemble_preds(results[k])
                 # results = self._reshape_ensemble_preds(results)
         return results
+
+    def predict(self, inputs: Union[Tensor, TensorDictBase], **kwargs) -> Dict[str, Tensor]:
+        """Wrapper around the main predict method, to allow inputs to be a TensorDictBase or a Tensor."""
+        if torch.is_tensor(inputs):
+            return self._predict(inputs, **kwargs)
+        else:
+            return self._predict(**inputs, **kwargs)
 
     def pack_data(self, data: Dict[str, Tensor], input_or_output: str) -> Tensor:
         """Pack the data into a single tensor."""
@@ -838,7 +827,7 @@ class BaseExperiment(LightningModule):
             "prefetch_factor",
         ]
         for arg in dataloader_args_to_log:
-            if hasattr(train_dl, arg):
+            if hasattr(train_dl, arg) and getattr(train_dl, arg) is not None:
                 to_log[f"train_dataloader/{arg}"] = getattr(train_dl, arg)
 
         self.log_dict(to_log, on_step=False, on_epoch=True, prog_bar=False, logger=True)
@@ -987,8 +976,6 @@ class BaseExperiment(LightningModule):
             self.trainer.log_every_n_steps = self._original_log_every_n_steps
 
         time_start = time.time()
-        train_log_dict = self.train_step_initial_log_dict()
-
         for main_data_key in self.main_data_keys:
             if isinstance(batch[main_data_key], dict):
                 batch[main_data_key] = {k: to_tensordict(v) for k, v in batch[main_data_key].items()}
@@ -1019,26 +1006,25 @@ class BaseExperiment(LightningModule):
             self.log("train/loss", float(loss), on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         # Count number of zero gradients as diagnostic tool
-        train_log_dict["n_zero_gradients"] = (
-            sum([int(torch.count_nonzero(p.grad == 0)) for p in self.model.get_parameters() if p.grad is not None])
-            / self.model.num_params
-        )
-        train_log_dict["time/train/step"] = time.time() - time_start
+        train_log_dict = {"time/train/step": time.time() - time_start}
         # train_log_dict["time/train/step_ratio"] = time_per_step / self.trainer.accumulate_grad_batches
-
         self.log_dict(train_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
         return loss  # {"loss": loss}
+
+    def do_log_training_diagnostics(self, batch_idx: int = None) -> bool:
+        return self.global_step % (self.trainer.log_every_n_steps * 2) == 0
 
     def on_train_batch_end(self, outputs=None, batch=None, batch_idx: int = None):
         if self.update_ema:
             self.model_ema(self.model_handle_for_ema)  # update the model EMA
-        if not (batch_idx == 0 or batch_idx % (self.trainer.log_every_n_steps * 2) == 0):
-            return  # Do not log the next things at every step
+        if not self.do_log_training_diagnostics(batch_idx):
+            return  # Do not log the following things at every step
 
         log_dict = {}
         # Log logvar of the channels
-        if self.channels_logvar is not None:
-            channel_vars = self.channels_logvar.exp().detach()
+        channel_logvars = self.channels_logvar
+        if channel_logvars is not None:
+            channel_vars = channel_logvars.exp().detach()
             # Unpack to map channel index to semantic channel name
             channel_vars = self.unpack_data(
                 results=channel_vars, input_or_output="output", axis=0, func="unpack_simple"
@@ -1070,9 +1056,22 @@ class BaseExperiment(LightningModule):
 
         self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
 
+    def on_before_optimizer_step(self, optimizer):
+        if self.do_log_training_diagnostics():
+            # Compute the 2-norm for each layer (and total) and log it
+            norms = grad_norm(self.model, norm_type=2)
+            # Compute number of zero gradients as diagnostic tool
+            norms["n_zero_gradients"] = (
+                sum([int(torch.count_nonzero(p.grad == 0)) for p in self.model.get_parameters() if p.grad is not None])
+                / self.model.num_params
+            )
+            self.log_dict(norms)
+
     def on_train_epoch_end(self) -> None:
-        train_time = time.time() - self._start_epoch_time
-        self.log_dict({"epoch": float(self.current_epoch), "time/train": train_time}, sync_dist=True)
+        log_dict = {"epoch": float(self.current_epoch)}
+        if self._start_epoch_time is not None:  # sometimes there's a weird issue in DDP mode where this is not set.
+            log_dict["time/train"] = time.time() - self._start_epoch_time
+        self.log_dict(log_dict, sync_dist=True)
         self._n_epochs_since_init += 1
 
     # --------------------- evaluation with PyTorch Lightning
@@ -1286,31 +1285,6 @@ class BaseExperiment(LightningModule):
         s += f"{self.WANDB_LAST_SEP}"
         return s
 
-    def _eval_ensemble_predictions(self, outputs: List[Any], split: str):
-        if not self.use_ensemble_predictions(split):
-            return
-        numpy_results = self._evaluation_get_preds(outputs, split)  # keys <p>_preds, <p>_targets
-
-        # Go through all predictions and compute metrics (i.e. over preds for each time step)
-        all_preds_metrics = defaultdict(list)
-        preds_keys = [k for k in numpy_results.keys() if k.endswith("preds")]
-        infix = self.ensemble_logging_infix(split)
-        for preds_key in preds_keys:
-            prefix = preds_key.replace("_preds", "") if preds_key != "preds" else ""
-            # assert prefix == '' or prefix == preds_key[:-len('_preds')], f'prefix={prefix}, preds_key={preds_key}'
-            targets_key = f"{prefix}_targets" if prefix else "targets"
-            metrics = evaluate_ensemble_prediction(numpy_results[preds_key], targets=numpy_results[targets_key])
-            preds_key_metrics = dict()
-            for m, v in metrics.items():
-                preds_key_metrics[f"{split}{infix}{prefix}/{m}"] = v
-                all_preds_metrics[f"{split}{infix}avg/{m}"].append(v)
-
-            self.log_dict(preds_key_metrics, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
-
-        # Compute average metrics over all predictions
-        avg_metrics = {k: np.mean(v) for k, v in all_preds_metrics.items()}
-        self.log_dict(avg_metrics, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
-
     def on_validation_epoch_end(self) -> None:
         # val_outputs = self._evaluation_get_preds(self._validation_step_outputs)
         self._validation_step_outputs = []
@@ -1343,6 +1317,9 @@ class BaseExperiment(LightningModule):
         aggregators: List[Dict[str, Callable]] = None,
     ) -> Tuple[Dict[str, float], List[str]]:
         logging_infix = self.ensemble_logging_infix(split=split).rstrip("/")
+        # Need the following to log some metrics for consistency with old formats
+        is_ps_data = "PhysicalSystemsBenchmarkDataModule" in self.datamodule_config.get("_target_", "None")
+
         val_time = time.time() - time_start
         split_name = "val" if split == "val" else split
         val_stats = {
@@ -1378,7 +1355,7 @@ class BaseExperiment(LightningModule):
                     if agg_name_substring.startswith("t") and agg_name_substring[1:].isdigit():
                         agg_name_part_with_t = agg_name_substring
                         lead_time = int(agg_name_substring[1:])
-                        lead_time_name = "lead_time"
+                        lead_time_name = "lead_time" if not is_ps_data or split == "val" else "time"
                         break
                     elif all(c.isdigit() for c in agg_name_substring.split("-")):
                         agg_name_part_with_t = agg_name_substring
@@ -1409,17 +1386,24 @@ class BaseExperiment(LightningModule):
                 for x_axis_name, values_list in logs_own_xaxis.items():
                     # values_list is e.g. wavenumber -> {wv_1: {wv_1: 1, pow: 2}, wv_2: {wv_2: 2, pow: 3}, ...}
                     x_axes = values_list.pop("x_axes")  # Dict of <x_axis_name> -> [<x_values>]
-                    first_x_axis = list(x_axes.keys())[0]
-                    for x_axis in x_axes:
+                    x_axes_keys = list(x_axes.keys()) if isinstance(x_axes, dict) else list(x_axes)
+                    first_x_axis = x_axes_keys[0]
+                    for x_axis in x_axes_keys:
                         # define our custom x axis metric
-                        wandb.define_metric(x_axis)
+                        try:
+                            wandb.define_metric(x_axis)
+                        except wandb.errors.errors.Error as e:
+                            self.log_text.warning(f"Could not define metric '{x_axis}' in wandb: {e}.")
                     for x_axis_value, values in values_list.items():
                         assert not isinstance(x_axis_value, str), f"{type(x_axis_value)=}. Use a number or timestamp."
                         for value_i_k, values_i in values.items():
-                            if value_i_k not in x_axes:
-                                for custom_x_axis in x_axes:
+                            if value_i_k not in x_axes_keys:
+                                for custom_x_axis in x_axes_keys:
                                     # define which metrics will be plotted against it
-                                    wandb.define_metric(value_i_k, step_metric=custom_x_axis)
+                                    try:
+                                        wandb.define_metric(value_i_k, step_metric=custom_x_axis)
+                                    except wandb.errors.errors.Error as e:
+                                        self.log_text.warning(f"Could not define metric '{value_i_k}' in wandb: {e}.")
                         if first_x_axis not in values.keys():
                             # alternatively, specify exact x-axis value inside values
                             values[first_x_axis] = x_axis_value  # e.g. "sigma" -> 0.02
@@ -1441,7 +1425,8 @@ class BaseExperiment(LightningModule):
                             wandb.define_metric(k, step_metric=lead_time_name)
                     except Exception as e:
                         self.log_text.warning(f"Could not define metric '{lead_time_name}' in wandb: {e}.")
-                self.logger.experiment.log({lead_time_name: lead_time, **logs_metrics_no_t})
+                if self.logger is not None:
+                    self.logger.experiment.log({lead_time_name: lead_time, **logs_metrics_no_t})
                 temporal_metrics_logged += 1
 
                 # Compute average metrics over all aggregators I
@@ -1455,11 +1440,14 @@ class BaseExperiment(LightningModule):
             for k, v in per_variable_mean_metrics.items():
                 if logging_infix != "":
                     assert logging_infix not in k, f"Logging infix {logging_infix} found in {k}"
-                aggs_mean = np.mean(v)
+                aggs_mean = np.mean(v)  # Mean over timesteps
                 # If there is a "/" separator, remove the variable name into "k_base" stem
                 # Split k such that variable is dropped e.g. k= global/rmse/z500 and k_base=global/rmse
                 k_base = "/".join(k.split("/")[:-1])
                 val_stats[f"{label}/avg/{k}"] = aggs_mean
+                if is_ps_data and "vorticity" in k or "velocity" in k:
+                    continue  # For consistency, we do not use these metrics for cross-variable averaging
+
                 total_mean_metrics[f"{label}/avg/{k_base}"].append(aggs_mean)
 
             # Total mean metrics: ['val/avg/l1', 'val/avg/ssr', 'val/avg/rmse', 'val/avg/bias', 'val/avg/grad_mag_percent_diff', 'val/avg/crps', 'inference/avg/l1', etc...]
@@ -1592,7 +1580,7 @@ class BaseExperiment(LightningModule):
                     t
                     for t in tags
                     if "=" in t
-                    and not "=null" in t
+                    and "=null" not in t
                     and not any([st in t for st in skip_tags])
                     and not any([st in t for st in skip_tags_with_value])
                 ]
@@ -1871,6 +1859,8 @@ class BaseExperiment(LightningModule):
                     state_dict[logvar_all_k] = state_dict[logvar_all_k].repeat(1, *self.model.spatial_shape_out)
                     state_dict.pop(k)
                     self.log_text.info(f"Repeated {k} into shape {state_dict[logvar_all_k].shape=}")
+                elif state_dict[k].ndim == 3 and tuple(state_dict[k].shape[1:]) == (1, 1):
+                    state_dict[k] = state_dict[k].squeeze(-1)
                 break
 
         if self.hparams.reset_optimizer:
@@ -1886,7 +1876,7 @@ class BaseExperiment(LightningModule):
                         state_dict[k] = state_dict[k].unsqueeze(2)
             # try adding 2 singleton dims to criterion.preds.channels_logvar key
             if self.model.hparams.log_vars_learn_per_dim and logvar_c_key is not None:
-                state_dict[logvar_c_key] = state_dict[logvar_c_key].unsqueeze(-1).unsqueeze(-1)
+                state_dict[logvar_c_key] = state_dict[logvar_c_key].unsqueeze(-1)  # .unsqueeze(-1)
             super().load_state_dict(state_dict, strict=strict)
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
@@ -1894,10 +1884,10 @@ class BaseExperiment(LightningModule):
         script_path = os.environ.get("SCRIPT_NAME", None)
         if script_path is not None:
             checkpoint["script_path"] = script_path.split("/")[-1]  # get only the script name
-        
+
         # Save the full class name with module path. This is useful to instantiating the correct class when loading
         checkpoint["_target_"] = f"{self.__class__.__module__}.{self.__class__.__name__}"
-        
+
         # Save wandb run info, if available
         if self.logger is not None and hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "id"):
             checkpoint["wandb"] = {

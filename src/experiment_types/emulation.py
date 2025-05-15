@@ -17,13 +17,12 @@ from src.utilities.utils import (
 class EmulationExperiment(BaseExperiment):
     def __init__(
         self,
-        stack_window_to_channel_dim: bool = True,
         return_outputs_at_evaluation: str | bool = False,  # can be "all", "preds_only", True, False
         **kwargs,
     ):
         super().__init__(**kwargs)
         # The following saves all the args that are passed to the constructor to self.hparams
-        #   e.g. access them with self.hparams.stack_window_to_channel_dim
+        #   e.g. access them with self.hparams.return_outputs_at_evaluation
         self.save_hyperparameters(ignore=["model"])
 
     def actual_num_input_channels(self, num_input_channels: int) -> int:
@@ -32,7 +31,7 @@ class EmulationExperiment(BaseExperiment):
         is_standard_diffusion = self.is_diffusion_model
         if is_standard_diffusion:
             return self.actual_num_output_channels(self.dims["output"])
-        if self.hparams.stack_window_to_channel_dim:
+        if self.stack_window_to_channel_dim:
             return num_input_channels * self.window
         return num_input_channels
 
@@ -110,7 +109,7 @@ class EmulationExperiment(BaseExperiment):
 
     def transform_inputs(self, inputs: Tensor, ensemble: bool, **kwargs) -> Tensor:
         inputs = self.pack_data(inputs, input_or_output="input")
-        if self.hparams.stack_window_to_channel_dim:  # and inputs.shape[1] == self.window:
+        if self.stack_window_to_channel_dim:  # and inputs.shape[1] == self.window:
             inputs = rrearrange(inputs, "b window c lat lon -> b (window c) lat lon")
         inputs = self.get_ensemble_inputs(inputs, **kwargs) if ensemble else inputs
         return inputs

@@ -343,11 +343,12 @@ class FV3GFSEnsembleDataModule(BaseDataModule):
             "specific_total_water_7_normed",
             "air_temperature_0",
         ]
+        snapshot_kwargs = {"var_names": snaps_vars}
         for h in horizon_range:
             save_snaps_h = save_snapshots and h in snapshot_horizons
             aggregators[f"t{h}"] = OneStepAggregator(
                 use_snapshot_aggregator=save_snaps_h,
-                snapshot_var_names=snaps_vars,
+                snapshot_kwargs=snapshot_kwargs,
                 verbose=verbose and (h == 1),
                 record_normed=h <= 10 or h % 50 == 0 or save_snaps_h,
                 record_abs_values=h % 50 == 1,

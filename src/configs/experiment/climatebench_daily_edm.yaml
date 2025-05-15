@@ -5,7 +5,7 @@
 
 defaults:
   - climatebench_daily.yaml
-  - override /model: unet_resnet.yaml  # or use adm.yaml
+  - override /model: adm.yaml  # or use adm.yaml
   - override /diffusion: edm.yaml
   - _self_
 

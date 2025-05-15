@@ -6,6 +6,7 @@ _target_: src.datamodules.debug_datamodule.DebugDataModule
 horizon: 1
 window: 1
 channels: 2
+channels_cond: 5
 height: 8
 width: 8
 data_type: "arange"

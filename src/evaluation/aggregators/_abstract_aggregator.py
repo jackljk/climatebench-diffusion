@@ -116,5 +116,6 @@ class _Aggregator(Protocol):
         gen_data: Mapping[str, torch.Tensor],
         target_data_norm: Mapping[str, torch.Tensor],
         gen_data_norm: Mapping[str, torch.Tensor],
-        metadata: Mapping[str, Any],
+        metadata: Mapping[str, Any] = None,
+        predictions_mask: Optional[torch.Tensor] = None,
     ) -> None: ...

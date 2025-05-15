@@ -163,6 +163,7 @@ def root_mean_squared_error(
     mse = mean_squared_error(truth, predicted, weights=weights, dim=dim)
     return torch.sqrt(mse)
 
+
 def mean_absolute_error(
     truth: Tensor,
     predicted: Tensor,
