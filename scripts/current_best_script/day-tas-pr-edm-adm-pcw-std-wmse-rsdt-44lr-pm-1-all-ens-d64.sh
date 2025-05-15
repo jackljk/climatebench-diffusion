@@ -6,6 +6,7 @@ export SCRIPT_NAME=$(basename "$0")
 
 # "$@" makes sure to use any extra command line arguments supplied here with bash <script>.sh <args>
 python run.py "$@" \
+    datamodule.data_dir=/data \
     experiment=climatebench_daily_edm \
     datamodule.mean_over_ensemble='all' \
     datamodule.window=1 \
