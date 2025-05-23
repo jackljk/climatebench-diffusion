@@ -6,7 +6,7 @@ import numpy as np
 import xarray as xr
 
 from src.utilities.utils import get_files, get_logger
-
+from src.utilities.normalization import StandardNormalizer
 
 log = get_logger(__name__)
 
@@ -45,8 +45,21 @@ def standardize_output_xr(
             output_xr[key] = output_xr[key].drop(vars_to_drop)
 
             # Rename the daily variables to be consistent with the yearly data
-            if "y" or "x" in output_xr[key].dims:
-                output_xr[key] = output_xr[key].rename({"y": "latitude", "x": "longitude"})
+            if any(dim in output_xr[key].dims for dim in ["y", "x", "lat", "lon"]):
+                # Create dictionary of dimension names to rename
+                rename_dict = {
+                    "y": "latitude", 
+                    "x": "longitude",
+                    "lat": "latitude", 
+                    "lon": "longitude"
+                }
+                
+                # Only include the dimensions that actually exist in the dataset
+                rename_dict = {k: v for k, v in rename_dict.items() if k in output_xr[key].dims}
+                
+                # Apply the renaming if there's anything to rename
+                if rename_dict:
+                    output_xr[key] = output_xr[key].rename(rename_dict)
             # Convert pr to mm/day and rename lon and lat to longitude and latitude
             if False:  # "pr" in output_vars:
                 log.info(f"Converting pr and pr90 to mm/day for {simulation}")
@@ -60,8 +73,22 @@ def standardize_output_xr(
         output_xr = output_xr.drop(vars_to_drop)
 
         # Rename the daily variables to be consistent with the yearly data
-        if "y" or "x" in output_xr.dims:
-            output_xr = output_xr.rename({"y": "latitude", "x": "longitude"})
+        # Rename the daily variables to be consistent with the yearly data
+        if any(dim in output_xr.dims for dim in ["y", "x", "lat", "lon"]):
+            # Create dictionary of dimension names to rename
+            rename_dict = {
+            "y": "latitude", 
+            "x": "longitude",
+            "lat": "latitude", 
+            "lon": "longitude"
+            }
+            
+            # Only include the dimensions that actually exist in the dataset
+            rename_dict = {k: v for k, v in rename_dict.items() if k in output_xr.dims}
+            
+            # Apply the renaming if there's anything to rename
+            if rename_dict:
+                output_xr = output_xr.rename(rename_dict)
 
         if False:  # "pr" in output_vars:
             # Convert pr to mm/day and rename lon and lat to longitude and latitude
@@ -147,13 +174,13 @@ def get_rsdt(
     if solar_experiment == "G6Solar":
         # get the file with G6Solar
         rsdt[solar_experiment] = xr.open_dataset(data_path + "/rsdt_Amon_CESM2-WACCM_G6solar.nc").compute()
-    else:
-        # For now don't load piControl
-        rsdt_path = [path for path in rsdt_paths if "ssp126" in path]
-        assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
-        rsdt_path = rsdt_path[0]
-        log.info(f"Loading rsdt data from {rsdt_path}")
-        rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
+
+    # always load rsdt ssp126
+    rsdt_path = [path for path in rsdt_paths if "ssp126" in path]
+    assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
+    rsdt_path = rsdt_path[0]
+    log.info(f"Loading rsdt data from {rsdt_path}")
+    rsdt['ssp'] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 
     # Squeeze the nbnd & member_id dimension from the output datasets
     for k, v in rsdt.items():
@@ -164,6 +191,17 @@ def get_rsdt(
             rsdt[k] = v.drop_vars("member_id")
             print(f"dropping member_id dimension from the rsdt{k} variable datasets")
 
+    # Standardize the rsdt data using training data i.e "ssp data"
+    rsdt_ssp_flattened = rsdt['ssp'].rsdt.data.reshape(-1)
+    rsdt_ssp_mean, rsdt_ssp_std = rsdt_ssp_flattened.mean(), rsdt_ssp_flattened.std()
+    
+    for k, v in rsdt.items():
+        rsdt[k] = normalize_data(v, {"rsdt": {"mean": rsdt_ssp_mean, "std": rsdt_ssp_std}})
+    
+    if solar_experiment:
+        # remove the ssp from the dictionary
+        rsdt.pop("ssp")
+    
     return rsdt
 
 

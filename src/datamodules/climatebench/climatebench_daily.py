@@ -277,7 +277,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             set_test = self._setup_test(X_test, Y_test)
         else:
             set_test = None
-
+            
         # Get rsdt data
         rsdt = None
         if "rsdt" in self.hparams.additional_vars:
