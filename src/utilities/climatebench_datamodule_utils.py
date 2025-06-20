@@ -201,6 +201,8 @@ def get_rsdt(
     if solar_experiment:
         # remove the ssp from the dictionary
         rsdt.pop("ssp")
+        # rename G6Solar lat lon to x, y
+        rsdt[solar_experiment] = rsdt[solar_experiment].rename({"lat": "y", "lon": "x"})
     
     return rsdt
 
