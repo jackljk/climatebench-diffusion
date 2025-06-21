@@ -12,7 +12,7 @@ python run.py "$@" \
     datamodule.window=1 \
     datamodule.batch_size=512 \
     datamodule.eval_batch_size=8 \
-    'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-AllEns-Tas+Pr-pCW-mch128" \
+    'datamodule.simulations=[ssp126, ssp370, ssp585]' name_suffix="3xSSP-AllEns-Tas+Pr-pCW" \
     'datamodule.output_vars=[tas, pr]' \
     datamodule.simulations_anom_type="none" datamodule.simulations_raw="all" datamodule.normalization_type="standard_new" \
     datamodule.additional_vars=["rsdt"] trainer.num_sanity_val_steps=0 \
@@ -27,7 +27,7 @@ python run.py "$@" \
     diffusion.loss_function="wmse" diffusion.P_mean=-1 diffusion.P_std=1.2 \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="raw_stdized2-Pm-1Ps1.2-ebs512+rsdt_stdized" \
+    suffix="fix_rsdt-mch128" \
     "$@"
 
 #     datamodule.batch_size=256 is too low
