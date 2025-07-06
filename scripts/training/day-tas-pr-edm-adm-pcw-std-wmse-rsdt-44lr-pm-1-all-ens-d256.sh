@@ -27,7 +27,7 @@ python run.py "$@" \
     diffusion.loss_function="wmse" diffusion.P_mean=-1 diffusion.P_std=1.2 \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="raw_stdized2-Pm-1Ps1.2-mch256-ebs512+rsdt_stdized" \
+    suffix="fix_rsdt-mch256" \
     "$@"
 
 #     datamodule.batch_size=256 is too low
