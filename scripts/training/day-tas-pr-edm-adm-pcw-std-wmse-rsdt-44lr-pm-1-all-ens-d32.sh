@@ -23,11 +23,11 @@ python run.py "$@" \
     module.conv_padding_mode_global="circular_width_only" \
     scheduler@module.scheduler=linear_warmup_cosine module.scheduler.warmup_epochs=3 trainer.max_epochs=100 \
     model=adm model.loss_function="wmse" \
-    model.model_channels=48 model.dropout=0.1 \
+    model.model_channels=32 model.dropout=0.1 \
     diffusion.loss_function="wmse" diffusion.P_mean=-1 diffusion.P_std=1.2 \
     diffusion.sigma_max_inf=400 diffusion.sigma_min=0.02 diffusion.num_steps=16 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="fix_rsdt-mch48" \
+    suffix="fix_rsdt-mch32" \
     "$@"
 
 #     datamodule.batch_size=256 is too low
