@@ -1171,6 +1171,24 @@ def reconstruct_xarray(data: Union[torch.Tensor, np.ndarray], metadata: Dict[str
 
     return reconstructed
 
+def clamp_raw_threshold_as_zero_in_normed(tensor: torch.Tensor, threshold: Optional[float], mean: float = 0.0, std: float = 1.0) -> torch.Tensor:
+    """
+    Clamps values in the tensor below a given threshold (in raw space) to 0 (in raw space) on a tensor (in normalized space).
+
+    Args:
+        tensor (torch.Tensor): The input tensor - should be in normalized space.
+        threshold (float): Values below this threshold will be set to 0 after normalization - in raw space.
+        mean (float): Mean for normalization.
+        std (float): Standard deviation for normalization.
+
+    Returns:
+        torch.Tensor: The normalized tensor with values below the threshold clamped to 0.
+    """
+    if threshold is None:
+        return tensor  # No clamping if threshold is None
+    zero_in_normalized_space = - mean / std  # Convert 0 to normalized space
+    threshold_in_normalized_space = (threshold - mean) / std  # Convert threshold to normalized space
+    return torch.where(tensor < threshold_in_normalized_space, torch.tensor(zero_in_normalized_space, dtype=tensor.dtype, device=tensor.device), tensor)
 
 if __name__ == "__main__":
     dictio = {"preds2d": dict(a=1, b=3), "preds3d": dict(aa=1, bb=3), "xxx": 1}

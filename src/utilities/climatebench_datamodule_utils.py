@@ -7,6 +7,7 @@ import xarray as xr
 
 from src.utilities.utils import get_files, get_logger
 from src.utilities.normalization import StandardNormalizer
+import torch
 
 log = get_logger(__name__)
 
@@ -18,6 +19,70 @@ log = get_logger(__name__)
 
 NO_DAYS_IN_YEAR = 365
 NO_DAYS_IN_MONTH = 30
+
+statistics = {
+    "standard_new": {
+        "tas_mean": {"weighted": 289.83469702468193, "unweighted": 280.41241455078125},
+        "tas_std": {"weighted": 15.114547332402394, "unweighted": 21.20634651184082},
+        "pr_mean": {"weighted": 3.5318931751025825e-05, "unweighted": 2.9361413908191025e-05},
+        "pr_std": {"weighted": 8.351846484899611e-05, "unweighted": 7.215367804747075e-05},
+        "log_1_pr_mean": {"weighted": 3.531428776456019e-05, "unweighted": 2.935781958512962e-05},
+        "log_1_pr_std": {"weighted": 8.348880039616833e-05, "unweighted": 7.21298492862843e-05},
+        # Try these:
+        "log_1e-8_pr_mean": {"weighted": -12.47100560750103, "unweighted": -12.584796905517578},
+        "log_1e-8_pr_std": {"weighted": 2.8926291719896695, "unweighted": 2.76674485206604},
+        "log_mm_day_1_pr_mean": {"weighted": 0.8233942575117554, "unweighted": 0.7447913885116577},
+        "log_mm_day_1_pr_std": {"weighted": 0.9123542090854786, "unweighted": 0.851499617099762},
+        "log_mm_day_001_pr_mean": {"weighted": -0.7521765418647202, "unweighted": -0.8860650062561035},
+        "log_mm_day_001_pr_std": {"weighted": 2.2917330972570222, "unweighted": 2.208401918411255},
+    },
+    "standard": {
+        "tas_mean": torch.tensor(279.7749),
+        "tas_std": torch.tensor(29.7625),
+        "pr_mean": torch.tensor(2.8494e-05),
+        "pr_std": torch.tensor(5.3200e-05),
+    },
+}
+
+
+def get_statistics(
+    output_vars: list[str] = ["tas"], normalization_type: str = "standard_new", precip_transform: Optional[str] = None, var_to_transform_name: Dict[str, str] = dict()
+):
+    if normalization_type == "standard":
+        assert precip_transform is None, "Use normalization_type='standard_new' instead."
+        # Compute the mean and std of the output variables
+        if len(output_vars) == 1 and output_vars[0] == "tas":
+            data_mean_act = statistics["standard"]["tas_mean"]
+            data_std_act = statistics["standard"]["tas_std"]
+        elif output_vars == ["tas", "pr"]:
+            data_mean_act = {"tas": statistics["standard"]["tas_mean"], "pr": statistics["standard"]["pr_mean"]}
+            data_std_act = {"tas": statistics["standard"]["tas_std"], "pr": statistics["standard"]["pr_std"]}
+        else:
+            raise ValueError(
+                f"Normalization type {normalization_type} not supported for output variables {output_vars}"
+            )
+    elif normalization_type == "standard_new":
+        data_mean_act, data_std_act = dict(), dict()
+        for ovar in output_vars:
+            if ovar == "pr" and precip_transform is not None:
+                pr_transform = precip_transform
+                if "only" in pr_transform:
+                    # Only transform the precipitation data but do not standardize it
+                    log.info(f"Only transforming the precipitation data with {pr_transform}")
+                    pr_transform = pr_transform.replace("_only", "")
+                    mean_pr, std_pr = 0.0, 1.0
+                else:
+                    mean_pr = statistics["standard_new"][f"{pr_transform}_pr_mean"]["weighted"]
+                    std_pr = statistics["standard_new"][f"{pr_transform}_pr_std"]["weighted"]
+                var_to_transform_name[ovar] = pr_transform
+            else:
+                mean_pr = statistics["standard_new"][f"{ovar}_mean"]["weighted"]
+                std_pr = statistics["standard_new"][f"{ovar}_std"]["weighted"]
+            data_mean_act[ovar] = torch.tensor(mean_pr)
+            data_std_act[ovar] = torch.tensor(std_pr)
+    else:
+        raise ValueError(f"Invalid value for normalization_type: {self.hparams.normalization_type}")
+    return data_mean_act, data_std_act
 
 
 # Datamodule Helpers
@@ -47,16 +112,11 @@ def standardize_output_xr(
             # Rename the daily variables to be consistent with the yearly data
             if any(dim in output_xr[key].dims for dim in ["y", "x", "lat", "lon"]):
                 # Create dictionary of dimension names to rename
-                rename_dict = {
-                    "y": "latitude", 
-                    "x": "longitude",
-                    "lat": "latitude", 
-                    "lon": "longitude"
-                }
-                
+                rename_dict = {"y": "latitude", "x": "longitude", "lat": "latitude", "lon": "longitude"}
+
                 # Only include the dimensions that actually exist in the dataset
                 rename_dict = {k: v for k, v in rename_dict.items() if k in output_xr[key].dims}
-                
+
                 # Apply the renaming if there's anything to rename
                 if rename_dict:
                     output_xr[key] = output_xr[key].rename(rename_dict)
@@ -76,16 +136,11 @@ def standardize_output_xr(
         # Rename the daily variables to be consistent with the yearly data
         if any(dim in output_xr.dims for dim in ["y", "x", "lat", "lon"]):
             # Create dictionary of dimension names to rename
-            rename_dict = {
-            "y": "latitude", 
-            "x": "longitude",
-            "lat": "latitude", 
-            "lon": "longitude"
-            }
-            
+            rename_dict = {"y": "latitude", "x": "longitude", "lat": "latitude", "lon": "longitude"}
+
             # Only include the dimensions that actually exist in the dataset
             rename_dict = {k: v for k, v in rename_dict.items() if k in output_xr.dims}
-            
+
             # Apply the renaming if there's anything to rename
             if rename_dict:
                 output_xr = output_xr.rename(rename_dict)
@@ -180,7 +235,7 @@ def get_rsdt(
     assert len(rsdt_path) == 1, f"Expected 1 file for ssp126, found {rsdt_paths=}"
     rsdt_path = rsdt_path[0]
     log.info(f"Loading rsdt data from {rsdt_path}")
-    rsdt['ssp'] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
+    rsdt["ssp"] = xr.open_dataset(data_path + f"/{rsdt_path}").compute()
 
     # Squeeze the nbnd & member_id dimension from the output datasets
     for k, v in rsdt.items():
@@ -192,133 +247,19 @@ def get_rsdt(
             print(f"dropping member_id dimension from the rsdt{k} variable datasets")
 
     # Standardize the rsdt data using training data i.e "ssp data"
-    rsdt_ssp_flattened = rsdt['ssp'].rsdt.data.reshape(-1)
+    rsdt_ssp_flattened = rsdt["ssp"].rsdt.data.reshape(-1)
     rsdt_ssp_mean, rsdt_ssp_std = rsdt_ssp_flattened.mean(), rsdt_ssp_flattened.std()
-    
+
     for k, v in rsdt.items():
         rsdt[k] = normalize_data(v, {"rsdt": {"mean": rsdt_ssp_mean, "std": rsdt_ssp_std}})
-    
+
     if solar_experiment:
         # remove the ssp from the dictionary
         rsdt.pop("ssp")
         # rename G6Solar lat lon to x, y
         rsdt[solar_experiment] = rsdt[solar_experiment].rename({"lat": "y", "lon": "x"})
-    
+
     return rsdt
-
-
-# def get_raw_data(
-#     data_path: str,
-#     simulations: Sequence[str],
-#     stage: str,
-#     mean_over_ensemble: bool = False,
-#     Debug_dataset_size: int = None,
-#     scale_inputs: str = None,
-# ) -> tuple(Dict[str, xr.Dataset], Dict[str, xr.Dataset]):
-#     """
-#     Load the raw data from the given path and return it as a dictionary of xarray datasets.
-
-#     Avaliable daily output simulations are:
-#     - 'output_ssp126_daily'
-#     - 'output_ssp245_daily'
-#     - 'output_ssp370_daily'
-#     - 'output_ssp585_daily'
-#     - 'outputs_historical_daily_raw'
-
-#     Avaliable Input simulations are yearly:
-#     - 'input_hist-GHG'
-#     - 'inputs_abrupt-4xCO2'
-#     - 'inputs_1pctCO2'
-#     - 'inputs_hist-aer'
-#     - 'inputs_historical'
-#     - 'inputs_ssp126'
-#     - 'inputs_ssp245'
-#     - 'inputs_ssp370'
-#     - 'inputs_ssp370-lowNTCF
-#     - 'inputs_ssp585'
-
-#     Args:
-#     - data_path: Path to the directory containing the data
-#     - simulations: List of simulations to load
-#     - stage: The stage of the data to load. Either 'train' or 'validation'
-#     - mean_over_ensemble: If True, the output data will be averaged over the ensemble dimension
-#     - Debug_dataset_size: If not None, the size of the dataset to load
-#     - scale_inputs: If not None, the type of scaling to apply to the input data (downscale or upscale)
-
-#     Returns:
-#     - X_train: Dictionary containing the input data for each simulation
-#     - Y_train: Dictionary containing the output data for each simulation
-#     """
-#     X_train, Y_train = dict(), dict()
-#     for i, simu in enumerate(simulations):
-#         input_name = "inputs_" + simu + ".nc"
-#         output_name = "outputs_" + simu + "_daily.nc"
-#         if Debug_dataset_size is not None:
-#             input_xr = (
-#                 xr.open_dataset(join(data_path, input_name))
-#                 .sel(time=slice("2015", str(2015 + Debug_dataset_size)))
-#                 .compute()
-#             )
-#             output_xr = (
-#                 xr.open_dataset(join(data_path, output_name))
-#                 .sel(time=slice("2015", str(2015 + Debug_dataset_size)))
-#                 .compute()
-#             )
-#         else:
-#             log.info(f"Loading data from {data_path}")
-#             input_xr = xr.open_dataset(join(data_path, input_name)).compute()
-#             log.info(f"Loaded input data from {input_name}")
-#             # output_xr = xr.open_dataset(join(data_path, output_name)).compute()
-#             output_xr = xr.open_dataset(join(data_path, output_name), chunks={"member_id": -1}).compute()
-#             log.info(f"Loaded output data from {output_name}")
-
-#         # assert not mean_over_ensemble, "don't wanna explore using mean_over_ensemble."
-#         if mean_over_ensemble:
-#             log.info(f"Average over ensemble for {simu}. Ds.dims: {output_xr.dims}")
-#             output_xr = output_xr.mean(dim="member_id")
-#             log.info(f"Finished averaging over ensemble for {simu}")
-#             # transpose_dims = ["time", "latitude", "longitude"]
-#         else:
-#             # drop each member where there's a nan in the output
-#             print("Dataset data_vars: ", output_xr.data_vars)
-#             # check_nan_ds = output_xr.tas
-#             # nan_mems = check_nan_ds.isnull().any(dim=["time", "latitude", "longitude"])
-#             # print("Dropping members with nan in output: ", nan_mems.values)
-#             # copy input_xr for each ensemble member
-#             input_xr = xr.concat([input_xr] * output_xr.sizes["member_id"], dim="member_id")
-#             # transpose_dims = ["time", "member", "latitude", "longitude"]
-#             output_xr = output_xr.rename({"member_id": "member"})
-#             input_xr = input_xr.rename({"member_id": "member"})
-
-#         # Drop lat_bound, lng_bounds and nbnd to make the data tranpose simpler
-#         output_xr = output_xr.drop(["lon_bounds", "lat_bounds", "nbnd"])
-
-#         # If the input data has lon and lat as dimensions, rename them to longitude and latitude
-#         if "lon" in input_xr.dims:
-#             input_xr = input_xr.rename({"lon": "longitude", "lat": "latitude"})
-
-#         # Rename the daily variables to be consistent with the yearly data
-#         if "y" or "x" in output_xr.dims:
-#             output_xr = output_xr.rename({"y": "latitude", "x": "longitude"})
-#         # Convert pr and pr90 to mm/day and rename lon and lat to longitude and latitude
-#         log.info(f"Converting pr and pr90 to mm/day for {simu}")
-#         output_xr["pr"] *= 86400  # less efficient: output_xr.assign({"pr": output_xr.pr * 86400})  # no pr90
-#         log.info(f"Finished converting pr and pr90 to mm/day for {simu}")
-
-#         # ! Note: Commented out for now
-#         # output_xr = output_xr.transpose(*transpose_dims)
-#         X_train[simu] = input_xr
-#         Y_train[simu] = output_xr
-
-#         # Match in/output Spatial resolution
-#         if scale_inputs is not None:
-#             log.info(f"Matching inputs res. to output res. for {simu}")
-#             X_train[simu], Y_train[simu] = _scaleInterpolateLinear(
-#                 X_train[simu], Y_train[simu], scale_type=scale_inputs
-#             )
-
-#     log.info(f"Finished pre-processing data for {simulations}")
-#     return X_train, Y_train
 
 
 def _scaleInterpolateLinear(X, Y, scale_type=None):

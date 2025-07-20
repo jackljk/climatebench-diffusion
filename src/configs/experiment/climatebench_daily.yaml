@@ -11,6 +11,8 @@ defaults:
 
 name: "CB-Daily"
 
+
+
 datamodule:
   window: 1 # no window since the granularity is daily (for now)
   num_workers: 16
@@ -20,3 +22,6 @@ model:
 
 module:
   allow_validation_size_indivisible_on_ddp: True
+  # Pr Clamping Parameters
+  pr_clamping: True # If True, will clamp the precipitation values to be non-negative
+  pr_clamping_threshold: 5e-10 # Minimum value for precipitation clamping

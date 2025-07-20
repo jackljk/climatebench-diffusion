@@ -21,6 +21,7 @@ num_ensemble_members: 2 # Number of ensemble members to use ('all' to use all av
 simulations_raw: null # Set to null if all simulations are already normalized ie "ssp126_outputs_daily.nc"
 simulations_anom_type: 'none' # 'standard' or 'minmax' or 'piControl'
 normalization_type: null   # How to preprocess the targets, e.g. 'standard'
+precip_transform: null # 'log' or 'none' (only for precipitation)
 
 # Debugging parameters
 DEBUG_dataset_size: null # Set to None to use the full dataset, value is the number of years to use

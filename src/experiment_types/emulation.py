@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Callable, Optional
 
 import torch
 from torch import Tensor
@@ -9,14 +9,45 @@ from torch import Tensor
 from src.evaluation.aggregators._abstract_aggregator import _Aggregator
 from src.experiment_types._base_experiment import BaseExperiment
 from src.utilities.utils import (
-    rrearrange,
-    torch_to_numpy,
+    rrearrange, 
+    torch_to_numpy, 
+    clamp_raw_threshold_as_zero_in_normed
 )
+from src.utilities.climatebench_datamodule_utils import get_statistics
+
+def predictions_post_process(output_vars: Any[List[str], str], threshold: Optional[float], normalization_statistics: Dict[str, float]) -> Callable[[Tensor], Tensor]:
+    """
+    Returns a post-processing function for model predictions.
+
+    The returned function clamps the input predictions to a minimum threshold
+    (and potentially other conditions defined in `clamp_tensor`).
+
+    Args:
+        min_threshold (Optional[float]): Minimum threshold to clamp the predictions.
+
+    Returns:
+        Callable[[Tensor], Tensor]: A function that takes predictions and returns the processed predictions.
+    """
+    pr_idx = output_vars.index("pr") if "pr" in output_vars else None
+    
+    def _post_processing(preds: Tensor) -> Tensor:
+        if pr_idx is None or threshold is None:
+            # If no precipitation index or threshold is provided, return predictions unchanged
+            return preds
+        # Clamp predictions using the specified minimum threshold
+        preds[:, pr_idx, :, :] = clamp_raw_threshold_as_zero_in_normed(
+            preds[:, pr_idx, :, :], threshold=threshold, mean=normalization_statistics["pr_mean"], std=normalization_statistics["pr_std"]
+        )
+        return preds
+
+    return _post_processing
 
 
 class EmulationExperiment(BaseExperiment):
     def __init__(
         self,
+        pr_clamping: bool = False,
+        pr_clamping_threshold: Optional[float] = None,
         return_outputs_at_evaluation: str | bool = False,  # can be "all", "preds_only", True, False
         **kwargs,
     ):
@@ -24,6 +55,25 @@ class EmulationExperiment(BaseExperiment):
         # The following saves all the args that are passed to the constructor to self.hparams
         #   e.g. access them with self.hparams.return_outputs_at_evaluation
         self.save_hyperparameters(ignore=["model"])
+        
+        data_mean_act, data_std_act = get_statistics(
+            self.hparams.datamodule_config.output_vars, 
+            self.hparams.datamodule_config.normalization_type,
+            self.hparams.datamodule_config.precip_transform,
+            
+        )
+        if pr_clamping:
+            normalization_statistics = {
+                "pr_mean": data_mean_act["pr"],
+                "pr_std": data_std_act["pr"],
+            }
+            self.predictions_post_process = predictions_post_process(
+                output_vars=self.hparams.datamodule_config.output_vars,
+                threshold=pr_clamping_threshold, 
+                normalization_statistics=normalization_statistics
+            )
+        else:
+            self.predictions_post_process = None
 
     def actual_num_input_channels(self, num_input_channels: int) -> int:
         # if we use the inputs as conditioning, and use an output-shaped input (e.g. for DDPM),
@@ -127,5 +177,7 @@ class EmulationExperiment(BaseExperiment):
         batch.pop("metadata", None)
 
         extra_kwargs = {k: v for k, v in batch.items() if k not in ["inputs", "targets"]}
+        extra_kwargs["predictions_post_process"] = self.predictions_post_process
+
         loss = self.model.get_loss(inputs=inputs, targets=targets, **extra_kwargs)
         return loss
