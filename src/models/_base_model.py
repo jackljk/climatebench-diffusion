@@ -70,6 +70,7 @@ class BaseModel(LightningModule):
         debug_mode: bool = False,
         name: str = "",
         verbose: bool = True,
+        num_training_ensemble_members: int = 5, # Number of ensemble members to use during training for AFCRPS or CRPS losses
     ):
         super().__init__()
         # The following saves all the args that are passed to the constructor to self.hparams
@@ -93,6 +94,7 @@ class BaseModel(LightningModule):
         self.spatial_shape_out = spatial_shape_out or spatial_shape_in
         self.datamodule_config = datamodule_config
         self.predict_non_spatial_condition = predict_non_spatial_condition
+        self.num_training_ensemble_members = num_training_ensemble_members
 
         print_text = f"Model: {self.__class__.__name__} with {self.num_input_channels=}, {self.num_output_channels=}"
         if self.spatial_shape_in == self.spatial_shape_out:
@@ -357,10 +359,27 @@ class BaseModel(LightningModule):
             return data
 
         # Predict
-        if torch.is_tensor(inputs):
-            predictions_raw = self(inputs, condition=condition, **kwargs)
+        if self.loss_function_name in ["afcrps", "crps"]:
+            # For AFCRPS or CRPS losses, we need an ensemble of predictions
+            assert self.num_training_ensemble_members > 0, "num_training_ensemble_members must be greater than 0"
+
+            predictions_stack = []
+            for _ in range(self.num_training_ensemble_members):
+                if torch.is_tensor(inputs):
+                    predictions_raw = self(inputs, condition=condition, **kwargs)
+                else:
+                    predictions_raw = self(**inputs, condition=condition, **kwargs)
+                    
+                predictions_stack.append(predictions_raw)
+            predictions_raw = torch.stack(predictions_stack, dim=0)
         else:
-            predictions_raw = self(**inputs, condition=condition, **kwargs)
+            if torch.is_tensor(inputs):
+                predictions = self(inputs, condition=condition, **kwargs)
+            else:
+                predictions = self(**inputs, condition=condition, **kwargs)
+            assert (
+                predictions.shape == targets.shape
+            ), f"Be careful: Predictions shape {predictions.shape} != targets shape {targets.shape}. Missing singleton dimensions after batch dim. can be fatal."
 
         criterion_kwargs = criterion_kwargs if criterion_kwargs is not None else {}
         if torch.is_tensor(predictions_raw):

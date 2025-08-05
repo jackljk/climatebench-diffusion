@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -7,7 +7,7 @@ from einops import repeat
 
 # from src.utilities.torch_utils import persistence
 from src.diffusion._base_diffusion import BaseDiffusion
-from src.losses.losses import AbstractWeightedLoss, crps_ensemble
+from src.losses.losses import AbstractWeightedLoss, afcrps_ensemble, crps_ensemble
 from src.utilities.random_control import StackedRandomGenerator
 from src.utilities.utils import get_logger, rrearrange
 
@@ -243,6 +243,7 @@ class EDMPrecond(BaseDiffusion):
         **kwargs,  # Keyword arguments for the underlying model.
     ):
         kwargs["timesteps"] = num_steps
+        self.multi_loss_weights = kwargs.pop("multi_loss_weights", None)
         super().__init__(**kwargs)
         self._USE_SIGMA_DATA = True
         self.use_fp16 = use_fp16
@@ -256,6 +257,9 @@ class EDMPrecond(BaseDiffusion):
         self.log_text.info(
             f"EDM: {sigma_min=}, {self.sigma_max_inf=}, {num_steps=}, {rho=}, {S_churn=}, {S_min=}, {S_max=}"
         )
+        if kwargs['loss_function'] in ['wcrps', 'afcrps']:
+            self.num_training_ensemble_members = kwargs.get('num_training_ensemble_members', 4)
+            self.log_text.info(f"Using {self.num_training_ensemble_members} ensemble members for {kwargs['loss_function']} loss.")
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
         """Return the loss function used for training.
@@ -281,8 +285,16 @@ class EDMPrecond(BaseDiffusion):
             return WeightedEDMLoss(**loss_kwargs, loss_type="L2")
         elif loss_function == "wmae":
             return WeightedEDMLoss(**loss_kwargs, loss_type="L1")
-        elif loss_function == "wcrps":
-            return WeightedEDMLossCRPS(**loss_kwargs)
+        elif loss_function in ["wcrps", "afcrps"]:
+            return WeightedEDMLossCRPS(crps_func=loss_function, num_ensemble_members=self.num_training_ensemble_members, **loss_kwargs)
+        elif loss_function in ["wcrps+wmse", "afcrps+wmse"]:
+            # Handle multi-loss case
+            return WeightedEDMLossCRPSPlusWMSE(
+                multi_loss_weights=self.multi_loss_weights,
+                crps_func=loss_function.split("+")[0],
+                num_ensemble_members=self.num_training_ensemble_members,
+                **loss_kwargs,
+            )
         else:
             raise ValueError(f"Unknown loss type: {loss_function}")
 
@@ -648,7 +660,7 @@ class EDMLossMAE(EDMLossAbstract):
 
 
 class WeightedEDMLossAbstract(AbstractWeightedLoss, EDMLossAbstract):
-    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, **kwargs):
+    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, num_ensemble_members: int = 4, **kwargs):
         AbstractWeightedLoss.__init__(self, use_batch_logvars=use_logvar, **kwargs)
         EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data, use_logvar=use_logvar)
 
@@ -685,25 +697,82 @@ class WeightedEDMLoss(WeightedEDMLossAbstract):
 
 
 class WeightedEDMLossCRPS(WeightedEDMLossAbstract):
+    def __init__(self, crps_func:str = "wcrps", num_ensemble_members=4, **kwargs):
+        super().__init__(**kwargs)
+        self.num_ensemble_members = num_ensemble_members
+        if crps_func == "wcrps":
+            self.crps_func = crps_ensemble
+        elif crps_func == "afcrps":
+            self.crps_func = afcrps_ensemble
+        else:
+            raise ValueError(f"Unknown CRPS function: {crps_func}. Use 'wcrps' or 'afcrps'.")
+
     def __call__(self, net, targets, predictions_post_process=None, targets_pre_process=None, **kwargs):
-        rnd_normal1 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
-        rnd_normal2 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
-        sigma1 = (rnd_normal1 * self.P_std + self.P_mean).exp()
-        sigma2 = (rnd_normal2 * self.P_std + self.P_mean).exp()
-        weight1 = (sigma1**2 + self.sigma_data**2) / (sigma1 * self.sigma_data) ** 2
-        weight2 = (sigma2**2 + self.sigma_data**2) / (sigma2 * self.sigma_data) ** 2
+        # introducing random seed generation for ensemble members to improve stochasticity
+        generators = []
+        for i in range(self.num_ensemble_members):
+            gen = torch.Generator(device=targets.device)
+            gen.manual_seed(torch.randint(0, 2**32, (1,), device=targets.device).item() + i)
+            generators.append(gen)
+            
+        # Use the seeds to generate random normals for each ensemble member
+        rnd_normals = [
+            torch.randn([targets.shape[0], 1, 1, 1], generator=gen, device=targets.device) for gen in generators
+        ]
+        sigmas = [
+            (rnd_normal * self.P_std + self.P_mean).exp() for rnd_normal in rnd_normals
+        ]
+        weights = [
+            (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2 for sigma in sigmas
+        ]
 
         y = targets
-        n1 = torch.randn_like(y) * sigma1
-        n2 = torch.randn_like(y) * sigma2
-        D_yn1 = net(y + n1, sigma1, **kwargs)
-        D_yn2 = net(y + n2, sigma2, **kwargs)
-        D_yn = torch.stack([D_yn1, D_yn2], dim=0)  # (2, B, C, H, W), where 2 is the ensemble size
-        # Take the min of the two weights
-        weight_lam = torch.min(weight1, weight2)
+        n1s = [torch.randn_like(y) * sigma for sigma in sigmas]
+        D_yns = [
+            net(y + n1, sigma, **kwargs) for n1, sigma in zip(n1s, sigmas)
+        ]
+        D_yn = torch.stack(D_yns, dim=0)  # (2, B, C, H, W), where 2 is the ensemble size
+        # Take the min of the weights
+        weight_lam = torch.min(torch.stack(weights, dim=0), dim=0).values  # (B, 1, 1, 1)
         return self.weigh_loss(
-            crps_ensemble(predictions=D_yn, observations=y, reduction="none"), multiply_weight=weight_lam
+            self.crps_func(predicted=D_yn, truth=y, reduction="none"), multiply_weight=weight_lam
         )
         # Copilot suggestion:
         # CRPS = E[|D_yn1 - D_yn2|] - 0.5 * E[|D_yn1 - y|] - 0.5 * E[|D_yn2 - y|]
         # crps = (D_yn1 - D_yn2).abs().mean() - 0.5 * (D_yn1 - y).abs().mean() - 0.5 * (D_yn2 - y).abs().mean()
+
+        # Old implementation:
+        # rnd_normal1 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
+        # rnd_normal2 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
+        # sigma1 = (rnd_normal1 * self.P_std + self.P_mean).exp()
+        # sigma2 = (rnd_normal2 * self.P_std + self.P_mean).exp()
+        # weight1 = (sigma1**2 + self.sigma_data**2) / (sigma1 * self.sigma_data) ** 2
+        # weight2 = (sigma2**2 + self.sigma_data**2) / (sigma2 * self.sigma_data) ** 2
+        # n1 = torch.randn_like(y) * sigma1
+        # n2 = torch.randn_like(y) * sigma2
+        # D_yn1 = net(y + n1, sigma1, **kwargs)
+        # D_yn2 = net(y + n2, sigma2, **kwargs)
+        # weight_lam = torch.min(weight1, weight2)
+
+class WeightedEDMLossCRPSPlusWMSE(WeightedEDMLossCRPS, WeightedEDMLoss):
+    def __init__(self, multi_loss_weights: Optional[dict] = None, crps_func: str = "wcrps", num_ensemble_members=4, **kwargs):
+        WeightedEDMLoss.__init__(self, loss_type="L2", **kwargs)
+        WeightedEDMLossCRPS.__init__(self, crps_func=crps_func, num_ensemble_members=num_ensemble_members, **kwargs)
+        if multi_loss_weights is None:
+            self.crps_weight = 0.8
+            self.wmse_weight = 0.2
+        else:
+            self.crps_weight = multi_loss_weights.get("crps", 0.8)
+            self.wmse_weight = multi_loss_weights.get("wmse", 0.2)
+
+    def __call__(self, net, targets, predictions_post_process=None, targets_pre_process=None, **kwargs):
+        # Compute CRPS loss
+        crps_loss = WeightedEDMLossCRPS.__call__(self, net, targets, predictions_post_process=predictions_post_process,
+                                                  targets_pre_process=targets_pre_process, **kwargs)
+        # Compute WMSE loss
+        wmse_loss = WeightedEDMLoss.__call__(self, net, targets, predictions_post_process=predictions_post_process,
+                                             targets_pre_process=targets_pre_process, **kwargs)
+
+        # Combine losses
+        combined_loss = self.crps_weight * crps_loss['loss'] + self.wmse_weight * wmse_loss['loss']
+        return {'loss': combined_loss, 'crps_loss': crps_loss['loss'], 'wmse_loss': wmse_loss['loss']}

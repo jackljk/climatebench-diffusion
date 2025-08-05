@@ -121,6 +121,60 @@ def crps_ensemble(
         crps = crps.mean(dim=dim)
     return crps
 
+class AFCRPSLoss(torch.nn.Module):
+    def forward(self, inputs, targets):
+        return afcrps_ensemble(
+            truth=targets,
+            predicted=inputs,
+            alpha=0.95,
+        )
+
+
+def afcrps_ensemble(
+    truth: Tensor,  # TRUTH
+    predicted: Tensor,  # FORECAST
+    alpha: float = 0.95,
+    dim: Union[int, Iterable[int]] = (),
+    reduction="mean",
+) -> Tensor:
+    """
+    Compute the almost fair CRPS (afCRPS) as described in https://arxiv.org/abs/2412.15832 equation (4).
+    This implementation is based on the identity:
+    math::
+        afCRPS(F, x) = 1 / (2M(M - 1)) * Σ_j=1^M Σ_k=1^M [ |X_j - x| + |X_k - x| - (1 - ε) |X_j - X_k| ]
+    where X_j and X_k denote independent random variables drawn from the forecast distribution F, and ε is a penalty factor.
+
+    Args:
+        truth (Tensor): Ground truth values, shape (...).
+        predicted (Tensor): Predicted ensemble values, shape (M, ...), where M is the number of ensemble members.
+        alpha (float): Weighing parameter controlling bias correction. Default is 1.0 (fully fair CRPS).
+        dim (int or Iterable[int]): Dimensions to reduce in the final calculation.
+        reduction (str): Either 'mean' or 'none' for final reduction of CRPS values.
+
+    Returns:
+        Tensor: The computed afCRPS values.
+    """
+    assert truth.ndim == predicted.ndim - 1, f"{truth.shape=}, {predicted.shape=}"
+    assert truth.shape == predicted.shape[1:], f"Shape mismatch: {truth.shape=} vs {predicted.shape[1:]=}"
+    assert 0 < alpha <= 1, f"Alpha must be in the range (0.0, 1.0]. Got {alpha=}"
+    n_members = predicted.shape[0] 
+    diagonal_mask = torch.eye(n_members, dtype=bool, device=predicted.device) # Shape: (M, M)
+    epsilon = (1 - alpha) / n_members # Penalty correction factor
+    skill = (predicted - truth).abs() 
+    skill = skill.unsqueeze(0) + skill.unsqueeze(1)  # Shape: (M, M, ...)
+    expanded_mask = diagonal_mask[(...,) + (None,) * (skill.ndim - diagonal_mask.ndim)]
+    skill.masked_fill_(expanded_mask, 0)
+    skill = skill.sum(dim=(0,1)) 
+    forecasts_diff = predicted.unsqueeze(0) - predicted.unsqueeze(1)  # Shape: (M, M, ...)
+    pairwise_diff = forecasts_diff.abs() 
+    expanded_mask = diagonal_mask[(...,) + (None,) * (pairwise_diff.ndim - diagonal_mask.ndim)]
+    pairwise_diff.masked_fill_(expanded_mask, 0) 
+    spread = pairwise_diff.sum(dim=(0, 1)) 
+    afcrps = (skill - (1 - epsilon) * spread) / (2 * n_members * (n_members - 1)) 
+    if reduction == "none":
+        return afcrps
+    assert reduction == "mean", f"Unknown reduction: {reduction}"
+    return afcrps.mean(dim=dim)
 
 class AbstractWeightedLoss(torch.nn.Module):
     def __init__(
@@ -421,6 +475,9 @@ def get_loss(name, reduction="mean", **kwargs):
     elif name in ["crps"]:
         assert reduction == "mean", "CRPS loss only supports mean reduction"
         loss = CRPSLoss(**kwargs)
+    elif name in ['afcrps']:
+        assert reduction == "mean", "AFCRPS loss only supports mean reduction"
+        loss = AFCRPSLoss(**kwargs)
     # elif name in ["nll", "negative_log_likelihood"]:
     #     loss = NLLLoss(reduction=reduction)
     else:

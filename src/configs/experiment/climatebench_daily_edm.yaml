@@ -17,6 +17,11 @@ model:
 
 diffusion:
   loss_function: "wmse"
+  num_training_ensemble_members: 2
+  # optional
+  multi_loss_weights:
+    crps: 0.8
+    wmse: 0.2
 
 logger:
   wandb:
