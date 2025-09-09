@@ -25,7 +25,7 @@ python run.py "$@" \
     model=adm model.loss_function="wmse" \
     model.model_channels=64 model.dropout=0.1 \
     datamodule.DEBUG_dataset_size=null \
-    suffix="raw_stdized2-ebs128" \
+    suffix="raw_stdized2-ebs128-rsdtfix" \
     "$@"
 
 #     datamodule.batch_size=256 is too low

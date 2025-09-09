@@ -71,6 +71,7 @@ class BaseModel(LightningModule):
         name: str = "",
         verbose: bool = True,
         num_training_ensemble_members: int = 5, # Number of ensemble members to use during training for AFCRPS or CRPS losses
+        multi_loss_weights: Optional[Dict[str, float]] = None,
     ):
         super().__init__()
         # The following saves all the args that are passed to the constructor to self.hparams
@@ -95,6 +96,7 @@ class BaseModel(LightningModule):
         self.datamodule_config = datamodule_config
         self.predict_non_spatial_condition = predict_non_spatial_condition
         self.num_training_ensemble_members = num_training_ensemble_members
+        self.multi_loss_weights = multi_loss_weights
 
         print_text = f"Model: {self.__class__.__name__} with {self.num_input_channels=}, {self.num_output_channels=}"
         if self.spatial_shape_in == self.spatial_shape_out:

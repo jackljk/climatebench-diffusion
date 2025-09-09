@@ -230,6 +230,7 @@ class EDMPrecond(BaseDiffusion):
         use_noise_logvar: bool = False,
         when_3d_concat_condition_to: str = None,  # When using 3D model: Concat to 'time' or 'channel' dimension?
         force_unconditional=False,  # Ignore conditioning information?
+        vary_ensemble_sigma=True,  # Vary ensemble sigma during training?
         # Sampling parameters.
         num_steps=18,  # Number of steps in the sampling loop.
         rho=7,  # Exponent of the time step discretization.
@@ -243,7 +244,6 @@ class EDMPrecond(BaseDiffusion):
         **kwargs,  # Keyword arguments for the underlying model.
     ):
         kwargs["timesteps"] = num_steps
-        self.multi_loss_weights = kwargs.pop("multi_loss_weights", None)
         super().__init__(**kwargs)
         self._USE_SIGMA_DATA = True
         self.use_fp16 = use_fp16
@@ -254,12 +254,12 @@ class EDMPrecond(BaseDiffusion):
         assert self.sigma_min < self.sigma_max_inf <= self.sigma_max
         self.heun = heun
         self.label_dim = 0
+        self.vary_ensemble_sigma = vary_ensemble_sigma
         self.log_text.info(
             f"EDM: {sigma_min=}, {self.sigma_max_inf=}, {num_steps=}, {rho=}, {S_churn=}, {S_min=}, {S_max=}"
         )
-        if kwargs['loss_function'] in ['wcrps', 'afcrps']:
-            self.num_training_ensemble_members = kwargs.get('num_training_ensemble_members', 4)
-            self.log_text.info(f"Using {self.num_training_ensemble_members} ensemble members for {kwargs['loss_function']} loss.")
+        if 'crps' in self.loss_function_name: # CRPS loss functions requiring ensemble members.
+            self.log_text.info(f"Using {self.num_training_ensemble_members} ensemble members for {self.loss_function_name} loss.")
 
     def _get_loss_callable_from_name_or_config(self, loss_function: str, **kwargs):
         """Return the loss function used for training.
@@ -268,6 +268,7 @@ class EDMPrecond(BaseDiffusion):
         loss_kwargs = dict(
             sigma_data=self.sigma_data,
             use_logvar=self.hparams.use_noise_logvar,
+            vary_ensemble_sigma=self.hparams.vary_ensemble_sigma,
             **kwargs,
         )
         if self.hparams.noise_distribution == "lognormal":
@@ -299,13 +300,16 @@ class EDMPrecond(BaseDiffusion):
             raise ValueError(f"Unknown loss type: {loss_function}")
 
     def forward(self, x, sigma, force_fp32=False, **model_kwargs):
-        if self.hparams.force_unconditional:
-            if isinstance(self.hparams.force_unconditional, float):
-                # Implement unconditional sampling by setting the condition to 0 with probability force_unconditional
+        if self.hparams.guidance_cfg_dropout:
+            if isinstance(self.hparams.guidance_cfg_dropout, float):
+                # Implement unconditional sampling by setting the condition to 0 with probability guidance_cfg_dropout
                 if self.training:
-                    # Set batch elems with p < force_unconditional to 0
-                    mask = torch.rand(x.shape[0], device=x.device) < self.hparams.force_unconditional
-                    x[mask] = 0
+                    # Set condition batch elems with p < guidance_cfg_dropout to 0 to batch elem unconditional
+                    mask = torch.rand(x.shape[0], device=x.device) < self.hparams.guidance_cfg_dropout
+                    assert (
+                        "condition" in model_kwargs
+                    ), "Condition must be provided for classifer free guidance `unconditional sampling."
+                    model_kwargs["condition"][mask] = 0
                 else:
                     pass  # conditional sampling.
             else:
@@ -407,9 +411,15 @@ class EDMPrecond(BaseDiffusion):
                 t < self.hparams.guidance_interval[0] or t > self.hparams.guidance_interval[1]
             ):  # todo: ensure that guidance interval is exactly at step boundaries to satisfy smoothness requiremen
                 return denoised  # No guidance outside the interval.
+            elif self.hparams.guidance_run_id in ["classifier_free", "cfg"]:
+                # run dual denoise for cfg, by sampling the diffusion unconditionally as well passing the tensors as 0s
+                kwargs_uncond = {k: v.clone().detach().zero_() if k == "condition" else v for k, v in kwargs.items()}
+                denoised_uncond = self(x, t, **kwargs_uncond).to(dtype)
+                # apply classifier free guidance denoise
+                return denoised_uncond + self.hparams.guidance * (denoised - denoised_uncond)
             # Guided denoiser.
             kwargs_g = kwargs
-            if self.guidance_model.model.hparams.force_unconditional:
+            if self.guidance_model.model.hparams.guidance_cfg_dropout:
                 kwargs_g = {k: v for k, v in kwargs.items() if k != "dynamical_condition"}
             ref_Dx = self.guidance_model(x, t, **kwargs_g).to(dtype)
             denoised = ref_Dx.lerp(denoised, self.hparams.guidance)
@@ -697,9 +707,11 @@ class WeightedEDMLoss(WeightedEDMLossAbstract):
 
 
 class WeightedEDMLossCRPS(WeightedEDMLossAbstract):
-    def __init__(self, crps_func:str = "wcrps", num_ensemble_members=4, **kwargs):
+    def __init__(self, crps_func:str = "wcrps", num_ensemble_members: int = 4, vary_ensemble_sigma: bool = True, return_Dyn: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.num_ensemble_members = num_ensemble_members
+        self.vary_ensemble_sigma = vary_ensemble_sigma
+        self.return_Dyn = return_Dyn
         if crps_func == "wcrps":
             self.crps_func = crps_ensemble
         elif crps_func == "afcrps":
@@ -708,56 +720,52 @@ class WeightedEDMLossCRPS(WeightedEDMLossAbstract):
             raise ValueError(f"Unknown CRPS function: {crps_func}. Use 'wcrps' or 'afcrps'.")
 
     def __call__(self, net, targets, predictions_post_process=None, targets_pre_process=None, **kwargs):
-        # introducing random seed generation for ensemble members to improve stochasticity
-        generators = []
+        randint = torch.randint(0, 2**32, (1,)).item()
+
+        D_yns = []
+        weights = []
+
+        batch_shape = targets.shape
+        gen = None
+
         for i in range(self.num_ensemble_members):
-            gen = torch.Generator(device=targets.device)
-            gen.manual_seed(torch.randint(0, 2**32, (1,), device=targets.device).item() + i)
-            generators.append(gen)
-            
-        # Use the seeds to generate random normals for each ensemble member
-        rnd_normals = [
-            torch.randn([targets.shape[0], 1, 1, 1], generator=gen, device=targets.device) for gen in generators
-        ]
-        sigmas = [
-            (rnd_normal * self.P_std + self.P_mean).exp() for rnd_normal in rnd_normals
-        ]
-        weights = [
-            (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2 for sigma in sigmas
-        ]
+            if self.vary_ensemble_sigma or gen is None:
+                # Create a new generator for each ensemble member to ensure different noise levels, if not varying sigma only 
+                # use the first generator.
+                gen = torch.Generator(device=targets.device).manual_seed(randint + i)
+                rnd_normal = torch.randn(batch_shape[0], 1, 1, 1, generator=gen, device=targets.device)
+                sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+                
+            noise = torch.randn(batch_shape, generator=gen, device=targets.device) * sigma
+            D_yn = net(targets + noise, sigma, **kwargs)
+            D_yns.append(D_yn)
 
-        y = targets
-        n1s = [torch.randn_like(y) * sigma for sigma in sigmas]
-        D_yns = [
-            net(y + n1, sigma, **kwargs) for n1, sigma in zip(n1s, sigmas)
-        ]
-        D_yn = torch.stack(D_yns, dim=0)  # (2, B, C, H, W), where 2 is the ensemble size
-        # Take the min of the weights
-        weight_lam = torch.min(torch.stack(weights, dim=0), dim=0).values  # (B, 1, 1, 1)
-        return self.weigh_loss(
-            self.crps_func(predicted=D_yn, truth=y, reduction="none"), multiply_weight=weight_lam
+            weight_calculated = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data)**2
+            weights.append(weight_calculated)
+
+        # Stack ensemble predictions
+        D_yn = torch.stack(D_yns, dim=0)
+
+        # Min weight across ensemble members
+        weight_lam = torch.min(torch.stack(weights, dim=0), dim=0).values if self.vary_ensemble_sigma else weights[0]
+
+        # Compute and return loss
+        loss = self.weigh_loss(
+            self.crps_func(predicted=D_yn, truth=targets, reduction="none"),
+            multiply_weight=weight_lam
         )
-        # Copilot suggestion:
-        # CRPS = E[|D_yn1 - D_yn2|] - 0.5 * E[|D_yn1 - y|] - 0.5 * E[|D_yn2 - y|]
-        # crps = (D_yn1 - D_yn2).abs().mean() - 0.5 * (D_yn1 - y).abs().mean() - 0.5 * (D_yn2 - y).abs().mean()
 
-        # Old implementation:
-        # rnd_normal1 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
-        # rnd_normal2 = torch.randn([targets.shape[0], 1, 1, 1], device=targets.device)
-        # sigma1 = (rnd_normal1 * self.P_std + self.P_mean).exp()
-        # sigma2 = (rnd_normal2 * self.P_std + self.P_mean).exp()
-        # weight1 = (sigma1**2 + self.sigma_data**2) / (sigma1 * self.sigma_data) ** 2
-        # weight2 = (sigma2**2 + self.sigma_data**2) / (sigma2 * self.sigma_data) ** 2
-        # n1 = torch.randn_like(y) * sigma1
-        # n2 = torch.randn_like(y) * sigma2
-        # D_yn1 = net(y + n1, sigma1, **kwargs)
-        # D_yn2 = net(y + n2, sigma2, **kwargs)
-        # weight_lam = torch.min(weight1, weight2)
+        if self.return_Dyn:
+            loss.update({'D_yns': D_yns, 'weights': weights})
+        return loss
+
+
 
 class WeightedEDMLossCRPSPlusWMSE(WeightedEDMLossCRPS, WeightedEDMLoss):
-    def __init__(self, multi_loss_weights: Optional[dict] = None, crps_func: str = "wcrps", num_ensemble_members=4, **kwargs):
+    def __init__(self, multi_loss_weights: Optional[dict] = None, crps_func: str = "wcrps", num_ensemble_members: int = 4, vary_ensemble_sigma: bool = False, return_Dyn: bool = True, **kwargs):
         WeightedEDMLoss.__init__(self, loss_type="L2", **kwargs)
-        WeightedEDMLossCRPS.__init__(self, crps_func=crps_func, num_ensemble_members=num_ensemble_members, **kwargs)
+        WeightedEDMLossCRPS.__init__(self, crps_func=crps_func, num_ensemble_members=num_ensemble_members, vary_ensemble_sigma=vary_ensemble_sigma, return_Dyn=return_Dyn, **kwargs)
+        self.num_training_ensemble_members = num_ensemble_members
         if multi_loss_weights is None:
             self.crps_weight = 0.8
             self.wmse_weight = 0.2
@@ -770,9 +778,18 @@ class WeightedEDMLossCRPSPlusWMSE(WeightedEDMLossCRPS, WeightedEDMLoss):
         crps_loss = WeightedEDMLossCRPS.__call__(self, net, targets, predictions_post_process=predictions_post_process,
                                                   targets_pre_process=targets_pre_process, **kwargs)
         # Compute WMSE loss
-        wmse_loss = WeightedEDMLoss.__call__(self, net, targets, predictions_post_process=predictions_post_process,
-                                             targets_pre_process=targets_pre_process, **kwargs)
+        wmse_losses = []
+        for i in range(self.num_training_ensemble_members):
+            wmse_loss = WeightedEDMLoss.loss(
+                self,
+                preds=crps_loss['D_yns'][i],  # Use D_yn from CRPS loss
+                targets=targets,
+                sigma_weights=crps_loss['weights'][i],  # Use the same weights as
+            )
+            wmse_losses.append(wmse_loss['loss'])
+
+        mean_wmse_loss = torch.stack(wmse_losses, dim=0).mean()
 
         # Combine losses
-        combined_loss = self.crps_weight * crps_loss['loss'] + self.wmse_weight * wmse_loss['loss']
-        return {'loss': combined_loss, 'crps_loss': crps_loss['loss'], 'wmse_loss': wmse_loss['loss']}
+        combined_loss = self.crps_weight * crps_loss['loss'] + self.wmse_weight * mean_wmse_loss
+        return {'loss': combined_loss, 'crps_loss': crps_loss['loss'], 'wmse_loss': mean_wmse_loss}

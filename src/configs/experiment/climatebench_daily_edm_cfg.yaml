@@ -17,12 +17,8 @@ model:
 
 diffusion:
   loss_function: "wmse"
-  num_training_ensemble_members: 2
-  vary_ensemble_sigma: True
-  # optional
-  multi_loss_weights:
-    crps: 0.8
-    wmse: 0.2
+  guidance: 0.15
+  guidance_run_id: "classifier_free"
 
 logger:
   wandb:
