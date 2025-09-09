@@ -670,7 +670,7 @@ class EDMLossMAE(EDMLossAbstract):
 
 
 class WeightedEDMLossAbstract(AbstractWeightedLoss, EDMLossAbstract):
-    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, num_ensemble_members: int = 4, **kwargs):
+    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, num_ensemble_members: int = 4, vary_ensemble_sigma: bool = True, **kwargs):
         AbstractWeightedLoss.__init__(self, use_batch_logvars=use_logvar, **kwargs)
         EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data, use_logvar=use_logvar)
 
