@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import xarray as xr
 from tensordict import TensorDict
+from pathlib import Path
 
 from src.evaluation.aggregators._abstract_aggregator import AbstractAggregator
 from src.utilities.utils import get_logger, rrearrange, to_tensordict, torch_to_numpy
@@ -155,17 +156,23 @@ class SaveToDiskAggregator(AbstractAggregator):
 
         # Save to file if path is provided
         save_to_path = (
-            self.save_to_path + f"{prefix}-epoch{epoch}-results.nc"
+            Path(self.save_to_path) / f"{prefix}-epoch{epoch}-results.nc"
             if self.save_to_path
-            else f"{prefix}-epoch{epoch}-results.nc"
+            else Path(f"{prefix}-epoch{epoch}-results.nc")
         )
-        log.info(f"Saving results to {save_to_path}")
+        # Increment filename if it already exists
+        counter = 1
+        while save_to_path.exists():
+            save_to_path = save_to_path.with_name(
+                f"{prefix}-epoch{epoch}-results_{counter}.nc"
+            )
+            counter += 1
         # predictions/6h-1AR_Attn23_ADM_EMA_256x1-2-3-4d_WMSE_54lr_LC5:200_15wd_fLV_11seed_19h03mOct18_3423514-5214396-hor30-TAG-ENS=5-max_val_samples=1-val_slice=20210329_20210430-possible_initial_times=12-prediction_horizon=30-TAG-epoch199.nc
-        final_ds.to_netcdf(save_to_path)
+        final_ds.to_netcdf(str(save_to_path))
         if self.save_to_wandb:
             import wandb
 
-            wandb.save(save_to_path)
+            wandb.save(str(save_to_path))
 
         # Reset running data
         self._running_data = None

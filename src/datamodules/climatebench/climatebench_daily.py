@@ -19,6 +19,7 @@ from src.evaluation.metrics_wb import get_lat_weights
 from src.utilities.climatebench_datamodule_utils import (
     get_mean_std_of_variables,
     get_rsdt,
+    get_enso,
     handle_ensemble,
     monthlyInterpolator,
     normalize_data,
@@ -250,6 +251,13 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
             else:
                 rsdt = get_rsdt(self.hparams.data_dir, self.hparams.simulations)
 
+        # Get enso data
+        enso = None
+        if "enso" in self.hparams.additional_vars:
+            # Include TEST_SIM in simulations for ENSO loading
+            all_sims = list(self.hparams.simulations) + [self.TEST_SIM]
+            enso = get_enso(self.hparams.data_dir, all_sims)
+
         ds_splits = {
             "train": set_train,
             "val": set_val,
@@ -258,6 +266,7 @@ class ClimateBenchDailyDataModule(ClimateBenchDataModule):
         }
         ds_vars = {
             "rsdt": rsdt,
+            "enso": enso,
         }
 
         # Set up the tensor datasets and saves to self._data_{split}
@@ -659,6 +668,7 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
 
         Vars that can be added:
             - rsdt: Incoming solar radiation at the top of the atmosphere
+            - enso: ENSO (NINO3.4) index - scalar value broadcast across spatial dimensions
 
         return:
         """
@@ -679,6 +689,24 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
                         raise Exception(f"Error accessing rsdt data for {ssp}: {e}")
                 rsdt_ds = self._handle_interpolation_monthly(rsdt_xr, var, ssp, ssp_index_datetime, coordinate_mapping)
                 interpolated_vars[var] = rsdt_ds
+            elif var == "enso" and self.enso is not None:
+                # ENSO data is keyed by specific SSP (not generic "ssp" like rsdt)
+                if ssp == "historical":
+                    enso_xr = self.enso["historical"]
+                else:
+                    # Try to get the specific SSP, fall back to ssp245 (test set default)
+                    try:
+                        enso_xr = self.enso[ssp]
+                    except KeyError:
+                        # Fallback: use ssp245 if available, otherwise raise error
+                        if "ssp245" in self.enso:
+                            enso_xr = self.enso["ssp245"]
+                        else:
+                            raise KeyError(f"ENSO data not available for {ssp}")
+                enso_ds = self._handle_interpolation_monthly_scalar(
+                    enso_xr, var, ssp_index_datetime, coordinate_mapping
+                )
+                interpolated_vars[var] = enso_ds
             else:
                 raise NotImplementedError(f"Additional variable {var} not implemented yet")
 
@@ -690,15 +718,20 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
 
         Vars that can be added:
             - rsdt: Incoming solar radiation at the top of the atmosphere
+            - enso: ENSO (NINO3.4) index - scalar value broadcast across spatial dimensions
 
         Args:
             - additional_vars: Dict[str, xr.DataArray]
         """
         self.additional_vars = list(additional_vars.keys())
+        self.rsdt = None
+        self.enso = None
         if additional_vars is not None:
             for var_name, var_data in additional_vars.items():
-                # handle for rsdt
-                self.rsdt = var_data if var_name == "rsdt" else None
+                if var_name == "rsdt":
+                    self.rsdt = var_data
+                elif var_name == "enso":
+                    self.enso = var_data
 
     def _get_outputs(self, ssp: str, ssp_index: int) -> Tuple[xr.Dataset, cftime.datetime]:
         """
@@ -767,6 +800,49 @@ class DailyTensorDataset(Dataset[Dict[str, Tensor]]):
             return rsdt_interpolated
 
         return None
+
+    def _handle_interpolation_monthly_scalar(
+        self, input_xr: xr.Dataset, var: str, ssp_index_datetime: cftime.datetime, coordinate_mapping: Dict[str, xr.DataArray]
+    ) -> xr.Dataset:
+        """
+        Handles interpolation of scalar monthly data (like ENSO) to daily resolution and broadcasts
+        across spatial dimensions.
+
+        Args:
+            - input_xr: xarray.Dataset with scalar values (no lat/lon dimensions)
+            - var: variable name (e.g., 'enso')
+            - ssp_index_datetime: target datetime for interpolation
+            - coordinate_mapping: dict with 'latitude' and 'longitude' coordinates to broadcast to
+
+        Returns:
+            - xr.Dataset with the interpolated value broadcast across lat/lon dimensions
+        """
+        # Get the variable name in the dataset (NINO34 for ENSO)
+        var_name_mapping = {"enso": "NINO34"}
+        data_var = var_name_mapping.get(var, var.upper())
+        
+        # Use monthlyInterpolator to get the interpolated scalar value
+        interpolated = monthlyInterpolator(input_xr, ssp_index_datetime)
+        
+        # Extract the scalar value
+        if data_var in interpolated.data_vars:
+            scalar_value = float(interpolated[data_var].values)
+        else:
+            scalar_value = float(interpolated.values)
+        
+        # Broadcast the scalar value across the spatial dimensions
+        lat_coords = coordinate_mapping['latitude']
+        lon_coords = coordinate_mapping['longitude']
+        
+        # Create a DataArray with the scalar value broadcast across lat/lon
+        broadcast_data = np.full((len(lat_coords), len(lon_coords)), scalar_value, dtype=np.float32)
+        
+        result = xr.Dataset(
+            {var: (["latitude", "longitude"], broadcast_data)},
+            coords={"latitude": lat_coords, "longitude": lon_coords}
+        )
+        
+        return result
 
     def _handle_interpolation_yearly(self, ssp, inputs_ssp, ssp_index_datetime):
         """

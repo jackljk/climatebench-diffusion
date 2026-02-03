@@ -262,6 +262,86 @@ def get_rsdt(
     return rsdt
 
 
+def get_enso(
+    data_path: str,
+    simulations: Sequence[str],
+) -> Dict[str, xr.Dataset]:
+    """
+    Load the ENSO (NINO3.4) data from the given path and return it as a dictionary of xarray datasets.
+    The ENSO data is normalized using the mean and std computed from all available data.
+
+    Available ENSO files:
+    - 'CESM2 NINO34 ssp126.nc'
+    - 'CESM2 NINO34 ssp245.nc'
+    - 'CESM2 NINO34 ssp370.nc'
+    - 'CESM2 NINO34 ssp585.nc'
+    - 'NINO34 Historical Data.nc'
+
+    Args:
+    - data_path: Path to the directory containing the data
+    - simulations: List of simulations to load
+
+    Returns:
+    - enso: Dictionary containing the ENSO data for each simulation
+    """
+    enso = dict()
+    
+    # File name mapping for ENSO data
+    enso_file_mapping = {
+        "historical": "NINO34 Historical Data.nc",
+        "ssp126": "CESM2 NINO34 ssp126.nc",
+        "ssp245": "CESM2 NINO34 ssp245.nc",
+        "ssp370": "CESM2 NINO34 ssp370.nc",
+        "ssp585": "CESM2 NINO34 ssp585.nc",
+    }
+    
+    # Load ENSO data for each simulation
+    for sim in simulations:
+        if sim in enso_file_mapping:
+            enso_path = f"{data_path}/{enso_file_mapping[sim]}"
+            log.info(f"Loading ENSO data from {enso_path}")
+            try:
+                enso[sim] = xr.open_dataset(enso_path).compute()
+            except FileNotFoundError:
+                log.warning(f"ENSO file not found: {enso_path}")
+                continue
+        else:
+            log.warning(f"ENSO data not available for simulation: {sim}")
+    
+    # Always load ssp245 for test set (since TEST_SIM is typically ssp245)
+    if "ssp245" not in enso and "ssp245" in enso_file_mapping:
+        enso_path = f"{data_path}/{enso_file_mapping['ssp245']}"
+        log.info(f"Loading ENSO test data from {enso_path}")
+        try:
+            enso["ssp245"] = xr.open_dataset(enso_path).compute()
+        except FileNotFoundError:
+            log.warning(f"ENSO file not found for test set: {enso_path}")
+    
+    if len(enso) == 0:
+        raise ValueError("No ENSO data could be loaded")
+    
+    # Handle member_id dimension - average over ensemble members if present
+    for k, v in enso.items():
+        if "member" in v.dims:
+            log.info(f"Averaging ENSO data over member dimension for {k}")
+            enso[k] = v.mean(dim="member")
+    
+    # Compute normalization statistics from all available data
+    all_enso_values = []
+    for k, v in enso.items():
+        all_enso_values.append(v["NINO34"].values.flatten())
+    all_enso_values = np.concatenate(all_enso_values)
+    enso_mean = float(np.nanmean(all_enso_values))
+    enso_std = float(np.nanstd(all_enso_values))
+    log.info(f"ENSO normalization stats - mean: {enso_mean:.4f}, std: {enso_std:.4f}")
+    
+    # Normalize ENSO data
+    for k, v in enso.items():
+        enso[k] = (v - enso_mean) / enso_std
+    
+    return enso
+
+
 def _scaleInterpolateLinear(X, Y, scale_type=None):
     """
     Interpolate daily climate data using linear interpolation.

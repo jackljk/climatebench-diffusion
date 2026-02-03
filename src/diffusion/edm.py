@@ -268,7 +268,6 @@ class EDMPrecond(BaseDiffusion):
         loss_kwargs = dict(
             sigma_data=self.sigma_data,
             use_logvar=self.hparams.use_noise_logvar,
-            vary_ensemble_sigma=self.hparams.vary_ensemble_sigma,
             **kwargs,
         )
         if self.hparams.noise_distribution == "lognormal":
@@ -287,29 +286,27 @@ class EDMPrecond(BaseDiffusion):
         elif loss_function == "wmae":
             return WeightedEDMLoss(**loss_kwargs, loss_type="L1")
         elif loss_function in ["wcrps", "afcrps"]:
-            return WeightedEDMLossCRPS(crps_func=loss_function, num_ensemble_members=self.num_training_ensemble_members, **loss_kwargs)
+            return WeightedEDMLossCRPS(crps_func=loss_function, num_ensemble_members=self.num_training_ensemble_members, vary_ensemble_sigma=self.hparams.vary_ensemble_sigma, **loss_kwargs)
         elif loss_function in ["wcrps+wmse", "afcrps+wmse"]:
             # Handle multi-loss case
             return WeightedEDMLossCRPSPlusWMSE(
                 multi_loss_weights=self.multi_loss_weights,
                 crps_func=loss_function.split("+")[0],
                 num_ensemble_members=self.num_training_ensemble_members,
+                vary_ensemble_sigma=self.hparams.vary_ensemble_sigma,
                 **loss_kwargs,
             )
         else:
             raise ValueError(f"Unknown loss type: {loss_function}")
 
     def forward(self, x, sigma, force_fp32=False, **model_kwargs):
-        if self.hparams.guidance_cfg_dropout:
-            if isinstance(self.hparams.guidance_cfg_dropout, float):
-                # Implement unconditional sampling by setting the condition to 0 with probability guidance_cfg_dropout
+        if self.hparams.force_unconditional:
+            if isinstance(self.hparams.force_unconditional, float):
+                # Implement unconditional sampling by setting the condition to 0 with probability force_unconditional
                 if self.training:
-                    # Set condition batch elems with p < guidance_cfg_dropout to 0 to batch elem unconditional
-                    mask = torch.rand(x.shape[0], device=x.device) < self.hparams.guidance_cfg_dropout
-                    assert (
-                        "condition" in model_kwargs
-                    ), "Condition must be provided for classifer free guidance `unconditional sampling."
-                    model_kwargs["condition"][mask] = 0
+                    # Set batch elems with p < force_unconditional to 0
+                    mask = torch.rand(x.shape[0], device=x.device) < self.hparams.force_unconditional
+                    x[mask] = 0
                 else:
                     pass  # conditional sampling.
             else:
@@ -411,15 +408,9 @@ class EDMPrecond(BaseDiffusion):
                 t < self.hparams.guidance_interval[0] or t > self.hparams.guidance_interval[1]
             ):  # todo: ensure that guidance interval is exactly at step boundaries to satisfy smoothness requiremen
                 return denoised  # No guidance outside the interval.
-            elif self.hparams.guidance_run_id in ["classifier_free", "cfg"]:
-                # run dual denoise for cfg, by sampling the diffusion unconditionally as well passing the tensors as 0s
-                kwargs_uncond = {k: v.clone().detach().zero_() if k == "condition" else v for k, v in kwargs.items()}
-                denoised_uncond = self(x, t, **kwargs_uncond).to(dtype)
-                # apply classifier free guidance denoise
-                return denoised_uncond + self.hparams.guidance * (denoised - denoised_uncond)
             # Guided denoiser.
             kwargs_g = kwargs
-            if self.guidance_model.model.hparams.guidance_cfg_dropout:
+            if self.guidance_model.model.hparams.force_unconditional:
                 kwargs_g = {k: v for k, v in kwargs.items() if k != "dynamical_condition"}
             ref_Dx = self.guidance_model(x, t, **kwargs_g).to(dtype)
             denoised = ref_Dx.lerp(denoised, self.hparams.guidance)
@@ -670,7 +661,7 @@ class EDMLossMAE(EDMLossAbstract):
 
 
 class WeightedEDMLossAbstract(AbstractWeightedLoss, EDMLossAbstract):
-    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, num_ensemble_members: int = 4, vary_ensemble_sigma: bool = True, **kwargs):
+    def __init__(self, P_mean, P_std, sigma_data, use_logvar: bool = False, num_ensemble_members: int = 4, **kwargs):
         AbstractWeightedLoss.__init__(self, use_batch_logvars=use_logvar, **kwargs)
         EDMLossAbstract.__init__(self, P_mean, P_std, sigma_data, use_logvar=use_logvar)
 

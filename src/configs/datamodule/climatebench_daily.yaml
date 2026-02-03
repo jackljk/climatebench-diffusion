@@ -7,7 +7,7 @@ data_dir: "~/data/climate-analytics-lab-shared/ClimateBench/daily/data"   # Make
 window: 1 # no window since the granularity is daily (for now)
 simulations: ['ssp126', 'ssp370', 'ssp585', 'historical'] # sims avaliable, ssp126, ssp245, ssp370, ssp585, historical
 normalize_vars: ['CO2', 'CH4', 'SO2', 'BC']
-additional_vars: ['rsdt']
+additional_vars: ['rsdt']  # Options: 'rsdt' (solar radiation), 'enso' (NINO3.4 index)
 output_vars: "tas"
 
 sim_validation: 'ssp370'

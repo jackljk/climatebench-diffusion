@@ -26,7 +26,6 @@ class BaseDiffusion(BaseModel):
         guidance_ckpt_filename: str = "latest_epoch",  # Checkpoint filename for the guidance model.
         guidance_overrides: Sequence[str] = None,  # Overrides for the guidance model.
         guidance_interval: Tuple[int, int] = None,  # Interval where to apply the guidance model.
-        guidance_cfg_dropout: float = 0.15,  # Dropout rate for the classfier free guidance.
         **kwargs,
     ):
         signature = inspect.signature(BaseModel.__init__).parameters
@@ -57,11 +56,9 @@ class BaseDiffusion(BaseModel):
 
         if guidance != 1:
             assert guidance_run_id is not None, "Guidance model run ID must be provided."
-            if guidance_run_id in ["self", "autoguidance"]:
+            if guidance_run_id == "self":
                 pass
                 # self._guidance_model = self
-            elif guidance_run_id in ["classifier_free", "cfg"]:
-                self.guidance_cfg_dropout = guidance_cfg_dropout
             else:
                 guidance_overrides = list(guidance_overrides) if guidance_overrides is not None else []
                 guidance_model = reload_checkpoint_from_wandb(
